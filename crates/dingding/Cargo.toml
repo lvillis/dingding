@@ -1,0 +1,50 @@
+[package]
+name = "dingding"
+description = "DingTalk SDK and bot framework for Rust."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+include = [
+    "Cargo.toml",
+    "src/**",
+]
+
+[features]
+default = ["async-tls-rustls-ring", "webhook", "openapi", "bot", "stream", "macros"]
+async-tls-rustls-ring = ["reqx/async-tls-rustls-ring"]
+async-tls-rustls-aws-lc-rs = ["reqx/async-tls-rustls-aws-lc-rs"]
+async-tls-native = ["reqx/async-tls-native"]
+webhook = []
+openapi = []
+bot = ["webhook"]
+stream = ["openapi", "bot", "dep:futures-util", "dep:tokio", "dep:tokio-tungstenite"]
+macros = ["bot", "dep:dingding-macros"]
+
+[dependencies]
+base64 = { workspace = true }
+futures-util = { workspace = true, optional = true }
+hmac = { workspace = true }
+reqx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, optional = true, features = ["time"] }
+tokio-tungstenite = { workspace = true, optional = true }
+url = { workspace = true }
+urlencoding = { workspace = true }
+dingding-macros = { version = "0.1.0", path = "../dingding-macros", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+no-default-features = true
+features = ["async-tls-rustls-ring", "webhook", "openapi", "bot", "macros"]
