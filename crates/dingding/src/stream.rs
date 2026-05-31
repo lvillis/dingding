@@ -18,7 +18,10 @@ use crate::{
     bot::{
         Bot, BotContext, BotEvent, BotState, ConversationScope, HandleOutcome, MessageType, Route,
     },
-    transport::decode_json_response,
+    transport::{
+        BodySnippetConfig, api_error_from_body, api_error_from_body_with_code,
+        decode_json_response, is_success_api_code, response_error_message,
+    },
     util::non_empty_trimmed,
 };
 
@@ -687,12 +690,10 @@ impl StreamClient {
             .transport()
             .post_openapi_json(&url, None, &request)
             .await?;
-        let (value, _body) = decode_json_response::<OpenConnectionResponse>(
-            response,
-            self.client.transport().error_body_snippet(),
-        )?;
-        value.validate()?;
-        Ok(value)
+        let error_body_snippet = self.client.transport().error_body_snippet();
+        let (value, body) =
+            decode_json_response::<RawOpenConnectionResponse>(response, error_body_snippet)?;
+        value.into_connection(&body, error_body_snippet)
     }
 
     async fn handle_text_frame(&self, text: &str) -> Result<StreamHandleResult> {
@@ -832,7 +833,7 @@ impl StreamClient {
     fn handle_system_frame(&self, frame: StreamFrame) -> Result<StreamHandleResult> {
         match frame.headers.topic.as_str() {
             "ping" => {
-                let data = frame.data_json().unwrap_or(Value::Null);
+                let data = frame.data_json_or_raw();
                 Ok(StreamHandleResult::ack(StreamAck::ok(
                     frame.headers.message_id,
                     StreamAckData::Raw(data),
@@ -1105,15 +1106,7 @@ impl StreamClientBuilder {
     pub fn build(self) -> Result<StreamClient> {
         let credentials = self.credentials.ok_or(Error::MissingCredentials)?;
         credentials.validate()?;
-        if self.subscriptions.is_empty() {
-            return Err(Error::invalid_input(
-                "subscriptions",
-                "at least one subscription is required",
-            ));
-        }
-        for subscription in &self.subscriptions {
-            subscription.validate()?;
-        }
+        let subscriptions = normalize_subscriptions(self.subscriptions)?;
         self.reconnect.validate()?;
         let user_agent = non_empty_trimmed(&self.user_agent, "user_agent")?;
         let local_ip = self
@@ -1133,7 +1126,7 @@ impl StreamClientBuilder {
         Ok(StreamClient {
             client: self.client,
             credentials,
-            subscriptions: self.subscriptions,
+            subscriptions,
             local_ip,
             user_agent,
             reconnect: self.reconnect,
@@ -1312,6 +1305,29 @@ impl StreamSubscription {
     }
 }
 
+fn normalize_subscriptions(
+    subscriptions: Vec<StreamSubscription>,
+) -> Result<Vec<StreamSubscription>> {
+    if subscriptions.is_empty() {
+        return Err(Error::invalid_input(
+            "subscriptions",
+            "at least one subscription is required",
+        ));
+    }
+
+    let mut normalized = Vec::new();
+    for mut subscription in subscriptions {
+        subscription.topic = non_empty_trimmed(&subscription.topic, "subscription.topic")?;
+        if !normalized.iter().any(|existing: &StreamSubscription| {
+            existing.kind == subscription.kind && existing.topic == subscription.topic
+        }) {
+            normalized.push(subscription);
+        }
+    }
+
+    Ok(normalized)
+}
+
 /// Stream subscription type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum StreamSubscriptionType {
@@ -1471,20 +1487,6 @@ struct OpenConnectionRequest<'a> {
     user_agent: &'a str,
 }
 
-#[derive(Debug, Deserialize)]
-struct OpenConnectionResponse {
-    endpoint: String,
-    ticket: String,
-}
-
-impl OpenConnectionResponse {
-    fn validate(&self) -> Result<()> {
-        non_empty_trimmed(&self.endpoint, "endpoint")?;
-        non_empty_trimmed(&self.ticket, "ticket")?;
-        Ok(())
-    }
-}
-
 fn websocket_url(ticket: &OpenConnectionResponse) -> Result<Url> {
     let mut url = Url::parse(&ticket.endpoint)
         .map_err(|source| Error::Stream(format!("invalid stream endpoint: {source}")))?;
@@ -1493,8 +1495,127 @@ fn websocket_url(ticket: &OpenConnectionResponse) -> Result<Url> {
             "stream endpoint scheme must be ws or wss".to_string(),
         ));
     }
-    url.query_pairs_mut().append_pair("ticket", &ticket.ticket);
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(Error::Stream(
+            "stream endpoint must not contain username or password".to_string(),
+        ));
+    }
+    if url.fragment().is_some() {
+        return Err(Error::Stream(
+            "stream endpoint must not contain a fragment".to_string(),
+        ));
+    }
+
+    let query_pairs = url
+        .query_pairs()
+        .filter(|(name, _value)| name != "ticket")
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    url.set_query(None);
+    {
+        let mut query = url.query_pairs_mut();
+        for (name, value) in query_pairs {
+            query.append_pair(&name, &value);
+        }
+        query.append_pair("ticket", &ticket.ticket);
+    }
     Ok(url)
+}
+
+#[derive(Debug)]
+struct OpenConnectionResponse {
+    endpoint: String,
+    ticket: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawOpenConnectionResponse {
+    endpoint: Option<String>,
+    ticket: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "crate::transport::deserialize_optional_i64"
+    )]
+    errcode: Option<i64>,
+    #[serde(
+        rename = "code",
+        default,
+        alias = "Code",
+        deserialize_with = "crate::transport::deserialize_optional_string"
+    )]
+    api_code: Option<String>,
+    #[serde(alias = "message")]
+    errmsg: Option<String>,
+    #[serde(
+        default,
+        alias = "requestId",
+        alias = "RequestId",
+        alias = "requestid",
+        deserialize_with = "crate::transport::deserialize_optional_string"
+    )]
+    request_id: Option<String>,
+}
+
+impl RawOpenConnectionResponse {
+    fn into_connection(
+        self,
+        body: &str,
+        error_body_snippet: BodySnippetConfig,
+    ) -> Result<OpenConnectionResponse> {
+        if let Some(code) = self.errcode
+            && code != 0
+        {
+            return Err(api_error_from_body_with_code(
+                code,
+                self.api_code.clone(),
+                response_error_message(self.errmsg, "unknown dingtalk api error"),
+                self.request_id,
+                body,
+                error_body_snippet,
+            ));
+        }
+        if let Some(api_code) = self.api_code.as_deref()
+            && !is_success_api_code(api_code)
+        {
+            return Err(api_error_from_body_with_code(
+                -1,
+                self.api_code.clone(),
+                response_error_message(self.errmsg, "unknown dingtalk api error"),
+                self.request_id,
+                body,
+                error_body_snippet,
+            ));
+        }
+
+        let endpoint = self
+            .endpoint
+            .as_deref()
+            .and_then(|value| non_empty_trimmed(value, "endpoint").ok())
+            .ok_or_else(|| {
+                api_error_from_body(
+                    -1,
+                    "missing endpoint in DingTalk Stream open response",
+                    self.request_id.clone(),
+                    body,
+                    error_body_snippet,
+                )
+            })?;
+        let ticket = self
+            .ticket
+            .as_deref()
+            .and_then(|value| non_empty_trimmed(value, "ticket").ok())
+            .ok_or_else(|| {
+                api_error_from_body(
+                    -1,
+                    "missing ticket in DingTalk Stream open response",
+                    self.request_id.clone(),
+                    body,
+                    error_body_snippet,
+                )
+            })?;
+
+        Ok(OpenConnectionResponse { endpoint, ticket })
+    }
 }
 
 /// Incoming DingTalk Stream frame.
@@ -1511,7 +1632,7 @@ impl StreamFrame {
         let raw = serde_json::from_str::<RawStreamFrame>(text)?;
         Ok(Self {
             frame_type: StreamFrameType::from_raw(&raw.frame_type),
-            headers: raw.headers,
+            headers: raw.headers.normalized()?,
             data: raw.data,
         })
     }
@@ -1566,6 +1687,12 @@ impl StreamFrame {
         }
     }
 
+    /// Returns `data` as JSON when string decoding succeeds, otherwise returns raw `data`.
+    #[must_use]
+    pub fn data_json_or_raw(&self) -> Value {
+        self.data_json().unwrap_or_else(|_error| self.data.clone())
+    }
+
     /// Decodes `data` into a concrete type, handling string-encoded JSON frames.
     pub fn data_as<T>(&self) -> Result<T>
     where
@@ -1613,12 +1740,10 @@ impl StreamFrame {
 
     fn message_id_from_text(text: &str) -> Option<String> {
         let value = serde_json::from_str::<Value>(text).ok()?;
-        value
-            .get("headers")?
-            .get("messageId")?
-            .as_str()
-            .filter(|value| !value.trim().is_empty())
-            .map(ToOwned::to_owned)
+        normalized_string_value(value_by_names(
+            value.get("headers")?,
+            &["messageId", "message_id", "MessageId"],
+        )?)
     }
 }
 
@@ -1708,9 +1833,7 @@ impl CardCallbackEvent {
     }
 
     fn string_field(&self, names: &[&str]) -> Option<&str> {
-        self.value_field(names)
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
+        self.value_field(names).and_then(trimmed_str_value)
     }
 
     fn value_field(&self, names: &[&str]) -> Option<&Value> {
@@ -1986,7 +2109,10 @@ impl CardCallbackActionValue {
     /// Creates action values from raw JSON.
     #[must_use]
     pub fn from_value(value: Value) -> Self {
-        Self { value: Some(value) }
+        let value = normalize_action_value(value);
+        Self {
+            value: (!value.is_null()).then_some(value),
+        }
     }
 
     /// Returns whether no action value was supplied.
@@ -2022,9 +2148,7 @@ impl CardCallbackActionValue {
     /// Returns a named string field from an object action value.
     #[must_use]
     pub fn string(&self, name: &str) -> Option<&str> {
-        self.get(name)
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
+        self.get(name).and_then(trimmed_str_value)
     }
 
     /// Deserializes the action value into an application type.
@@ -2039,6 +2163,19 @@ impl CardCallbackActionValue {
             .transpose()
             .map_err(Error::from)
     }
+}
+
+fn normalize_action_value(value: Value) -> Value {
+    let Value::String(raw) = &value else {
+        return value;
+    };
+
+    let trimmed = raw.trim();
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return value;
+    }
+
+    serde_json::from_str(trimmed).unwrap_or(value)
 }
 
 /// Response payload for interactive card callbacks.
@@ -2083,7 +2220,18 @@ impl CardCallbackResponse {
 
     /// Converts this value into a Stream ACK response.
     pub fn into_stream_response(self) -> Result<StreamFrameResponse> {
+        self.validate()?;
         StreamFrameResponse::json(self)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if let Some(card_data) = &self.card_data {
+            card_data.validate("card_data")?;
+        }
+        if let Some(user_private_data) = &self.user_private_data {
+            user_private_data.validate("user_private_data")?;
+        }
+        Ok(())
     }
 }
 
@@ -2103,16 +2251,32 @@ impl CardCallbackResponseData {
         Self {
             card_param_map: values
                 .into_iter()
-                .map(|(key, value)| (key.into(), value.into()))
+                .map(|(key, value)| (key.into().trim().to_string(), value.into()))
                 .collect(),
         }
+    }
+
+    fn validate(&self, field: &'static str) -> Result<()> {
+        if self.card_param_map.is_empty() {
+            return Err(Error::invalid_input(
+                field,
+                "at least one card parameter is required",
+            ));
+        }
+        for key in self.card_param_map.keys() {
+            non_empty_trimmed(key, field)?;
+        }
+        Ok(())
     }
 }
 
 fn callback_content(raw: &Value) -> Option<Value> {
     let value = value_by_names(raw, &["content"])?;
     match value {
-        Value::String(text) => serde_json::from_str::<Value>(text).ok(),
+        Value::String(text) => Some(
+            serde_json::from_str::<Value>(text)
+                .unwrap_or_else(|_error| Value::String(text.clone())),
+        ),
         other => Some(other.clone()),
     }
 }
@@ -2143,11 +2307,20 @@ fn value_by_names<'a>(raw: &'a Value, names: &[&str]) -> Option<&'a Value> {
 }
 
 fn string_value(raw: &Value, names: &[&str]) -> Option<String> {
-    value_by_names(raw, names)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
+    value_by_names(raw, names).and_then(normalized_string_value)
+}
+
+fn normalized_string_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => non_empty_trimmed(value, "value").ok(),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn trimmed_str_value(value: &Value) -> Option<&str> {
+    let value = value.as_str()?.trim();
+    (!value.is_empty()).then_some(value)
 }
 
 fn string_vec_from_value(value: &Value) -> Vec<String> {
@@ -2191,8 +2364,9 @@ struct RawStreamFrame {
 /// DingTalk Stream frame headers.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StreamHeaders {
+    #[serde(alias = "Topic")]
     topic: String,
-    #[serde(rename = "messageId")]
+    #[serde(rename = "messageId", alias = "message_id", alias = "MessageId")]
     message_id: String,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
@@ -2216,7 +2390,7 @@ impl StreamHeaders {
     pub fn content_type(&self) -> Option<&str> {
         self.get("contentType")
             .or_else(|| self.get("content-type"))
-            .and_then(Value::as_str)
+            .and_then(trimmed_str_value)
     }
 
     /// Returns an extra header value by name.
@@ -2234,6 +2408,12 @@ impl StreamHeaders {
     #[must_use]
     pub fn extra(&self) -> &BTreeMap<String, Value> {
         &self.extra
+    }
+
+    fn normalized(mut self) -> Result<Self> {
+        self.topic = non_empty_trimmed(&self.topic, "stream.headers.topic")?;
+        self.message_id = non_empty_trimmed(&self.message_id, "stream.headers.message_id")?;
+        Ok(self)
     }
 }
 
@@ -2263,7 +2443,8 @@ pub enum StreamFrameType {
 
 impl StreamFrameType {
     fn from_raw(value: &str) -> Self {
-        match value.trim().to_ascii_uppercase().as_str() {
+        let value = value.trim();
+        match value.to_ascii_uppercase().as_str() {
             "SYSTEM" => Self::System,
             "CALLBACK" => Self::Callback,
             "EVENT" => Self::Event,
@@ -2461,6 +2642,102 @@ mod tests {
     }
 
     #[test]
+    fn websocket_url_replaces_existing_ticket() {
+        let url = websocket_url(&OpenConnectionResponse {
+            endpoint: "wss://example.com/connect?tenant=ding&ticket=stale".to_string(),
+            ticket: "fresh-ticket".to_string(),
+        })
+        .expect("url");
+
+        assert_eq!(
+            url.as_str(),
+            "wss://example.com/connect?tenant=ding&ticket=fresh-ticket"
+        );
+    }
+
+    #[test]
+    fn websocket_url_rejects_credentials_and_fragments() {
+        let userinfo = websocket_url(&OpenConnectionResponse {
+            endpoint: "wss://user:pass@example.com/connect".to_string(),
+            ticket: "ticket-1".to_string(),
+        })
+        .expect_err("userinfo should fail");
+        let fragment = websocket_url(&OpenConnectionResponse {
+            endpoint: "wss://example.com/connect#fragment".to_string(),
+            ticket: "ticket-1".to_string(),
+        })
+        .expect_err("fragment should fail");
+
+        assert_eq!(userinfo.kind(), crate::ErrorKind::Stream);
+        assert_eq!(fragment.kind(), crate::ErrorKind::Stream);
+    }
+
+    #[test]
+    fn open_connection_response_normalizes_endpoint_and_ticket() {
+        let response = RawOpenConnectionResponse {
+            endpoint: Some(" wss://example.com/connect ".to_string()),
+            ticket: Some(" ticket-1 ".to_string()),
+            errcode: Some(0),
+            api_code: None,
+            errmsg: None,
+            request_id: Some(" request-1 ".to_string()),
+        }
+        .into_connection(
+            r#"{"errcode":0,"endpoint":" wss://example.com/connect ","ticket":" ticket-1 "}"#,
+            BodySnippetConfig::default(),
+        )
+        .expect("connection response");
+
+        assert_eq!(response.endpoint, "wss://example.com/connect");
+        assert_eq!(response.ticket, "ticket-1");
+    }
+
+    #[test]
+    fn open_connection_response_preserves_api_errors() {
+        let error = RawOpenConnectionResponse {
+            endpoint: None,
+            ticket: None,
+            errcode: Some(40001),
+            api_code: None,
+            errmsg: Some("invalid client".to_string()),
+            request_id: Some(" request-1 ".to_string()),
+        }
+        .into_connection(
+            r#"{"errcode":40001,"errmsg":"invalid client","requestId":" request-1 "}"#,
+            BodySnippetConfig::default(),
+        )
+        .expect_err("business error should fail");
+
+        assert_eq!(error.kind(), crate::ErrorKind::Api);
+        assert_eq!(error.request_id(), Some("request-1"));
+        assert!(
+            error
+                .error_body_snippet()
+                .is_some_and(|snippet| snippet.contains("invalid client"))
+        );
+    }
+
+    #[test]
+    fn open_connection_response_rejects_missing_ticket() {
+        let error = RawOpenConnectionResponse {
+            endpoint: Some("wss://example.com/connect".to_string()),
+            ticket: Some(" ".to_string()),
+            errcode: Some(0),
+            api_code: None,
+            errmsg: None,
+            request_id: Some("request-1".to_string()),
+        }
+        .into_connection(
+            r#"{"errcode":0,"endpoint":"wss://example.com/connect","ticket":" ","requestId":"request-1"}"#,
+            BodySnippetConfig::default(),
+        )
+        .expect_err("missing ticket should fail");
+
+        assert_eq!(error.kind(), crate::ErrorKind::Api);
+        assert_eq!(error.request_id(), Some("request-1"));
+    }
+
+    #[test]
     fn stream_ack_serializes_message_id() {
         let ack = StreamAck::ok(
             "message-1".to_string(),
@@ -2544,7 +2821,7 @@ mod tests {
                     "type":"CALLBACK",
                     "headers":{
                         "topic":"/v1.0/im/bot/messages/get",
-                        "messageId":"message-1",
+                        "MessageId":12345,
                         "contentType":"application/json"
                     }
                 }"#,
@@ -2554,14 +2831,50 @@ mod tests {
         let value = serde_json::to_value(handled.ack).expect("json");
 
         assert_eq!(value["code"], 500);
-        assert_eq!(value["headers"]["messageId"], "message-1");
+        assert_eq!(value["headers"]["messageId"], "12345");
         assert!(matches!(
             handled.error,
             Some(StreamFrameError {
                 message_id: Some(message_id),
                 ..
-            }) if message_id == "message-1"
+            }) if message_id == "12345"
         ));
+    }
+
+    #[tokio::test]
+    async fn system_ping_ack_preserves_non_json_data() {
+        let client = DingTalk::builder()
+            .app_key_and_secret("client-id", "client-secret")
+            .build()
+            .expect("client");
+        let bot = Bot::new(client.clone());
+        let stream = StreamClient::builder(client)
+            .expect("builder")
+            .bot(bot)
+            .build()
+            .expect("stream");
+
+        let handled = stream
+            .handle_text_frame(
+                r#"{
+                    "specVersion":"1.0",
+                    "type":"SYSTEM",
+                    "headers":{
+                        "topic":"ping",
+                        "messageId":"message-1",
+                        "contentType":"application/json"
+                    },
+                    "data":"not-json"
+                }"#,
+            )
+            .await
+            .expect("handled");
+        let value = serde_json::to_value(handled.ack).expect("json");
+
+        assert_eq!(value["code"], 200);
+        assert_eq!(value["headers"]["messageId"], "message-1");
+        assert_eq!(value["data"], r#""not-json""#);
+        assert!(handled.error.is_none());
     }
 
     #[test]
@@ -2607,6 +2920,37 @@ mod tests {
         assert_eq!(card.topic(), CARD_CALLBACK_TOPIC);
         assert_eq!(card.kind(), StreamSubscriptionType::Callback);
         assert!(event.validate().is_ok());
+    }
+
+    #[test]
+    fn stream_builder_deduplicates_subscriptions() {
+        let client = DingTalk::builder()
+            .app_key_and_secret("client-id", "client-secret")
+            .build()
+            .expect("client");
+        let bot = Bot::new(client.clone());
+
+        let stream = StreamClient::builder(client)
+            .expect("builder")
+            .subscriptions(vec![
+                StreamSubscription::event(" /v1.0/example/events "),
+                StreamSubscription::event("/v1.0/example/events"),
+                StreamSubscription::callback("/v1.0/example/events"),
+            ])
+            .bot(bot)
+            .build()
+            .expect("stream");
+
+        assert_eq!(stream.subscriptions.len(), 2);
+        assert_eq!(stream.subscriptions[0].topic(), "/v1.0/example/events");
+        assert_eq!(
+            stream.subscriptions[0].kind(),
+            StreamSubscriptionType::Event
+        );
+        assert_eq!(
+            stream.subscriptions[1].kind(),
+            StreamSubscriptionType::Callback
+        );
     }
 
     #[test]
@@ -2717,6 +3061,48 @@ mod tests {
                 message_type: MessageType::Text,
             }]
         );
+    }
+
+    #[test]
+    fn stream_frame_normalizes_headers_and_unknown_type() {
+        let frame = StreamFrame::from_text(
+            r#"{
+                "specVersion":"1.0",
+                "type":" FUTURE ",
+                "headers":{
+                    "topic":" /v1.0/example/events ",
+                    "messageId":" message-1 ",
+                    "contentType":"application/json"
+                },
+                "data":{"ok":true}
+            }"#,
+        )
+        .expect("frame");
+
+        assert_eq!(
+            frame.frame_type(),
+            &StreamFrameType::Unknown("FUTURE".to_string())
+        );
+        assert_eq!(frame.topic(), "/v1.0/example/events");
+        assert_eq!(frame.message_id(), "message-1");
+    }
+
+    #[test]
+    fn stream_frame_rejects_blank_required_headers() {
+        let error = StreamFrame::from_text(
+            r#"{
+                "specVersion":"1.0",
+                "type":"EVENT",
+                "headers":{
+                    "topic":"/v1.0/example/events",
+                    "messageId":" "
+                },
+                "data":{"ok":true}
+            }"#,
+        )
+        .expect_err("blank message id should fail");
+
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -2890,9 +3276,71 @@ mod tests {
     }
 
     #[test]
+    fn card_callback_accessors_return_normalized_strings() {
+        let event = CardCallbackEvent::from_value(serde_json::json!({
+            "cardBizId": " card-biz-id ",
+            "operatorUserId": " user-1 ",
+            "actionValue": {
+                "field": " value "
+            }
+        }));
+        let payload = event.payload();
+
+        assert_eq!(event.card_biz_id(), Some("card-biz-id"));
+        assert_eq!(event.user_id(), Some("user-1"));
+        assert_eq!(
+            event
+                .action_value()
+                .and_then(|value| value.get("field"))
+                .and_then(Value::as_str),
+            Some(" value ")
+        );
+        assert_eq!(payload.card_biz_id(), Some("card-biz-id"));
+        assert_eq!(payload.operator().user_id(), Some("user-1"));
+        assert_eq!(payload.action_value().string("field"), Some("value"));
+    }
+
+    #[test]
+    fn card_callback_payload_preserves_unparseable_string_content() {
+        let event = CardCallbackEvent::from_value(serde_json::json!({
+            "cardBizId": "card-biz-id",
+            "content": "not-json"
+        }));
+        let payload = event.payload();
+
+        assert_eq!(
+            payload.content().map(CardCallbackContent::raw),
+            Some(&Value::String("not-json".to_string()))
+        );
+    }
+
+    #[test]
+    fn card_callback_action_value_treats_null_as_empty() {
+        let value = CardCallbackActionValue::from_value(Value::Null);
+
+        assert!(value.is_empty());
+        assert_eq!(
+            value
+                .deserialize::<serde_json::Value>()
+                .expect("deserialize"),
+            None
+        );
+    }
+
+    #[test]
+    fn card_callback_action_value_decodes_string_encoded_json() {
+        let value = CardCallbackActionValue::from_value(Value::String(
+            r#"{"field":" value ","count":2}"#.to_string(),
+        ));
+
+        assert_eq!(value.string("field"), Some("value"));
+        assert_eq!(value.get("count").and_then(Value::as_u64), Some(2));
+    }
+
+    #[test]
     fn card_callback_response_serializes_card_param_maps() {
         let response = CardCallbackResponse::new()
-            .card_data([("status", "done")])
+            .card_data([(" status ", "done")])
             .user_private_data([("clicked", "true")])
             .into_stream_response()
             .expect("response");
@@ -2905,6 +3353,16 @@ mod tests {
             response.as_value()["userPrivateData"]["cardParamMap"]["clicked"],
             "true"
         );
+    }
+
+    #[test]
+    fn card_callback_response_rejects_empty_param_maps() {
+        let error = CardCallbackResponse::new()
+            .card_data(Vec::<(&str, &str)>::new())
+            .into_stream_response()
+            .expect_err("empty param map should fail");
+
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
     }
 
     #[tokio::test]
@@ -3091,7 +3549,7 @@ mod tests {
                 "headers":{
                     "topic":"/v1.0/example/future",
                     "messageId":"message-1",
-                    "contentType":"application/json"
+                    "contentType":" application/json "
                 },
                 "data":"{\"ok\":true}"
             }"#,
@@ -3112,11 +3570,11 @@ mod tests {
         assert_eq!(frame.content_type(), Some("application/json"));
         assert_eq!(
             frame.header("content-type").and_then(Value::as_str),
-            Some("application/json")
+            Some(" application/json ")
         );
         assert_eq!(
             frame.headers().get("CONTENTTYPE").and_then(Value::as_str),
-            Some("application/json")
+            Some(" application/json ")
         );
         assert!(frame.headers().extra().contains_key("contentType"));
         assert_eq!(frame.data_json().expect("data")["ok"], true);

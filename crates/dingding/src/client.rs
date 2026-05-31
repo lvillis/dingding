@@ -319,4 +319,26 @@ mod tests {
             Some("override-key")
         );
     }
+
+    #[test]
+    fn builder_rejects_non_http_base_url() {
+        let error = DingTalk::builder()
+            .webhook_base_url("file:///tmp/dingtalk")
+            .build()
+            .err()
+            .expect("non-http base URL should fail");
+
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidConfig);
+    }
+
+    #[test]
+    fn builder_rejects_base_url_userinfo() {
+        let error = DingTalk::builder()
+            .webhook_base_url("https://user:pass@example.com")
+            .build()
+            .err()
+            .expect("userinfo should fail");
+
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidConfig);
+    }
 }

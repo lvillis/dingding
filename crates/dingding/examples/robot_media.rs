@@ -25,7 +25,7 @@ async fn main() -> Result<()> {
     let file_name = upload.file_name().to_string();
     let media = robot.upload_media(upload).await?;
 
-    let process_query_key = match (target, media_type) {
+    let response = match (target, media_type) {
         (Target::Group(open_conversation_id), MediaType::Image) => {
             robot
                 .send_group_image(open_conversation_id, media.media_id())
@@ -90,7 +90,7 @@ async fn main() -> Result<()> {
     println!(
         "media sent: media_id={} process_query_key={}",
         media.media_id(),
-        process_query_key
+        response.process_query_key()
     );
     Ok(())
 }

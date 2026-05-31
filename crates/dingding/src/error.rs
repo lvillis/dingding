@@ -54,11 +54,15 @@ impl ErrorKind {
 #[derive(Debug, ThisError)]
 #[non_exhaustive]
 pub enum Error {
-    /// DingTalk API business error, usually represented by `errcode != 0`.
-    #[error("DingTalk API error (code={code}): {message}")]
+    /// DingTalk API business error, usually represented by `errcode != 0`
+    /// or a non-success modern OpenAPI `code`.
+    #[error("DingTalk API error (errcode={code}{api_code_suffix}): {message}", api_code_suffix = api_code_suffix(api_code.as_deref()))]
     Api {
-        /// DingTalk error code.
+        /// Legacy DingTalk numeric `errcode`, HTTP status, or `-1` when DingTalk only returned a
+        /// modern string `code`.
         code: i64,
+        /// Modern DingTalk OpenAPI string `code` when supplied.
+        api_code: Option<String>,
         /// DingTalk error message.
         message: String,
         /// Optional request id returned by DingTalk.
@@ -146,6 +150,28 @@ impl Error {
         }
     }
 
+    /// Returns the legacy DingTalk numeric `errcode` when this is an API error.
+    ///
+    /// Modern OpenAPI responses can return only a string `code`; in that case this returns the
+    /// SDK's synthetic numeric code, usually `-1`. Use [`Self::api_code`] for the structured
+    /// modern code.
+    #[must_use]
+    pub fn errcode(&self) -> Option<i64> {
+        match self {
+            Self::Api { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
+
+    /// Returns the modern DingTalk OpenAPI string `code` when present.
+    #[must_use]
+    pub fn api_code(&self) -> Option<&str> {
+        match self {
+            Self::Api { api_code, .. } => api_code.as_deref(),
+            _ => None,
+        }
+    }
+
     /// Returns redacted response body snippet when retained.
     #[must_use]
     pub fn error_body_snippet(&self) -> Option<&str> {
@@ -181,7 +207,12 @@ impl Error {
                 }
                 _ => false,
             },
-            Self::Api { code, .. } => matches!(*code, 130101 | 130102),
+            Self::Api { code, api_code, .. } => {
+                matches!(*code, 429 | 500..=599 | 130101 | 130102)
+                    || api_code
+                        .as_deref()
+                        .is_some_and(is_retryable_dingtalk_api_code)
+            }
             _ => false,
         }
     }
@@ -207,19 +238,49 @@ impl Error {
         Self::InvalidSignature(message.into())
     }
 
-    pub(crate) fn api(
+    pub(crate) fn api_with_code(
         code: i64,
+        api_code: Option<String>,
         message: impl Into<String>,
         request_id: Option<String>,
         error_body_snippet: Option<String>,
     ) -> Self {
         Self::Api {
             code,
+            api_code,
             message: message.into(),
             request_id,
             error_body_snippet,
         }
     }
+}
+
+fn api_code_suffix(api_code: Option<&str>) -> String {
+    api_code
+        .map(|api_code| format!(", api_code={api_code}"))
+        .unwrap_or_default()
+}
+
+fn is_retryable_dingtalk_api_code(value: &str) -> bool {
+    let value = value.trim();
+    if value
+        .parse::<i64>()
+        .is_ok_and(|code| matches!(code, 429 | 500..=599 | 130101 | 130102))
+    {
+        return true;
+    }
+
+    let value = value.to_ascii_lowercase();
+    value.contains("throttl")
+        || value.contains("too_many")
+        || value.contains("toomany")
+        || value.contains("too many")
+        || value.contains("rate_limit")
+        || value.contains("ratelimit")
+        || value.contains("timeout")
+        || value.contains("temporar")
+        || value.contains("internal")
+        || value.contains("unavailable")
 }
 
 impl fmt::Display for ErrorKind {
@@ -240,6 +301,48 @@ mod tests {
         assert_eq!(
             ErrorKind::MissingCredentials.to_string(),
             "missing_credentials"
+        );
+    }
+
+    #[test]
+    fn api_http_status_codes_can_be_retryable() {
+        assert!(Error::api_with_code(429, None, "too many requests", None, None).is_retryable());
+        assert!(Error::api_with_code(503, None, "unavailable", None, None).is_retryable());
+        assert!(!Error::api_with_code(400, None, "bad request", None, None).is_retryable());
+    }
+
+    #[test]
+    fn api_error_exposes_modern_code() {
+        let error = Error::api_with_code(
+            -1,
+            Some("InvalidParameter".to_string()),
+            "bad request",
+            Some("request-1".to_string()),
+            None,
+        );
+
+        assert_eq!(error.errcode(), Some(-1));
+        assert_eq!(error.api_code(), Some("InvalidParameter"));
+        assert_eq!(error.request_id(), Some("request-1"));
+        assert!(error.to_string().contains("api_code=InvalidParameter"));
+        assert!(!error.is_retryable());
+    }
+
+    #[test]
+    fn modern_retryable_api_codes_are_retryable() {
+        assert!(
+            Error::api_with_code(
+                -1,
+                Some("TooManyRequests".to_string()),
+                "limited",
+                None,
+                None,
+            )
+            .is_retryable()
+        );
+        assert!(
+            Error::api_with_code(-1, Some("503".to_string()), "unavailable", None, None,)
+                .is_retryable()
         );
     }
 }

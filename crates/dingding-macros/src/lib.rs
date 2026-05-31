@@ -41,6 +41,18 @@ fn expand_handler(
             "dingding handlers must be async functions",
         ));
     }
+    if input.sig.unsafety.is_some() {
+        return Err(syn::Error::new_spanned(
+            input.sig.unsafety,
+            "dingding handlers must not be unsafe functions",
+        ));
+    }
+    if !input.sig.generics.params.is_empty() || input.sig.generics.where_clause.is_some() {
+        return Err(syn::Error::new_spanned(
+            input.sig.generics,
+            "dingding handlers must not have generic parameters",
+        ));
+    }
 
     let mut scope = "any";
     let mut msg = "any";
@@ -160,17 +172,7 @@ fn should_mark_path_as_used(expr: &Expr) -> bool {
         return false;
     }
 
-    let Some(last) = path.path.segments.last() else {
-        return false;
-    };
-
     path.path.segments.len() > 1
-        || last
-            .ident
-            .to_string()
-            .chars()
-            .next()
-            .is_some_and(char::is_uppercase)
 }
 
 fn command_expr(expr: &Expr) -> syn::Result<Expr> {

@@ -1,0 +1,5 @@
+error: dingding handlers must not be unsafe functions
+ --> tests/ui/handler_macro/unsafe_handler.rs:2:7
+  |
+2 | async unsafe fn ping(_ctx: dingding::bot::AnyContext) -> dingding::Result<()> {
+  |       ^^^^^^

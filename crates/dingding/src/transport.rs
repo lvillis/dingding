@@ -4,7 +4,11 @@ use reqx::{
     advanced::{ClientProfile, PermissiveRetryEligibility},
     prelude::{Client as HttpClient, RetryPolicy},
 };
-use serde::de::DeserializeOwned;
+use serde::{
+    Deserialize,
+    de::{DeserializeOwned, Error as DeError},
+};
+use serde_json::Value;
 use url::Url;
 
 use crate::{
@@ -211,10 +215,24 @@ fn build_http_client(base_url: &Url, config: &TransportConfig) -> Result<HttpCli
 
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct StandardApiResponse {
+    #[serde(default, deserialize_with = "deserialize_optional_i64")]
     pub(crate) errcode: Option<i64>,
+    #[serde(
+        rename = "code",
+        default,
+        alias = "Code",
+        deserialize_with = "deserialize_optional_string"
+    )]
+    pub(crate) api_code: Option<String>,
     #[serde(alias = "message")]
     pub(crate) errmsg: Option<String>,
-    #[serde(default, alias = "requestId", alias = "RequestId")]
+    #[serde(
+        default,
+        alias = "requestId",
+        alias = "RequestId",
+        alias = "requestid",
+        deserialize_with = "deserialize_optional_string"
+    )]
     pub(crate) request_id: Option<String>,
 }
 
@@ -226,7 +244,15 @@ where
     T: DeserializeOwned,
 {
     let body = successful_body(response, error_body_snippet)?;
-    let value = serde_json::from_str(&body)?;
+    let value = serde_json::from_str(&body).map_err(|source| {
+        api_error_from_body(
+            -1,
+            format!("invalid DingTalk JSON response: {source}"),
+            None,
+            &body,
+            error_body_snippet,
+        )
+    })?;
     Ok((value, body))
 }
 
@@ -236,21 +262,56 @@ pub(crate) fn parse_standard_response(
     error_body_snippet: BodySnippetConfig,
 ) -> Result<StandardApiResponse> {
     let (value, body) = decode_json_response::<StandardApiResponse>(response, error_body_snippet)?;
-    if let Some(code) = value.errcode
-        && code != 0
-    {
-        return Err(api_error_from_body(
+    match value.errcode {
+        Some(0)
+            if value
+                .api_code
+                .as_deref()
+                .is_some_and(|api_code| !is_success_api_code(api_code)) =>
+        {
+            Err(api_error_from_body_with_code(
+                -1,
+                value.api_code.clone(),
+                response_error_message(value.errmsg.clone(), "unknown dingtalk api error"),
+                value.request_id.clone(),
+                &body,
+                error_body_snippet,
+            ))
+        }
+        Some(0) => Ok(value),
+        Some(code) => Err(api_error_from_body_with_code(
             code,
-            value
-                .errmsg
-                .clone()
-                .unwrap_or_else(|| "unknown dingtalk api error".to_string()),
+            value.api_code.clone(),
+            response_error_message(value.errmsg.clone(), "unknown dingtalk api error"),
             value.request_id.clone(),
             &body,
             error_body_snippet,
-        ));
+        )),
+        None if value
+            .api_code
+            .as_deref()
+            .is_some_and(|api_code| !is_success_api_code(api_code)) =>
+        {
+            Err(api_error_from_body_with_code(
+                -1,
+                value.api_code.clone(),
+                response_error_message(value.errmsg.clone(), "unknown dingtalk api error"),
+                value.request_id.clone(),
+                &body,
+                error_body_snippet,
+            ))
+        }
+        None => Err(api_error_from_body(
+            -1,
+            response_error_message(
+                value.errmsg.clone(),
+                "missing errcode field in DingTalk response",
+            ),
+            value.request_id.clone(),
+            &body,
+            error_body_snippet,
+        )),
     }
-    Ok(value)
 }
 
 #[cfg(feature = "openapi")]
@@ -259,15 +320,65 @@ pub(crate) fn parse_standard_text_response(
     error_body_snippet: BodySnippetConfig,
 ) -> Result<String> {
     let body = successful_body(response, error_body_snippet)?;
-    if let Ok(value) = serde_json::from_str::<StandardApiResponse>(&body)
-        && let Some(code) = value.errcode
-        && code != 0
-    {
+    let raw = serde_json::from_str::<Value>(&body).map_err(|source| {
+        api_error_from_body(
+            -1,
+            format!("invalid DingTalk JSON response: {source}"),
+            None,
+            &body,
+            error_body_snippet,
+        )
+    })?;
+    let Value::Object(object) = &raw else {
         return Err(api_error_from_body(
-            code,
-            value
-                .errmsg
-                .unwrap_or_else(|| "unknown dingtalk api error".to_string()),
+            -1,
+            "DingTalk response must be a JSON object",
+            None,
+            &body,
+            error_body_snippet,
+        ));
+    };
+    let has_success_payload = standard_text_object_has_success_payload(object);
+
+    let value = serde_json::from_value::<StandardApiResponse>(raw).map_err(|source| {
+        api_error_from_body(
+            -1,
+            format!("invalid DingTalk JSON response: {source}"),
+            None,
+            &body,
+            error_body_snippet,
+        )
+    })?;
+    match value.errcode {
+        Some(0) => {}
+        Some(code) => {
+            return Err(api_error_from_body_with_code(
+                code,
+                value.api_code.clone(),
+                response_error_message(value.errmsg, "unknown dingtalk api error"),
+                value.request_id,
+                &body,
+                error_body_snippet,
+            ));
+        }
+        None => {}
+    }
+    if let Some(api_code) = value.api_code.as_deref()
+        && !is_success_api_code(api_code)
+    {
+        return Err(api_error_from_body_with_code(
+            -1,
+            value.api_code.clone(),
+            response_error_message(value.errmsg, "unknown dingtalk api error"),
+            value.request_id,
+            &body,
+            error_body_snippet,
+        ));
+    }
+    if value.errcode.is_none() && !has_success_payload {
+        return Err(api_error_from_body(
+            -1,
+            response_error_message(value.errmsg, "missing errcode field in DingTalk response"),
             value.request_id,
             &body,
             error_body_snippet,
@@ -275,6 +386,13 @@ pub(crate) fn parse_standard_text_response(
     }
 
     Ok(body)
+}
+
+#[cfg(feature = "openapi")]
+fn standard_text_object_has_success_payload(value: &serde_json::Map<String, Value>) -> bool {
+    value.contains_key("result")
+        || value.contains_key("processQueryKey")
+        || value.contains_key("process_query_key")
 }
 
 #[cfg(feature = "openapi")]
@@ -286,10 +404,25 @@ where
     T: DeserializeOwned,
 {
     let (value, body) = decode_json_response::<DingTalkResult<T>>(response, error_body_snippet)?;
-    if value.errcode != 0 {
-        return Err(api_error_from_body(
-            value.errcode,
-            value.errmsg,
+    if let Some(code) = value.errcode
+        && code != 0
+    {
+        return Err(api_error_from_body_with_code(
+            code,
+            value.api_code.clone(),
+            response_error_message(value.errmsg, "unknown dingtalk api error"),
+            value.request_id,
+            &body,
+            error_body_snippet,
+        ));
+    }
+    if let Some(api_code) = value.api_code.as_deref()
+        && !is_success_api_code(api_code)
+    {
+        return Err(api_error_from_body_with_code(
+            -1,
+            value.api_code.clone(),
+            response_error_message(value.errmsg, "unknown dingtalk api error"),
             value.request_id,
             &body,
             error_body_snippet,
@@ -300,7 +433,7 @@ where
         api_error_from_body(
             -1,
             "missing result field in DingTalk response",
-            None,
+            value.request_id,
             &body,
             error_body_snippet,
         )
@@ -317,14 +450,19 @@ pub(crate) fn parse_binary_response(
 
     if !(200..=299).contains(&status) {
         let body = response.text_lossy();
-        let message = serde_json::from_str::<StandardApiResponse>(&body)
-            .ok()
-            .and_then(|parsed| parsed.errmsg);
-        return Err(Error::api(
+        let parsed = serde_json::from_str::<StandardApiResponse>(&body).ok();
+        let message = parsed
+            .as_ref()
+            .map(|parsed| response_error_message(parsed.errmsg.clone(), &format!("HTTP {status}")));
+        let request_id =
+            request_id.or_else(|| parsed.as_ref().and_then(|parsed| parsed.request_id.clone()));
+        return Err(api_error_from_body_with_code(
             status.into(),
+            parsed.as_ref().and_then(|parsed| parsed.api_code.clone()),
             message.unwrap_or_else(|| format!("HTTP {status}")),
             request_id,
-            body_snippet_for_error(&body, error_body_snippet),
+            &body,
+            error_body_snippet,
         ));
     }
 
@@ -334,11 +472,25 @@ pub(crate) fn parse_binary_response(
 #[cfg(feature = "openapi")]
 #[derive(Debug, serde::Deserialize)]
 struct DingTalkResult<T> {
-    errcode: i64,
+    #[serde(default, deserialize_with = "deserialize_optional_i64")]
+    errcode: Option<i64>,
+    #[serde(
+        rename = "code",
+        default,
+        alias = "Code",
+        deserialize_with = "deserialize_optional_string"
+    )]
+    api_code: Option<String>,
     #[serde(alias = "message")]
-    errmsg: String,
+    errmsg: Option<String>,
     result: Option<T>,
-    #[serde(default, alias = "requestId", alias = "RequestId")]
+    #[serde(
+        default,
+        alias = "requestId",
+        alias = "RequestId",
+        alias = "requestid",
+        deserialize_with = "deserialize_optional_string"
+    )]
     request_id: Option<String>,
 }
 
@@ -351,14 +503,19 @@ fn successful_body(
     let body = response.text_lossy();
 
     if !(200..=299).contains(&status) {
-        let message = serde_json::from_str::<StandardApiResponse>(&body)
-            .ok()
-            .and_then(|parsed| parsed.errmsg);
-        return Err(Error::api(
+        let parsed = serde_json::from_str::<StandardApiResponse>(&body).ok();
+        let message = parsed
+            .as_ref()
+            .map(|parsed| response_error_message(parsed.errmsg.clone(), &format!("HTTP {status}")));
+        let request_id =
+            request_id.or_else(|| parsed.as_ref().and_then(|parsed| parsed.request_id.clone()));
+        return Err(api_error_from_body_with_code(
             status.into(),
+            parsed.as_ref().and_then(|parsed| parsed.api_code.clone()),
             message.unwrap_or_else(|| format!("HTTP {status}")),
             request_id,
-            body_snippet_for_error(&body, error_body_snippet),
+            &body,
+            error_body_snippet,
         ));
     }
 
@@ -372,11 +529,44 @@ pub(crate) fn api_error_from_body(
     body: &str,
     config: BodySnippetConfig,
 ) -> Error {
-    Error::api(
+    api_error_from_body_with_code(code, None, message, request_id, body, config)
+}
+
+pub(crate) fn api_error_from_body_with_code(
+    code: i64,
+    api_code: Option<String>,
+    message: impl Into<String>,
+    request_id: Option<String>,
+    body: &str,
+    config: BodySnippetConfig,
+) -> Error {
+    Error::api_with_code(
         code,
-        message,
-        request_id,
+        normalize_optional_response_string(api_code),
+        normalize_error_message(message),
+        normalize_optional_response_string(request_id),
         body_snippet_for_error(body, config),
+    )
+}
+
+fn normalize_error_message(message: impl Into<String>) -> String {
+    let message = message.into();
+    let message = message.trim();
+    if message.is_empty() {
+        "unknown dingtalk api error".to_string()
+    } else {
+        message.to_string()
+    }
+}
+
+pub(crate) fn response_error_message(message: Option<String>, fallback: &str) -> String {
+    normalize_error_message(message.unwrap_or_else(|| fallback.to_string()))
+}
+
+pub(crate) fn is_success_api_code(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "ok" | "success"
     )
 }
 
@@ -386,14 +576,165 @@ fn response_request_id(response: &reqx::Response) -> Option<String> {
         .get("x-request-id")
         .or_else(|| response.headers().get("x-acs-request-id"))
         .and_then(|value| value.to_str().ok())
-        .map(ToOwned::to_owned)
+        .and_then(normalize_response_string)
+}
+
+fn normalize_optional_response_string(value: Option<String>) -> Option<String> {
+    value.and_then(|value| normalize_response_string(&value))
+}
+
+fn normalize_response_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+pub(crate) fn deserialize_optional_i64<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    match value {
+        Value::Null => Ok(None),
+        Value::Number(value) => value
+            .as_i64()
+            .ok_or_else(|| DeError::custom("expected signed integer"))
+            .map(Some),
+        Value::String(value) => {
+            let value = value.trim();
+            if value.is_empty() {
+                Ok(None)
+            } else {
+                value
+                    .parse::<i64>()
+                    .map(Some)
+                    .map_err(|source| DeError::custom(format!("expected signed integer: {source}")))
+            }
+        }
+        _ => Err(DeError::custom("expected signed integer or string integer")),
+    }
+}
+
+pub(crate) fn deserialize_optional_string<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    let value = match value {
+        Value::Null => return Ok(None),
+        Value::String(value) => value,
+        Value::Number(value) => value.to_string(),
+        _ => return Err(DeError::custom("expected string or number")),
+    };
+
+    Ok(normalize_response_string(&value))
 }
 
 fn body_snippet_for_error(body: &str, config: BodySnippetConfig) -> Option<String> {
-    if !config.enabled {
+    if !config.enabled || config.max_bytes == 0 {
         return None;
     }
 
     let snippet = truncate_snippet(body, config.max_bytes);
     Some(redact_text(&snippet))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_error_from_body_normalizes_message_and_request_id() {
+        let error = api_error_from_body(
+            40001,
+            "  ",
+            Some(" request-1 ".to_string()),
+            r#"{"errcode":40001,"errmsg":"  ","access_token":"secret-token"}"#,
+            BodySnippetConfig::default(),
+        );
+
+        assert_eq!(error.kind(), crate::ErrorKind::Api);
+        assert_eq!(error.request_id(), Some("request-1"));
+        assert!(error.to_string().contains("unknown dingtalk api error"));
+        assert!(error.error_body_snippet().is_some_and(
+            |snippet| snippet.contains("<redacted>") && !snippet.contains("secret-token")
+        ));
+    }
+
+    #[test]
+    fn api_error_from_body_preserves_modern_api_code() {
+        let error = api_error_from_body_with_code(
+            -1,
+            Some(" InvalidParameter ".to_string()),
+            " bad request ",
+            Some(" request-1 ".to_string()),
+            r#"{"code":"InvalidParameter","message":"bad request"}"#,
+            BodySnippetConfig::default(),
+        );
+
+        assert_eq!(error.errcode(), Some(-1));
+        assert_eq!(error.api_code(), Some("InvalidParameter"));
+        assert_eq!(error.request_id(), Some("request-1"));
+        assert!(error.to_string().contains("api_code=InvalidParameter"));
+        assert!(error.to_string().contains("bad request"));
+    }
+
+    #[test]
+    fn standard_api_response_accepts_string_error_codes() {
+        let parsed = serde_json::from_str::<StandardApiResponse>(
+            r#"{"errcode":"40001","errmsg":"invalid","requestId":" request-1 "}"#,
+        )
+        .expect("response");
+
+        assert_eq!(parsed.errcode, Some(40001));
+        assert_eq!(parsed.request_id.as_deref(), Some("request-1"));
+    }
+
+    #[test]
+    fn standard_api_response_accepts_numeric_request_id() {
+        let parsed =
+            serde_json::from_str::<StandardApiResponse>(r#"{"errcode":0,"requestId":12345}"#)
+                .expect("response");
+
+        assert_eq!(parsed.request_id.as_deref(), Some("12345"));
+    }
+
+    #[test]
+    fn standard_api_response_accepts_modern_code_and_lowercase_request_id() {
+        let parsed = serde_json::from_str::<StandardApiResponse>(
+            r#"{"code":"InvalidParameter","message":"bad request","requestid":" request-1 "}"#,
+        )
+        .expect("response");
+
+        assert_eq!(parsed.api_code.as_deref(), Some("InvalidParameter"));
+        assert_eq!(parsed.errmsg.as_deref(), Some("bad request"));
+        assert_eq!(parsed.request_id.as_deref(), Some("request-1"));
+    }
+
+    #[test]
+    fn zero_length_body_snippet_disables_capture() {
+        let error = api_error_from_body(
+            40001,
+            "invalid",
+            None,
+            r#"{"errcode":40001,"errmsg":"invalid"}"#,
+            BodySnippetConfig {
+                enabled: true,
+                max_bytes: 0,
+            },
+        );
+
+        assert_eq!(error.error_body_snippet(), None);
+    }
 }

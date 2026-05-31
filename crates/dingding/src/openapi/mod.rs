@@ -7,8 +7,9 @@ use crate::{
     DingTalk, Error, Result,
     auth::AppCredentials,
     transport::{
-        api_error_from_body, decode_json_response, parse_binary_response, parse_dingtalk_result,
-        parse_standard_text_response,
+        BodySnippetConfig, api_error_from_body, api_error_from_body_with_code,
+        decode_json_response, is_success_api_code, parse_binary_response, parse_dingtalk_result,
+        parse_standard_text_response, response_error_message,
     },
     util::non_empty_trimmed,
 };
@@ -62,25 +63,44 @@ impl OpenApi {
             self.client.transport().error_body_snippet(),
         )?;
 
-        if response.errcode != 0 {
-            return Err(api_error_from_body(
-                response.errcode,
-                response.errmsg,
+        if let Some(code) = response.errcode
+            && code != 0
+        {
+            return Err(api_error_from_body_with_code(
+                code,
+                response.api_code.clone(),
+                response_error_message(response.errmsg, "unknown dingtalk api error"),
+                response.request_id,
+                &body,
+                self.client.transport().error_body_snippet(),
+            ));
+        }
+        if let Some(api_code) = response.api_code.as_deref()
+            && !is_success_api_code(api_code)
+        {
+            return Err(api_error_from_body_with_code(
+                -1,
+                response.api_code.clone(),
+                response_error_message(response.errmsg, "unknown dingtalk api error"),
                 response.request_id,
                 &body,
                 self.client.transport().error_body_snippet(),
             ));
         }
 
-        let token = response.access_token.ok_or_else(|| {
-            api_error_from_body(
-                -1,
-                "missing access_token in DingTalk response",
-                response.request_id.clone(),
-                &body,
-                self.client.transport().error_body_snippet(),
-            )
-        })?;
+        let token = response
+            .access_token
+            .as_deref()
+            .and_then(|value| non_empty_trimmed(value, "access_token").ok())
+            .ok_or_else(|| {
+                api_error_from_body(
+                    -1,
+                    "missing access_token in DingTalk response",
+                    response.request_id.clone(),
+                    &body,
+                    self.client.transport().error_body_snippet(),
+                )
+            })?;
 
         self.client
             .store_access_token(credentials.clone(), token.clone(), response.expires_in);
@@ -108,13 +128,14 @@ impl OpenApi {
     /// Uploads a DingTalk media resource for robot image, voice, video, or file messages.
     pub async fn upload_media(&self, upload: MediaUpload) -> Result<UploadedMedia> {
         upload.validate()?;
+        let media_type = normalize_no_control_chars(upload.media_type().as_str(), "media_type")?;
 
         let access_token = self.access_token().await?;
         let mut url = self.client.webhook_endpoint(&["media", "upload"])?;
         {
             let mut query = url.query_pairs_mut();
             query.append_pair("access_token", &access_token);
-            query.append_pair("type", upload.media_type().as_str());
+            query.append_pair("type", &media_type);
         }
 
         let (content_type, body) = media_upload_multipart_body(&upload)?;
@@ -191,7 +212,10 @@ impl RobotApi {
             .post_raw_text(&["v1.0", "robot", "messageFiles", "download"], &request)
             .await?;
 
-        parse_message_file_download_response(&body)
+        parse_message_file_download_response(
+            &body,
+            self.openapi.client.transport().error_body_snippet(),
+        )
     }
 
     /// Downloads a robot-received image, voice, video, or file message by `downloadCode`.
@@ -200,12 +224,7 @@ impl RobotApi {
         download_code: impl Into<String>,
     ) -> Result<DownloadedFile> {
         let download = self.message_file_download_url(download_code).await?;
-        let url = url::Url::parse(download.download_url()).map_err(|source| {
-            Error::invalid_input(
-                "download_url",
-                format!("invalid URL from DingTalk: {source}"),
-            )
-        })?;
+        let url = parse_http_endpoint_url(download.download_url(), "download_url")?;
         let response = self.openapi.client.transport().get_url(&url).await?;
         let content_type = response
             .headers()
@@ -229,7 +248,7 @@ impl RobotApi {
         &self,
         open_conversation_id: impl AsRef<str>,
         message: RobotMessage,
-    ) -> Result<String> {
+    ) -> Result<RobotMessageResponse> {
         let robot_code = non_empty_trimmed(&self.robot_code, "robot_code")?;
         let open_conversation_id =
             non_empty_trimmed(open_conversation_id.as_ref(), "open_conversation_id")?;
@@ -242,9 +261,12 @@ impl RobotApi {
             open_conversation_id,
         };
 
-        self.openapi
+        let body = self
+            .openapi
             .post_raw_text(&["v1.0", "robot", "groupMessages", "send"], &request)
-            .await
+            .await?;
+
+        parse_robot_message_response(&body, self.openapi.client.transport().error_body_snippet())
     }
 
     /// Sends a text message to a group conversation.
@@ -252,7 +274,7 @@ impl RobotApi {
         &self,
         open_conversation_id: impl AsRef<str>,
         content: impl Into<String>,
-    ) -> Result<String> {
+    ) -> Result<RobotMessageResponse> {
         self.send_group_message(open_conversation_id, RobotMessage::text(content))
             .await
     }
@@ -263,7 +285,7 @@ impl RobotApi {
         open_conversation_id: impl AsRef<str>,
         title: impl Into<String>,
         text: impl Into<String>,
-    ) -> Result<String> {
+    ) -> Result<RobotMessageResponse> {
         self.send_group_message(open_conversation_id, RobotMessage::markdown(title, text))
             .await
     }
@@ -275,7 +297,7 @@ impl RobotApi {
         title: impl Into<String>,
         text: impl Into<String>,
         message_url: impl Into<String>,
-    ) -> Result<String> {
+    ) -> Result<RobotMessageResponse> {
         self.send_group_message(
             open_conversation_id,
             RobotMessage::link(title, text, message_url),
@@ -291,7 +313,7 @@ impl RobotApi {
         text: impl Into<String>,
         message_url: impl Into<String>,
         pic_url: impl Into<String>,
-    ) -> Result<String> {
+    ) -> Result<RobotMessageResponse> {
         self.send_group_message(
             open_conversation_id,
             RobotMessage::link_with_image(title, text, message_url, pic_url),
@@ -304,7 +326,7 @@ impl RobotApi {
         &self,
         open_conversation_id: impl AsRef<str>,
         photo_url: impl Into<String>,
-    ) -> Result<String> {
+    ) -> Result<RobotMessageResponse> {
         self.send_group_message(open_conversation_id, RobotMessage::image(photo_url))
             .await
     }
@@ -314,7 +336,7 @@ impl RobotApi {
         &self,
         open_conversation_id: impl AsRef<str>,
         card: RobotActionCard,
-    ) -> Result<String> {
+    ) -> Result<RobotMessageResponse> {
         self.send_group_message(open_conversation_id, RobotMessage::action_card(card))
             .await
     }
@@ -325,7 +347,7 @@ impl RobotApi {
         open_conversation_id: impl AsRef<str>,
         media_id: impl Into<String>,
         duration_millis: u64,
-    ) -> Result<String> {
+    ) -> Result<RobotMessageResponse> {
         self.send_group_message(
             open_conversation_id,
             RobotMessage::audio(media_id, duration_millis),
@@ -340,7 +362,7 @@ impl RobotApi {
         media_id: impl Into<String>,
         file_name: impl Into<String>,
         file_type: impl Into<String>,
-    ) -> Result<String> {
+    ) -> Result<RobotMessageResponse> {
         self.send_group_message(
             open_conversation_id,
             RobotMessage::file(media_id, file_name, file_type),
@@ -353,7 +375,7 @@ impl RobotApi {
         &self,
         open_conversation_id: impl AsRef<str>,
         video: RobotVideo,
-    ) -> Result<String> {
+    ) -> Result<RobotMessageResponse> {
         self.send_group_message(open_conversation_id, RobotMessage::video(video))
             .await
     }
@@ -364,7 +386,7 @@ impl RobotApi {
         open_conversation_id: impl AsRef<str>,
         msg_key: impl Into<String>,
         msg_param: T,
-    ) -> Result<String>
+    ) -> Result<RobotMessageResponse>
     where
         T: Serialize,
     {
@@ -380,7 +402,7 @@ impl RobotApi {
         &self,
         user_ids: I,
         message: RobotMessage,
-    ) -> Result<String>
+    ) -> Result<RobotMessageResponse>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -396,9 +418,12 @@ impl RobotApi {
             user_ids,
         };
 
-        self.openapi
+        let body = self
+            .openapi
             .post_raw_text(&["v1.0", "robot", "oToMessages", "batchSend"], &request)
-            .await
+            .await?;
+
+        parse_robot_message_response(&body, self.openapi.client.transport().error_body_snippet())
     }
 
     /// Sends a text message to one user.
@@ -406,7 +431,7 @@ impl RobotApi {
         &self,
         user_id: impl AsRef<str>,
         content: impl Into<String>,
-    ) -> Result<String> {
+    ) -> Result<RobotMessageResponse> {
         self.send_private_message([user_id], RobotMessage::text(content))
             .await
     }
@@ -416,7 +441,7 @@ impl RobotApi {
         &self,
         user_ids: I,
         content: impl Into<String>,
-    ) -> Result<String>
+    ) -> Result<RobotMessageResponse>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -431,7 +456,7 @@ impl RobotApi {
         user_id: impl AsRef<str>,
         title: impl Into<String>,
         text: impl Into<String>,
-    ) -> Result<String> {
+    ) -> Result<RobotMessageResponse> {
         self.send_private_message([user_id], RobotMessage::markdown(title, text))
             .await
     }
@@ -442,7 +467,7 @@ impl RobotApi {
         user_ids: I,
         title: impl Into<String>,
         text: impl Into<String>,
-    ) -> Result<String>
+    ) -> Result<RobotMessageResponse>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -458,7 +483,7 @@ impl RobotApi {
         title: impl Into<String>,
         text: impl Into<String>,
         message_url: impl Into<String>,
-    ) -> Result<String> {
+    ) -> Result<RobotMessageResponse> {
         self.send_private_message([user_id], RobotMessage::link(title, text, message_url))
             .await
     }
@@ -470,7 +495,7 @@ impl RobotApi {
         title: impl Into<String>,
         text: impl Into<String>,
         message_url: impl Into<String>,
-    ) -> Result<String>
+    ) -> Result<RobotMessageResponse>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -484,7 +509,7 @@ impl RobotApi {
         &self,
         user_id: impl AsRef<str>,
         photo_url: impl Into<String>,
-    ) -> Result<String> {
+    ) -> Result<RobotMessageResponse> {
         self.send_private_message([user_id], RobotMessage::image(photo_url))
             .await
     }
@@ -494,7 +519,7 @@ impl RobotApi {
         &self,
         user_ids: I,
         photo_url: impl Into<String>,
-    ) -> Result<String>
+    ) -> Result<RobotMessageResponse>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -508,7 +533,7 @@ impl RobotApi {
         &self,
         user_id: impl AsRef<str>,
         card: RobotActionCard,
-    ) -> Result<String> {
+    ) -> Result<RobotMessageResponse> {
         self.send_private_message([user_id], RobotMessage::action_card(card))
             .await
     }
@@ -518,7 +543,7 @@ impl RobotApi {
         &self,
         user_ids: I,
         card: RobotActionCard,
-    ) -> Result<String>
+    ) -> Result<RobotMessageResponse>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -533,7 +558,7 @@ impl RobotApi {
         user_id: impl AsRef<str>,
         media_id: impl Into<String>,
         duration_millis: u64,
-    ) -> Result<String> {
+    ) -> Result<RobotMessageResponse> {
         self.send_private_message([user_id], RobotMessage::audio(media_id, duration_millis))
             .await
     }
@@ -544,7 +569,7 @@ impl RobotApi {
         user_ids: I,
         media_id: impl Into<String>,
         duration_millis: u64,
-    ) -> Result<String>
+    ) -> Result<RobotMessageResponse>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -560,7 +585,7 @@ impl RobotApi {
         media_id: impl Into<String>,
         file_name: impl Into<String>,
         file_type: impl Into<String>,
-    ) -> Result<String> {
+    ) -> Result<RobotMessageResponse> {
         self.send_private_message(
             [user_id],
             RobotMessage::file(media_id, file_name, file_type),
@@ -575,7 +600,7 @@ impl RobotApi {
         media_id: impl Into<String>,
         file_name: impl Into<String>,
         file_type: impl Into<String>,
-    ) -> Result<String>
+    ) -> Result<RobotMessageResponse>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -589,7 +614,7 @@ impl RobotApi {
         &self,
         user_id: impl AsRef<str>,
         video: RobotVideo,
-    ) -> Result<String> {
+    ) -> Result<RobotMessageResponse> {
         self.send_private_message([user_id], RobotMessage::video(video))
             .await
     }
@@ -599,7 +624,7 @@ impl RobotApi {
         &self,
         user_ids: I,
         video: RobotVideo,
-    ) -> Result<String>
+    ) -> Result<RobotMessageResponse>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -614,7 +639,7 @@ impl RobotApi {
         user_ids: I,
         msg_key: impl Into<String>,
         msg_param: T,
-    ) -> Result<String>
+    ) -> Result<RobotMessageResponse>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -641,7 +666,7 @@ impl RobotApi {
             )
             .await?;
 
-        parse_interactive_card_response(&body)
+        parse_interactive_card_response(&body, self.openapi.client.transport().error_body_snippet())
     }
 
     /// Updates a standard interactive card previously sent by this application robot.
@@ -657,7 +682,7 @@ impl RobotApi {
             .put_raw_text(&["v1.0", "im", "robots", "interactiveCards"], &request)
             .await?;
 
-        parse_interactive_card_response(&body)
+        parse_interactive_card_response(&body, self.openapi.client.transport().error_body_snippet())
     }
 }
 
@@ -794,8 +819,8 @@ impl MediaUpload {
     }
 
     fn validate(&self) -> Result<()> {
-        non_empty_trimmed(self.media_type.as_str(), "media_type")?;
-        non_empty_trimmed(&self.file_name, "file_name")?;
+        validate_no_control_chars(self.media_type.as_str(), "media_type")?;
+        validate_no_control_chars(&self.file_name, "file_name")?;
         if self.bytes.is_empty() {
             return Err(Error::invalid_input(
                 "media",
@@ -803,7 +828,7 @@ impl MediaUpload {
             ));
         }
         if let Some(content_type) = &self.content_type {
-            non_empty_trimmed(content_type, "content_type")?;
+            validate_no_control_chars(content_type, "content_type")?;
         }
         Ok(())
     }
@@ -902,6 +927,33 @@ impl DownloadedFile {
     #[must_use]
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
+    }
+}
+
+/// Response returned by enterprise robot message send APIs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RobotMessageResponse {
+    process_query_key: String,
+    raw: Value,
+}
+
+impl RobotMessageResponse {
+    /// Returns DingTalk's process query key for later query or recall APIs.
+    #[must_use]
+    pub fn process_query_key(&self) -> &str {
+        &self.process_query_key
+    }
+
+    /// Consumes this value and returns the process query key.
+    #[must_use]
+    pub fn into_process_query_key(self) -> String {
+        self.process_query_key
+    }
+
+    /// Returns the raw JSON response.
+    #[must_use]
+    pub fn raw(&self) -> &Value {
+        &self.raw
     }
 }
 
@@ -1154,7 +1206,7 @@ impl InteractiveCard {
         }
 
         if let Some(callback_url) = &self.callback_url {
-            validate_http_url(callback_url, "callback_url")?;
+            validate_http_endpoint_url(callback_url, "callback_url")?;
         }
         if let Some(value) = &self.user_id_private_data_map_json {
             normalize_json_object_str("user_id_private_data_map", value)?;
@@ -1216,7 +1268,7 @@ impl InteractiveCardSendOptions {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        self.at_user_list_json = Some(json_string_list(user_ids));
+        self.at_user_list_json = json_string_list(user_ids);
         self
     }
 
@@ -1241,7 +1293,7 @@ impl InteractiveCardSendOptions {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        self.receiver_list_json = Some(json_string_list(user_ids));
+        self.receiver_list_json = json_string_list(user_ids);
         self
     }
 
@@ -1523,7 +1575,7 @@ impl RobotActionButton {
 
     fn validate(&self) -> Result<()> {
         non_empty_trimmed(&self.title, "button_title")?;
-        non_empty_trimmed(&self.url, "button_url")?;
+        validate_http_url(&self.url, "button_url")?;
         Ok(())
     }
 }
@@ -1633,13 +1685,16 @@ impl RobotActionCard {
 
     fn msg_key(&self) -> Result<&'static str> {
         self.validate()?;
-        Ok(match (self.layout, self.buttons.len()) {
-            (_, 1) => "sampleActionCard",
-            (RobotActionCardLayout::Vertical, 2) => "sampleActionCard2",
-            (RobotActionCardLayout::Vertical, 3) => "sampleActionCard3",
-            (RobotActionCardLayout::Horizontal, 2) => "sampleActionCard6",
-            _ => unreachable!("validated action-card layout"),
-        })
+        match (self.layout, self.buttons.len()) {
+            (_, 1) => Ok("sampleActionCard"),
+            (RobotActionCardLayout::Vertical, 2) => Ok("sampleActionCard2"),
+            (RobotActionCardLayout::Vertical, 3) => Ok("sampleActionCard3"),
+            (RobotActionCardLayout::Horizontal, 2) => Ok("sampleActionCard6"),
+            _ => Err(Error::invalid_input(
+                "buttons",
+                "unsupported action-card layout",
+            )),
+        }
     }
 
     fn msg_param_json(&self) -> Result<String> {
@@ -1893,7 +1948,7 @@ impl RobotMessage {
         Self::Link {
             title: title.into(),
             text: text.into(),
-            message_url: message_url.into(),
+            message_url: message_url.into().trim().to_string(),
             pic_url: None,
         }
     }
@@ -1909,8 +1964,8 @@ impl RobotMessage {
         Self::Link {
             title: title.into(),
             text: text.into(),
-            message_url: message_url.into(),
-            pic_url: Some(pic_url.into()),
+            message_url: message_url.into().trim().to_string(),
+            pic_url: Some(pic_url.into().trim().to_string()),
         }
     }
 
@@ -1918,7 +1973,7 @@ impl RobotMessage {
     #[must_use]
     pub fn image(photo_url: impl Into<String>) -> Self {
         Self::Image {
-            photo_url: photo_url.into(),
+            photo_url: photo_url.into().trim().to_string(),
         }
     }
 
@@ -1948,7 +2003,7 @@ impl RobotMessage {
     #[must_use]
     pub fn audio(media_id: impl Into<String>, duration_millis: u64) -> Self {
         Self::Audio {
-            media_id: media_id.into(),
+            media_id: media_id.into().trim().to_string(),
             duration_millis,
         }
     }
@@ -1961,9 +2016,9 @@ impl RobotMessage {
         file_type: impl Into<String>,
     ) -> Self {
         Self::File {
-            media_id: media_id.into(),
-            file_name: file_name.into(),
-            file_type: file_type.into(),
+            media_id: media_id.into().trim().to_string(),
+            file_name: file_name.into().trim().to_string(),
+            file_type: file_type.into().trim().to_string(),
         }
     }
 
@@ -2035,6 +2090,8 @@ impl RobotMessage {
 
     /// Returns the JSON-encoded `msgParam` object expected by DingTalk.
     pub fn msg_param_json(&self) -> Result<String> {
+        self.validate()?;
+
         match self {
             Self::Text { content } => {
                 let param = RobotTextParam { content };
@@ -2123,9 +2180,9 @@ impl RobotMessage {
             } => {
                 non_empty_trimmed(title, "title")?;
                 non_empty_trimmed(text, "text")?;
-                non_empty_trimmed(message_url, "message_url")?;
+                validate_http_url(message_url, "message_url")?;
                 if let Some(pic_url) = pic_url {
-                    non_empty_trimmed(pic_url, "pic_url")?;
+                    validate_http_url(pic_url, "pic_url")?;
                 }
             }
             Self::Image { photo_url } => {
@@ -2215,17 +2272,64 @@ fn normalize_json_array_str(field: &'static str, value: &str) -> Result<String> 
 }
 
 fn validate_http_url(value: &str, field: &'static str) -> Result<()> {
-    let value = non_empty_trimmed(value, field)?;
-    let url = url::Url::parse(&value)
+    parse_http_url(value, field).map(|_url| ())
+}
+
+fn validate_http_endpoint_url(value: &str, field: &'static str) -> Result<()> {
+    parse_http_endpoint_url(value, field).map(|_url| ())
+}
+
+fn parse_http_endpoint_url(value: &str, field: &'static str) -> Result<url::Url> {
+    let url = parse_http_url(value, field)?;
+    if url.fragment().is_some() {
+        return Err(Error::invalid_input(
+            field,
+            "URL must not contain a fragment",
+        ));
+    }
+    Ok(url)
+}
+
+fn parse_http_url(value: &str, field: &'static str) -> Result<url::Url> {
+    let trimmed = non_empty_trimmed(value, field)?;
+    if trimmed != value {
+        return Err(Error::invalid_input(
+            field,
+            "value must not contain leading or trailing whitespace",
+        ));
+    }
+
+    let url = url::Url::parse(value)
         .map_err(|source| Error::invalid_input(field, format!("invalid URL: {source}")))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(Error::invalid_input(
+            field,
+            "URL must not contain username or password",
+        ));
+    }
     if matches!(url.scheme(), "http" | "https") {
-        Ok(())
+        Ok(url)
     } else {
         Err(Error::invalid_input(
             field,
             "URL scheme must be http or https",
         ))
     }
+}
+
+fn validate_no_control_chars(value: &str, field: &'static str) -> Result<()> {
+    normalize_no_control_chars(value, field).map(|_value| ())
+}
+
+fn normalize_no_control_chars(value: &str, field: &'static str) -> Result<String> {
+    let value = non_empty_trimmed(value, field)?;
+    if value.chars().any(char::is_control) {
+        return Err(Error::invalid_input(
+            field,
+            "value must not contain control characters",
+        ));
+    }
+    Ok(value)
 }
 
 fn normalize_user_ids<I, S>(user_ids: I) -> Result<Vec<String>>
@@ -2251,7 +2355,7 @@ where
     Ok(values)
 }
 
-fn json_string_list<I, S>(values: I) -> String
+fn json_string_list<I, S>(values: I) -> Option<String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
@@ -2263,16 +2367,18 @@ where
             normalized.push(value.to_string());
         }
     }
-    Value::Array(normalized.into_iter().map(Value::String).collect()).to_string()
+    (!normalized.is_empty())
+        .then(|| Value::Array(normalized.into_iter().map(Value::String).collect()).to_string())
 }
 
 fn media_upload_multipart_body(upload: &MediaUpload) -> Result<(String, Vec<u8>)> {
     upload.validate()?;
+    let media_type = normalize_no_control_chars(upload.media_type().as_str(), "media_type")?;
 
     let boundary = media_upload_boundary(upload);
     let mut body = Vec::new();
 
-    multipart_text_field(&mut body, &boundary, "type", upload.media_type().as_str());
+    multipart_text_field(&mut body, &boundary, "type", &media_type);
     multipart_file_field(
         &mut body,
         &boundary,
@@ -2340,7 +2446,8 @@ fn media_upload_boundary(upload: &MediaUpload) -> String {
         media_type.as_str()
     };
 
-    for suffix in 0..100 {
+    let mut suffix = 0_u128;
+    loop {
         let boundary = format!(
             "----dingding-{media_type}-{}-{}-{suffix}",
             upload.file_name().len(),
@@ -2349,9 +2456,8 @@ fn media_upload_boundary(upload: &MediaUpload) -> String {
         if !contains_subslice(upload.bytes(), boundary.as_bytes()) {
             return boundary;
         }
+        suffix = suffix.saturating_add(1);
     }
-
-    "----dingding-media-boundary".to_string()
 }
 
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
@@ -2371,11 +2477,22 @@ fn parse_media_upload_response(
     if let Some(code) = parsed.errcode
         && code != 0
     {
-        return Err(api_error_from_body(
+        return Err(api_error_from_body_with_code(
             code,
-            parsed
-                .errmsg
-                .unwrap_or_else(|| "unknown dingtalk api error".to_string()),
+            parsed.api_code.clone(),
+            response_error_message(parsed.errmsg, "unknown dingtalk api error"),
+            parsed.request_id,
+            &body,
+            error_body_snippet,
+        ));
+    }
+    if let Some(api_code) = parsed.api_code.as_deref()
+        && !is_success_api_code(api_code)
+    {
+        return Err(api_error_from_body_with_code(
+            -1,
+            parsed.api_code.clone(),
+            response_error_message(parsed.errmsg, "unknown dingtalk api error"),
             parsed.request_id,
             &body,
             error_body_snippet,
@@ -2383,10 +2500,14 @@ fn parse_media_upload_response(
     }
 
     let raw = serde_json::from_str::<Value>(&body)?;
-    let media_id = parsed
-        .media_id
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| Error::invalid_input("media_id", "missing media_id in DingTalk response"))?;
+    let media_id = required_response_string(
+        parsed.media_id.as_deref(),
+        "media_id",
+        "missing media_id in DingTalk response",
+        parsed.request_id.clone(),
+        &body,
+        error_body_snippet,
+    )?;
     let media_type = match parsed.media_type {
         Some(value) => MediaType::from_raw(value)?,
         None => requested_media_type.clone(),
@@ -2403,7 +2524,10 @@ fn parse_media_upload_response(
     })
 }
 
-fn parse_message_file_download_response(body: &str) -> Result<MessageFileDownload> {
+fn parse_message_file_download_response(
+    body: &str,
+    error_body_snippet: BodySnippetConfig,
+) -> Result<MessageFileDownload> {
     let raw = serde_json::from_str::<Value>(body)?;
     let payload = raw
         .get("result")
@@ -2413,17 +2537,48 @@ fn parse_message_file_download_response(body: &str) -> Result<MessageFileDownloa
         .get("downloadUrl")
         .or_else(|| payload.get("download_url"))
         .or_else(|| payload.get("url"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            Error::invalid_input("download_url", "missing downloadUrl in DingTalk response")
-        })?
-        .to_string();
+        .and_then(Value::as_str);
+    let download_url = required_response_string(
+        download_url,
+        "download_url",
+        "missing downloadUrl in DingTalk response",
+        response_request_id(&raw),
+        body,
+        error_body_snippet,
+    )?;
+    validate_http_endpoint_url(&download_url, "download_url")?;
 
     Ok(MessageFileDownload { download_url, raw })
 }
 
-fn parse_interactive_card_response(body: &str) -> Result<InteractiveCardResponse> {
+fn parse_robot_message_response(
+    body: &str,
+    error_body_snippet: BodySnippetConfig,
+) -> Result<RobotMessageResponse> {
+    let (process_query_key, raw) = parse_process_query_key_response(body, error_body_snippet)?;
+
+    Ok(RobotMessageResponse {
+        process_query_key,
+        raw,
+    })
+}
+
+fn parse_interactive_card_response(
+    body: &str,
+    error_body_snippet: BodySnippetConfig,
+) -> Result<InteractiveCardResponse> {
+    let (process_query_key, raw) = parse_process_query_key_response(body, error_body_snippet)?;
+
+    Ok(InteractiveCardResponse {
+        process_query_key,
+        raw,
+    })
+}
+
+fn parse_process_query_key_response(
+    body: &str,
+    error_body_snippet: BodySnippetConfig,
+) -> Result<(String, Value)> {
     let raw = serde_json::from_str::<Value>(body)?;
     let payload = raw
         .get("result")
@@ -2432,20 +2587,43 @@ fn parse_interactive_card_response(body: &str) -> Result<InteractiveCardResponse
     let process_query_key = payload
         .get("processQueryKey")
         .or_else(|| payload.get("process_query_key"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            Error::invalid_input(
-                "process_query_key",
-                "missing processQueryKey in DingTalk response",
-            )
-        })?
-        .to_string();
-
-    Ok(InteractiveCardResponse {
+        .and_then(Value::as_str);
+    let process_query_key = required_response_string(
         process_query_key,
-        raw,
-    })
+        "process_query_key",
+        "missing processQueryKey in DingTalk response",
+        response_request_id(&raw),
+        body,
+        error_body_snippet,
+    )?;
+
+    Ok((process_query_key, raw))
+}
+
+fn required_response_string(
+    value: Option<&str>,
+    field: &'static str,
+    message: &'static str,
+    request_id: Option<String>,
+    body: &str,
+    error_body_snippet: BodySnippetConfig,
+) -> Result<String> {
+    value
+        .and_then(|value| non_empty_trimmed(value, field).ok())
+        .ok_or_else(|| api_error_from_body(-1, message, request_id, body, error_body_snippet))
+}
+
+fn response_request_id(value: &Value) -> Option<String> {
+    value
+        .get("requestId")
+        .or_else(|| value.get("RequestId"))
+        .or_else(|| value.get("requestid"))
+        .or_else(|| value.get("request_id"))
+        .and_then(|value| match value {
+            Value::String(value) => non_empty_trimmed(value, "request_id").ok(),
+            Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        })
 }
 
 fn is_false(value: &bool) -> bool {
@@ -2484,29 +2662,71 @@ impl OpenApi {
 
 #[derive(Debug, Deserialize)]
 struct AccessTokenResponse {
-    errcode: i64,
+    #[serde(
+        default,
+        deserialize_with = "crate::transport::deserialize_optional_i64"
+    )]
+    errcode: Option<i64>,
+    #[serde(
+        rename = "code",
+        default,
+        alias = "Code",
+        deserialize_with = "crate::transport::deserialize_optional_string"
+    )]
+    api_code: Option<String>,
     #[serde(alias = "message")]
-    errmsg: String,
+    errmsg: Option<String>,
     #[serde(alias = "accessToken")]
     access_token: Option<String>,
     #[serde(alias = "expiresIn", alias = "expireIn")]
+    #[serde(
+        default,
+        deserialize_with = "crate::transport::deserialize_optional_i64"
+    )]
     expires_in: Option<i64>,
-    #[serde(default, alias = "requestId", alias = "RequestId")]
+    #[serde(
+        default,
+        alias = "requestId",
+        alias = "RequestId",
+        alias = "requestid",
+        deserialize_with = "crate::transport::deserialize_optional_string"
+    )]
     request_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawMediaUploadResponse {
+    #[serde(
+        default,
+        deserialize_with = "crate::transport::deserialize_optional_i64"
+    )]
     errcode: Option<i64>,
+    #[serde(
+        rename = "code",
+        default,
+        alias = "Code",
+        deserialize_with = "crate::transport::deserialize_optional_string"
+    )]
+    api_code: Option<String>,
     #[serde(alias = "message")]
     errmsg: Option<String>,
-    #[serde(default, alias = "requestId", alias = "RequestId")]
+    #[serde(
+        default,
+        alias = "requestId",
+        alias = "RequestId",
+        alias = "requestid",
+        deserialize_with = "crate::transport::deserialize_optional_string"
+    )]
     request_id: Option<String>,
     #[serde(alias = "mediaId")]
     media_id: Option<String>,
     #[serde(rename = "type")]
     media_type: Option<String>,
     #[serde(alias = "createdAt")]
+    #[serde(
+        default,
+        deserialize_with = "crate::transport::deserialize_optional_i64"
+    )]
     created_at: Option<i64>,
 }
 
@@ -2669,6 +2889,15 @@ mod tests {
     }
 
     #[test]
+    fn robot_msg_param_json_rejects_invalid_messages() {
+        let error = RobotMessage::text(" ")
+            .msg_param_json()
+            .expect_err("empty text should not serialize as a sendable message");
+
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn robot_markdown_message_uses_sample_markdown_key() {
         let message = RobotMessage::markdown("title", "**body**");
 
@@ -2729,6 +2958,70 @@ mod tests {
                 "width": "640"
             })
         );
+    }
+
+    #[test]
+    fn robot_message_builders_trim_identifier_and_url_fields() {
+        let link = RobotMessage::link_with_image(
+            "title",
+            "body",
+            " https://example.com/open ",
+            " https://example.com/pic.png ",
+        );
+        let file = RobotMessage::file(" media-file ", " report.pdf ", " pdf ");
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&link.msg_param_json().expect("link")).expect("json"),
+            serde_json::json!({
+                "title": "title",
+                "text": "body",
+                "messageUrl": "https://example.com/open",
+                "picUrl": "https://example.com/pic.png"
+            })
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&file.msg_param_json().expect("file")).expect("json"),
+            serde_json::json!({
+                "mediaId": "media-file",
+                "fileName": "report.pdf",
+                "fileType": "pdf"
+            })
+        );
+    }
+
+    #[test]
+    fn robot_link_messages_validate_http_urls() {
+        let message = RobotMessage::link("title", "body", "ftp://example.com/file");
+        let error = message
+            .validate()
+            .expect_err("link message URL should require HTTP");
+
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn robot_link_messages_reject_url_userinfo() {
+        let message = RobotMessage::link("title", "body", "https://user:pass@example.com/file");
+        let error = message
+            .validate()
+            .expect_err("link message URL should not contain credentials");
+
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn robot_link_messages_reject_untrimmed_manual_urls() {
+        let message = RobotMessage::Link {
+            title: "title".to_string(),
+            text: "body".to_string(),
+            message_url: " https://example.com/open ".to_string(),
+            pic_url: None,
+        };
+        let error = message
+            .validate()
+            .expect_err("serialized URL would contain whitespace");
+
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -2827,17 +3120,77 @@ mod tests {
     }
 
     #[test]
+    fn media_upload_normalizes_custom_media_type_wire_value() {
+        let upload = MediaUpload::new(
+            MediaType::Other(" custom ".to_string()),
+            "demo.bin",
+            b"BIN".to_vec(),
+        );
+        let (_content_type, body) = media_upload_multipart_body(&upload).expect("multipart");
+        let body = String::from_utf8(body).expect("utf8 multipart");
+
+        assert!(body.contains("\r\ncustom\r\n"));
+        assert!(!body.contains("\r\n custom \r\n"));
+    }
+
+    #[test]
+    fn media_upload_rejects_control_characters_in_multipart_headers() {
+        let file_name_error = media_upload_multipart_body(&MediaUpload::file(
+            "report.pdf\r\nx-injected: 1",
+            b"PDF".to_vec(),
+        ))
+        .expect_err("file name must not inject headers");
+        let content_type_error = media_upload_multipart_body(
+            &MediaUpload::file("report.pdf", b"PDF".to_vec())
+                .content_type("application/pdf\r\nx-injected: 1"),
+        )
+        .expect_err("content type must not inject headers");
+        let media_type_error = media_upload_multipart_body(&MediaUpload::new(
+            MediaType::Other("file\nbad".to_string()),
+            "report.pdf",
+            b"PDF".to_vec(),
+        ))
+        .expect_err("media type must not contain control characters");
+
+        assert_eq!(file_name_error.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(content_type_error.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(media_type_error.kind(), crate::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn media_upload_boundary_avoids_file_content_collisions() {
+        let upload = MediaUpload::file(
+            "report.pdf",
+            b"prefix ----dingding-file-10-39-0 suffix".to_vec(),
+        );
+
+        assert_eq!(media_upload_boundary(&upload), "----dingding-file-10-39-1");
+    }
+
+    #[test]
     fn parses_message_file_download_response() {
         let download = parse_message_file_download_response(
-            r#"{"errcode":0,"result":{"downloadUrl":"https://example.com/file.bin"}}"#,
+            r#"{"errcode":0,"result":{"downloadUrl":" https://example.com/file.bin "}}"#,
+            BodySnippetConfig::default(),
         )
         .expect("download");
 
         assert_eq!(download.download_url(), "https://example.com/file.bin");
         assert_eq!(
             download.raw()["result"]["downloadUrl"],
-            "https://example.com/file.bin"
+            " https://example.com/file.bin "
         );
+    }
+
+    #[test]
+    fn message_file_download_rejects_fragment_url() {
+        let error = parse_message_file_download_response(
+            r#"{"errcode":0,"result":{"downloadUrl":"https://example.com/file.bin#token"}}"#,
+            BodySnippetConfig::default(),
+        )
+        .expect_err("download URL should not contain a fragment");
+
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -2886,6 +3239,24 @@ mod tests {
     }
 
     #[test]
+    fn interactive_card_empty_user_lists_are_omitted() {
+        let card = InteractiveCard::group(
+            "open-cid",
+            "template-id",
+            "card-biz-id",
+            serde_json::json!({ "title": "Deploy" }),
+        )
+        .expect("card")
+        .at_users([" ", ""])
+        .receiver_users(Vec::<&str>::new());
+
+        let request = card.to_send_request("robot-code".to_string());
+        let value = serde_json::to_value(request).expect("serialize");
+
+        assert!(value.get("sendOptions").is_none());
+    }
+
+    #[test]
     fn interactive_card_update_request_is_serialized() {
         let update = InteractiveCardUpdate::card_data(
             " card-biz-id ",
@@ -2921,16 +3292,32 @@ mod tests {
 
     #[test]
     fn parses_interactive_card_response() {
-        let direct =
-            parse_interactive_card_response(r#"{"processQueryKey":"query-1"}"#).expect("direct");
+        let direct = parse_interactive_card_response(
+            r#"{"processQueryKey":" query-1 "}"#,
+            BodySnippetConfig::default(),
+        )
+        .expect("direct");
         let wrapped = parse_interactive_card_response(
-            r#"{"errcode":0,"errmsg":"ok","result":{"processQueryKey":"query-2"}}"#,
+            r#"{"errcode":0,"errmsg":"ok","result":{"processQueryKey":" query-2 "}}"#,
+            BodySnippetConfig::default(),
         )
         .expect("wrapped");
 
         assert_eq!(direct.process_query_key(), "query-1");
-        assert_eq!(direct.raw()["processQueryKey"], "query-1");
+        assert_eq!(direct.raw()["processQueryKey"], " query-1 ");
         assert_eq!(wrapped.process_query_key(), "query-2");
+    }
+
+    #[test]
+    fn interactive_card_response_errors_preserve_numeric_request_id() {
+        let error = parse_interactive_card_response(
+            r#"{"requestId":12345,"result":{}}"#,
+            BodySnippetConfig::default(),
+        )
+        .expect_err("missing processQueryKey should fail");
+
+        assert_eq!(error.kind(), crate::ErrorKind::Api);
+        assert_eq!(error.request_id(), Some("12345"));
     }
 
     #[test]
@@ -2957,6 +3344,12 @@ mod tests {
                 .callback_url("ftp://example.com/callback")
                 .validate()
                 .expect_err("callback URL should require HTTP");
+        let callback_url_fragment =
+            InteractiveCard::group("cid", "template", "biz", serde_json::json!({}))
+                .expect("card")
+                .callback_url("https://example.com/callback#token")
+                .validate()
+                .expect_err("callback URL should not contain a fragment");
 
         assert_eq!(invalid_data.kind(), crate::ErrorKind::InvalidInput);
         assert_eq!(missing_target.kind(), crate::ErrorKind::InvalidInput);
@@ -2967,6 +3360,7 @@ mod tests {
             crate::ErrorKind::InvalidInput
         );
         assert_eq!(invalid_callback_url.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(callback_url_fragment.kind(), crate::ErrorKind::InvalidInput);
     }
 
     #[test]

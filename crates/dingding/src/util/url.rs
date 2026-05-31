@@ -6,9 +6,21 @@ pub(crate) fn normalize_base_url(value: impl AsRef<str>) -> Result<Url> {
     let raw = value.as_ref().trim();
     let mut url = Url::parse(raw).map_err(|source| Error::InvalidConfig(source.to_string()))?;
 
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(Error::InvalidConfig(
+            "base_url scheme must be http or https".to_string(),
+        ));
+    }
+
     if url.cannot_be_a_base() {
         return Err(Error::InvalidConfig(
             "base_url must be hierarchical".to_string(),
+        ));
+    }
+
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(Error::InvalidConfig(
+            "base_url must not contain username or password".to_string(),
         ));
     }
 

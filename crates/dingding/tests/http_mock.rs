@@ -85,13 +85,97 @@ async fn signed_webhook_robot_encodes_signature_once() -> TestResult<()> {
 }
 
 #[tokio::test]
+async fn webhook_robot_rejects_response_without_errcode() -> TestResult<()> {
+    let server = MockServer::spawn([MockResponse::json("{}")])?;
+    let client = DingTalk::builder()
+        .webhook_base_url(server.base_url())
+        .system_proxy(false)
+        .build()?;
+
+    let error = client
+        .webhook("webhook-token")
+        .send_text("hello")
+        .await
+        .err()
+        .ok_or("missing errcode should fail")?;
+
+    assert_eq!(error.kind(), ErrorKind::Api);
+    assert!(
+        error
+            .error_body_snippet()
+            .is_some_and(|snippet| snippet == "{}")
+    );
+
+    let request = server.next_request()?;
+    assert_eq!(request.path(), "/robot/send");
+
+    server.finish()
+}
+
+#[tokio::test]
+async fn webhook_robot_rejects_invalid_json_response_with_body_snippet() -> TestResult<()> {
+    let server = MockServer::spawn([MockResponse::json("not-json")])?;
+    let client = DingTalk::builder()
+        .webhook_base_url(server.base_url())
+        .system_proxy(false)
+        .build()?;
+
+    let error = client
+        .webhook("webhook-token")
+        .send_text("hello")
+        .await
+        .err()
+        .ok_or("invalid JSON response should fail")?;
+
+    assert_eq!(error.kind(), ErrorKind::Api);
+    assert!(error.to_string().contains("invalid DingTalk JSON response"));
+    assert!(
+        error
+            .error_body_snippet()
+            .is_some_and(|snippet| snippet.contains("not-json"))
+    );
+
+    let request = server.next_request()?;
+    assert_eq!(request.path(), "/robot/send");
+
+    server.finish()
+}
+
+#[tokio::test]
+async fn webhook_robot_rejects_modern_code_error_even_with_zero_errcode() -> TestResult<()> {
+    let server = MockServer::spawn([MockResponse::json(
+        r#"{"errcode":0,"code":"InvalidParameter","message":"bad webhook","requestId":"req-webhook"}"#,
+    )])?;
+    let client = DingTalk::builder()
+        .webhook_base_url(server.base_url())
+        .system_proxy(false)
+        .build()?;
+
+    let error = client
+        .webhook("webhook-token")
+        .send_text("hello")
+        .await
+        .err()
+        .ok_or("modern code error should fail")?;
+
+    assert_eq!(error.kind(), ErrorKind::Api);
+    assert_eq!(error.errcode(), Some(-1));
+    assert_eq!(error.api_code(), Some("InvalidParameter"));
+    assert_eq!(error.request_id(), Some("req-webhook"));
+    assert!(error.to_string().contains("bad webhook"));
+
+    let request = server.next_request()?;
+    assert_eq!(request.path(), "/robot/send");
+
+    server.finish()
+}
+
+#[tokio::test]
 async fn openapi_group_message_fetches_token_and_posts_with_access_token_header() -> TestResult<()>
 {
     let server = MockServer::spawn([
-        MockResponse::json(
-            r#"{"errcode":0,"errmsg":"ok","access_token":"token-123","expires_in":7200}"#,
-        ),
-        MockResponse::json(r#"{"errcode":0,"errmsg":"ok","processQueryKey":"pq-123"}"#),
+        MockResponse::json(r#"{"errcode":"0","access_token":" token-123 ","expires_in":"7200"}"#),
+        MockResponse::json(r#"{"errcode":"0","errmsg":"ok","processQueryKey":"pq-123"}"#),
     ])?;
     let client = dingtalk_for_mock(&server)?;
 
@@ -101,10 +185,8 @@ async fn openapi_group_message_fetches_token_and_posts_with_access_token_header(
         .send_group_text("open-cid", "hello from openapi")
         .await?;
 
-    assert_eq!(
-        response,
-        r#"{"errcode":0,"errmsg":"ok","processQueryKey":"pq-123"}"#
-    );
+    assert_eq!(response.process_query_key(), "pq-123");
+    assert_eq!(response.raw()["processQueryKey"], "pq-123");
 
     let token_request = server.next_request()?;
     assert_eq!(token_request.method, "GET");
@@ -141,13 +223,266 @@ async fn openapi_group_message_fetches_token_and_posts_with_access_token_header(
 }
 
 #[tokio::test]
+async fn openapi_robot_message_rejects_missing_process_query_key() -> TestResult<()> {
+    let server = MockServer::spawn([
+        MockResponse::json(
+            r#"{"errcode":0,"errmsg":"ok","access_token":"token-123","expires_in":7200}"#,
+        ),
+        MockResponse::json(r#"{"errcode":0,"requestId":12345,"result":{}}"#),
+    ])?;
+    let client = dingtalk_for_mock(&server)?;
+
+    let error = client
+        .openapi()
+        .robot("robot-code")
+        .send_group_text("open-cid", "hello")
+        .await
+        .err()
+        .ok_or("missing processQueryKey should fail")?;
+
+    assert_eq!(error.kind(), ErrorKind::Api);
+    assert_eq!(error.request_id(), Some("12345"));
+    assert!(
+        error
+            .error_body_snippet()
+            .is_some_and(|snippet| snippet.contains("requestId"))
+    );
+
+    let token_request = server.next_request()?;
+    assert_eq!(token_request.path(), "/gettoken");
+
+    let send_request = server.next_request()?;
+    assert_eq!(send_request.path(), "/v1.0/robot/groupMessages/send");
+
+    server.finish()
+}
+
+#[tokio::test]
+async fn openapi_rejects_blank_access_token() -> TestResult<()> {
+    let server = MockServer::spawn([MockResponse::json(
+        r#"{"errcode":0,"access_token":"  ","expires_in":7200,"requestId":"req-token"}"#,
+    )])?;
+    let client = dingtalk_for_mock(&server)?;
+
+    let error = client
+        .openapi()
+        .access_token()
+        .await
+        .err()
+        .ok_or("blank access_token should fail")?;
+
+    assert_eq!(error.kind(), ErrorKind::Api);
+    assert_eq!(error.request_id(), Some("req-token"));
+    assert!(
+        error
+            .error_body_snippet()
+            .is_some_and(|snippet| snippet.contains("access_token"))
+    );
+
+    let token_request = server.next_request()?;
+    assert_eq!(token_request.path(), "/gettoken");
+
+    server.finish()
+}
+
+#[tokio::test]
+async fn openapi_result_allows_success_without_errmsg() -> TestResult<()> {
+    let server = MockServer::spawn([
+        MockResponse::json(
+            r#"{"errcode":0,"errmsg":"ok","access_token":"token-123","expires_in":7200}"#,
+        ),
+        MockResponse::json(r#"{"errcode":0,"result":{"accepted":true}}"#),
+    ])?;
+    let client = dingtalk_for_mock(&server)?;
+
+    let result = client
+        .openapi()
+        .post_json_result::<Value, _>(&["v1.0", "custom", "endpoint"], &json!({ "ping": true }))
+        .await?;
+
+    assert_eq!(result, json!({ "accepted": true }));
+
+    let token_request = server.next_request()?;
+    assert_eq!(token_request.path(), "/gettoken");
+
+    let api_request = server.next_request()?;
+    assert_eq!(api_request.method, "POST");
+    assert_eq!(api_request.path(), "/v1.0/custom/endpoint");
+
+    server.finish()
+}
+
+#[tokio::test]
+async fn openapi_result_allows_result_without_errcode() -> TestResult<()> {
+    let server = MockServer::spawn([
+        MockResponse::json(
+            r#"{"errcode":0,"errmsg":"ok","access_token":"token-123","expires_in":7200}"#,
+        ),
+        MockResponse::json(r#"{"requestId":"req-result","result":{"accepted":true}}"#),
+    ])?;
+    let client = dingtalk_for_mock(&server)?;
+
+    let result = client
+        .openapi()
+        .post_json_result::<Value, _>(&["v1.0", "custom", "endpoint"], &json!({ "ping": true }))
+        .await?;
+
+    assert_eq!(result, json!({ "accepted": true }));
+
+    let token_request = server.next_request()?;
+    assert_eq!(token_request.path(), "/gettoken");
+
+    let api_request = server.next_request()?;
+    assert_eq!(api_request.method, "POST");
+    assert_eq!(api_request.path(), "/v1.0/custom/endpoint");
+
+    server.finish()
+}
+
+#[tokio::test]
+async fn openapi_missing_result_preserves_request_id() -> TestResult<()> {
+    let server = MockServer::spawn([
+        MockResponse::json(
+            r#"{"errcode":0,"errmsg":"ok","access_token":"token-123","expires_in":7200}"#,
+        ),
+        MockResponse::json(r#"{"errcode":0,"requestId":"req-missing-result"}"#),
+    ])?;
+    let client = dingtalk_for_mock(&server)?;
+
+    let error = client
+        .openapi()
+        .post_json_result::<Value, _>(&["v1.0", "custom", "endpoint"], &json!({ "ping": true }))
+        .await
+        .err()
+        .ok_or("missing result should fail")?;
+
+    assert_eq!(error.kind(), ErrorKind::Api);
+    assert_eq!(error.request_id(), Some("req-missing-result"));
+
+    let token_request = server.next_request()?;
+    assert_eq!(token_request.path(), "/gettoken");
+
+    let api_request = server.next_request()?;
+    assert_eq!(api_request.method, "POST");
+    assert_eq!(api_request.path(), "/v1.0/custom/endpoint");
+
+    server.finish()
+}
+
+#[tokio::test]
+async fn openapi_raw_send_rejects_empty_standard_response() -> TestResult<()> {
+    let server = MockServer::spawn([
+        MockResponse::json(
+            r#"{"errcode":0,"errmsg":"ok","access_token":"token-123","expires_in":7200}"#,
+        ),
+        MockResponse::json(r#"{"requestId":"req-empty-response"}"#),
+    ])?;
+    let client = dingtalk_for_mock(&server)?;
+
+    let error = client
+        .openapi()
+        .robot("robot-code")
+        .send_group_text("open-cid", "hello")
+        .await
+        .err()
+        .ok_or("empty standard response should fail")?;
+
+    assert_eq!(error.kind(), ErrorKind::Api);
+    assert_eq!(error.request_id(), Some("req-empty-response"));
+    assert!(
+        error
+            .error_body_snippet()
+            .is_some_and(|snippet| snippet.contains("requestId"))
+    );
+
+    let token_request = server.next_request()?;
+    assert_eq!(token_request.path(), "/gettoken");
+
+    let send_request = server.next_request()?;
+    assert_eq!(send_request.path(), "/v1.0/robot/groupMessages/send");
+
+    server.finish()
+}
+
+#[tokio::test]
+async fn openapi_raw_send_rejects_non_json_standard_response() -> TestResult<()> {
+    let server = MockServer::spawn([
+        MockResponse::json(
+            r#"{"errcode":0,"errmsg":"ok","access_token":"token-123","expires_in":7200}"#,
+        ),
+        MockResponse::json("temporary upstream failure"),
+    ])?;
+    let client = dingtalk_for_mock(&server)?;
+
+    let error = client
+        .openapi()
+        .robot("robot-code")
+        .send_group_text("open-cid", "hello")
+        .await
+        .err()
+        .ok_or("non-json standard response should fail")?;
+
+    assert_eq!(error.kind(), ErrorKind::Api);
+    assert!(error.to_string().contains("invalid DingTalk JSON response"));
+    assert!(
+        error
+            .error_body_snippet()
+            .is_some_and(|snippet| snippet.contains("temporary upstream failure"))
+    );
+
+    let token_request = server.next_request()?;
+    assert_eq!(token_request.path(), "/gettoken");
+
+    let send_request = server.next_request()?;
+    assert_eq!(send_request.path(), "/v1.0/robot/groupMessages/send");
+
+    server.finish()
+}
+
+#[tokio::test]
+async fn openapi_raw_send_preserves_modern_code_error_response() -> TestResult<()> {
+    let server = MockServer::spawn([
+        MockResponse::json(
+            r#"{"errcode":0,"errmsg":"ok","access_token":"token-123","expires_in":7200}"#,
+        ),
+        MockResponse::json(
+            r#"{"code":"InvalidParameter","message":"bad robotCode","requestid":"req-modern"}"#,
+        ),
+    ])?;
+    let client = dingtalk_for_mock(&server)?;
+
+    let error = client
+        .openapi()
+        .robot("robot-code")
+        .send_group_text("open-cid", "hello")
+        .await
+        .err()
+        .ok_or("modern code error should fail")?;
+
+    assert_eq!(error.kind(), ErrorKind::Api);
+    assert_eq!(error.errcode(), Some(-1));
+    assert_eq!(error.api_code(), Some("InvalidParameter"));
+    assert_eq!(error.request_id(), Some("req-modern"));
+    assert!(error.to_string().contains("InvalidParameter"));
+    assert!(error.to_string().contains("bad robotCode"));
+
+    let token_request = server.next_request()?;
+    assert_eq!(token_request.path(), "/gettoken");
+
+    let send_request = server.next_request()?;
+    assert_eq!(send_request.path(), "/v1.0/robot/groupMessages/send");
+
+    server.finish()
+}
+
+#[tokio::test]
 async fn openapi_upload_media_posts_legacy_multipart_body() -> TestResult<()> {
     let server = MockServer::spawn([
         MockResponse::json(
             r#"{"errcode":0,"errmsg":"ok","access_token":"token-123","expires_in":7200}"#,
         ),
         MockResponse::json(
-            r#"{"errcode":0,"errmsg":"ok","media_id":"media-123","type":"image","created_at":1700000000000}"#,
+            r#"{"errcode":"0","errmsg":"ok","media_id":" media-123 ","type":" image ","created_at":"1700000000000"}"#,
         ),
     ])?;
     let client = dingtalk_for_mock(&server)?;
@@ -210,6 +545,45 @@ async fn openapi_business_error_preserves_request_id_and_body_snippet() -> TestR
         error
             .error_body_snippet()
             .is_some_and(|body| body.contains("invalid robot code"))
+    );
+
+    let token_request = server.next_request()?;
+    assert_eq!(token_request.path(), "/gettoken");
+
+    let send_request = server.next_request()?;
+    assert_eq!(send_request.path(), "/v1.0/robot/groupMessages/send");
+
+    server.finish()
+}
+
+#[tokio::test]
+async fn openapi_http_error_uses_body_request_id_when_header_is_missing() -> TestResult<()> {
+    let server = MockServer::spawn([
+        MockResponse::json(
+            r#"{"errcode":0,"errmsg":"ok","access_token":"token-123","expires_in":7200}"#,
+        ),
+        MockResponse::json_status(
+            429,
+            "Too Many Requests",
+            r#"{"errcode":429,"errmsg":"too many requests","requestId":"req-body"}"#,
+        ),
+    ])?;
+    let client = dingtalk_for_mock(&server)?;
+
+    let error = client
+        .openapi()
+        .robot("robot-code")
+        .send_group_text("open-cid", "hello")
+        .await
+        .err()
+        .ok_or("request should fail")?;
+
+    assert_eq!(error.kind(), ErrorKind::Api);
+    assert_eq!(error.request_id(), Some("req-body"));
+    assert!(
+        error
+            .error_body_snippet()
+            .is_some_and(|snippet| snippet.contains("too many requests"))
     );
 
     let token_request = server.next_request()?;
@@ -307,6 +681,15 @@ impl MockResponse {
         Self {
             status: 200,
             reason: "OK",
+            content_type: "application/json",
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    fn json_status(status: u16, reason: &'static str, body: &str) -> Self {
+        Self {
+            status,
+            reason,
             content_type: "application/json",
             body: body.as_bytes().to_vec(),
         }

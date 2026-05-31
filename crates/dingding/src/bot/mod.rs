@@ -155,7 +155,7 @@ impl MessageType {
     fn from_raw(value: Option<&str>) -> Self {
         let value = value.unwrap_or_default().trim();
         if value.is_empty() {
-            return Self::Any;
+            return Self::Unknown("missing".to_string());
         }
 
         match value.to_ascii_lowercase().as_str() {
@@ -515,19 +515,14 @@ impl RichTextItem {
             });
         }
 
-        match value.get("type").and_then(Value::as_str) {
-            Some("picture") => Some(Self::Picture {
-                download_code: value
-                    .get("downloadCode")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned),
-                picture_download_code: value
-                    .get("pictureDownloadCode")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned),
+        let item_type = value.get("type").and_then(value_string);
+        match item_type.as_deref() {
+            Some(kind) if kind.eq_ignore_ascii_case("picture") => Some(Self::Picture {
+                download_code: value.get("downloadCode").and_then(value_string),
+                picture_download_code: value.get("pictureDownloadCode").and_then(value_string),
             }),
-            Some(value) => Some(Self::Unknown {
-                item_type: Some(value.to_string()),
+            Some(kind) => Some(Self::Unknown {
+                item_type: Some(kind.to_string()),
             }),
             None => None,
         }
@@ -537,8 +532,7 @@ impl RichTextItem {
 fn content_string(content: Option<&Value>, key: &str) -> Option<String> {
     content
         .and_then(|value| value.get(key))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
+        .and_then(value_string)
 }
 
 fn content_u64(content: Option<&Value>, key: &str) -> Option<u64> {
@@ -573,10 +567,15 @@ fn value_bool(value: &Value) -> Option<bool> {
 
 fn value_string(value: &Value) -> Option<String> {
     match value {
-        Value::String(value) if !value.trim().is_empty() => Some(value.clone()),
+        Value::String(value) => non_empty_trimmed_string(value),
         Value::Number(value) => Some(value.to_string()),
         _ => None,
     }
+}
+
+fn non_empty_trimmed_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn raw_string(raw: &Value, keys: &[&str]) -> Option<String> {
@@ -865,6 +864,8 @@ impl CallbackVerifier {
     }
 
     fn verify_at(&self, timestamp_millis: &str, sign: &str, now: SystemTime) -> Result<()> {
+        let timestamp_millis = timestamp_millis.trim();
+        let sign = sign.trim();
         let timestamp = parse_timestamp_millis(timestamp_millis)?;
         let now = now
             .duration_since(UNIX_EPOCH)
@@ -1337,8 +1338,13 @@ impl<S> BotContext<S> {
     /// Missing expiration metadata is treated as not expired.
     #[must_use]
     pub fn is_session_webhook_expired(&self) -> bool {
-        self.session_webhook_expires_at()
-            .is_some_and(|expires_at| expires_at <= SystemTime::now())
+        let Some(expires_at_millis) = self.event.session_webhook_expires_at_millis else {
+            return false;
+        };
+
+        UNIX_EPOCH
+            .checked_add(Duration::from_millis(expires_at_millis))
+            .is_none_or(|expires_at| expires_at <= SystemTime::now())
     }
 
     /// Returns the original incoming JSON payload.
@@ -2056,9 +2062,11 @@ mod tests {
         let text = MessageType::from_dingtalk_value(" TEXT ");
         let rich_text: MessageType = "rich_text".parse().expect("message type parse");
         let unknown = MessageType::from("sticker");
+        let missing = MessageType::from_dingtalk_value(" ");
 
         assert_eq!(text, MessageType::Text);
         assert_eq!(rich_text, MessageType::RichText);
+        assert_eq!(missing, MessageType::Unknown("missing".to_string()));
         assert_eq!(text.as_str(), "text");
         assert_eq!(rich_text.to_string(), "richText");
         assert!(text.is_text());
@@ -2851,6 +2859,99 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_machine_string_fields_without_trimming_message_text() {
+        let event = BotEvent::from_value(serde_json::json!({
+            "conversationType": "2",
+            "conversationTitle": " ops ",
+            "messageId": " message-1 ",
+            "msgtype": "text",
+            "senderId": " sender-open-id ",
+            "senderStaffId": " staff-1 ",
+            "senderNick": " Alice ",
+            "openConversationId": " cid-example ",
+            "sessionWebhook": " https://oapi.dingtalk.com/robot/sendBySession?token=redacted ",
+            "text": {
+                "content": "  /ping keep text spaces  "
+            },
+            "atUsers": [
+                {
+                    "dingtalkId": " $:LWCP_v1:$example ",
+                    "staffId": " staff-2 "
+                }
+            ],
+            "content": {
+                "downloadCode": " download-code ",
+                "recognition": " hello ",
+                "duration": "1200",
+                "richText": [
+                    {
+                        "type": " picture ",
+                        "downloadCode": " picture-download ",
+                        "pictureDownloadCode": " picture-code "
+                    }
+                ]
+            }
+        }));
+
+        assert_eq!(
+            event.text.as_ref().map(|text| text.content.as_str()),
+            Some("  /ping keep text spaces  ")
+        );
+        assert_eq!(event.message_id.as_deref(), Some("message-1"));
+        assert_eq!(event.open_conversation_id.as_deref(), Some("cid-example"));
+        assert_eq!(event.sender_id.as_deref(), Some("sender-open-id"));
+        assert_eq!(event.sender_staff_id.as_deref(), Some("staff-1"));
+        assert_eq!(event.sender_nick.as_deref(), Some("Alice"));
+        assert_eq!(event.conversation_title.as_deref(), Some("ops"));
+        assert_eq!(
+            event.session_webhook.as_deref(),
+            Some("https://oapi.dingtalk.com/robot/sendBySession?token=redacted")
+        );
+        assert_eq!(
+            event
+                .at_users
+                .first()
+                .and_then(|user| user.staff_id.as_deref()),
+            Some("staff-2")
+        );
+
+        let audio = AudioMessage::from_content(event.content.as_ref());
+        assert_eq!(audio.download_code.as_deref(), Some("download-code"));
+        assert_eq!(audio.recognition.as_deref(), Some("hello"));
+
+        let rich_text = RichTextMessage::from_content(event.content.as_ref());
+        assert!(matches!(
+            rich_text.items.first(),
+            Some(RichTextItem::Picture {
+                download_code: Some(download_code),
+                picture_download_code: Some(picture_download_code),
+            }) if download_code == "picture-download" && picture_download_code == "picture-code"
+        ));
+    }
+
+    #[test]
+    fn missing_msgtype_is_unknown_event_type() {
+        let event = BotEvent::from_value(serde_json::json!({
+            "conversationType": "2",
+            "text": {
+                "content": "/ping"
+            }
+        }));
+
+        assert_eq!(
+            event.message_type,
+            MessageType::Unknown("missing".to_string())
+        );
+        assert!(matches!(
+            event.message,
+            IncomingMessage::Unknown {
+                ref message_type,
+                ..
+            } if message_type == "missing"
+        ));
+    }
+
+    #[test]
     fn parses_non_text_callback_content() {
         let event = BotEvent::from_value(serde_json::json!({
             "conversationType": "1",
@@ -2941,21 +3042,30 @@ mod tests {
             "conversationType": "1",
             "msgtype": "file",
             "content": {
-                "downloadCode": "download-code",
+                "downloadCode": 3003,
                 "fileName": "report.pdf",
-                "fileId": "file-1",
-                "spaceId": "space-1"
+                "fileId": 1001,
+                "spaceId": 2002
             }
         }));
         assert!(matches!(
             &file.message,
             IncomingMessage::File(FileMessage {
+                download_code: Some(download_code),
                 file_name: Some(value),
                 file_id: Some(file_id),
                 space_id: Some(space_id),
-                ..
-            }) if value == "report.pdf" && file_id == "file-1" && space_id == "space-1"
+            }) if download_code == "3003"
+                && value == "report.pdf"
+                && file_id == "1001"
+                && space_id == "2002"
         ));
+        assert_eq!(
+            file.message
+                .file()
+                .and_then(|message| message.download_code.as_deref()),
+            Some("3003")
+        );
         assert_eq!(
             file.message
                 .file()
@@ -2972,8 +3082,8 @@ mod tests {
                     { "text": "hello" },
                     {
                         "type": "picture",
-                        "downloadCode": "download-code",
-                        "pictureDownloadCode": "picture-code"
+                        "downloadCode": 4004,
+                        "pictureDownloadCode": 5005
                     }
                 ]
             }
@@ -2992,7 +3102,7 @@ mod tests {
             RichTextItem::Picture {
                 download_code: Some(download_code),
                 picture_download_code: Some(picture_download_code),
-            } if download_code == "download-code" && picture_download_code == "picture-code"
+            } if download_code == "4004" && picture_download_code == "5005"
         ));
         assert_eq!(
             rich_text
@@ -3091,6 +3201,19 @@ mod tests {
         verifier
             .verify_at(timestamp, &encoded_signature, now)
             .expect("signature should verify");
+    }
+
+    #[test]
+    fn verifies_callback_signature_with_trimmed_header_values() {
+        let timestamp = "1700000000000";
+        let app_secret = "this is a secret";
+        let now = UNIX_EPOCH + Duration::from_millis(1_700_000_000_000);
+        let signature = test_callback_signature(timestamp, app_secret);
+        let verifier = CallbackVerifier::new(app_secret).expect("verifier");
+
+        verifier
+            .verify_at(&format!(" {timestamp} "), &format!(" {signature} "), now)
+            .expect("header whitespace should be ignored");
     }
 
     #[test]

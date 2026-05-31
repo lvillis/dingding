@@ -66,8 +66,17 @@ impl Webhook {
             .await?;
         let parsed =
             parse_standard_response(response, self.client.transport().error_body_snippet())?;
+        let errcode = parsed.errcode.ok_or_else(|| {
+            Error::api_with_code(
+                -1,
+                None,
+                "missing errcode field in DingTalk response",
+                parsed.request_id.clone(),
+                None,
+            )
+        })?;
         Ok(WebhookResponse {
-            errcode: parsed.errcode.unwrap_or(0),
+            errcode,
             errmsg: parsed.errmsg.unwrap_or_else(|| "ok".to_string()),
             request_id: parsed.request_id,
         })
@@ -212,6 +221,18 @@ impl Webhook {
                         "URL scheme must be http or https",
                     ));
                 }
+                if !parsed.username().is_empty() || parsed.password().is_some() {
+                    return Err(Error::invalid_input(
+                        "webhook_url",
+                        "URL must not contain username or password",
+                    ));
+                }
+                if parsed.fragment().is_some() {
+                    return Err(Error::invalid_input(
+                        "webhook_url",
+                        "URL must not contain a fragment",
+                    ));
+                }
                 Ok(parsed)
             }
         }
@@ -241,6 +262,28 @@ mod tests {
             .session_webhook("file:///tmp/webhook")
             .target_url()
             .expect_err("non-http URL should fail");
+
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn rejects_session_webhook_userinfo() {
+        let client = DingTalk::new().expect("client");
+        let error = client
+            .session_webhook("https://user:pass@example.com/session-webhook")
+            .target_url()
+            .expect_err("session webhook URL should not contain credentials");
+
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn rejects_session_webhook_fragment() {
+        let client = DingTalk::new().expect("client");
+        let error = client
+            .session_webhook("https://example.com/session-webhook#token")
+            .target_url()
+            .expect_err("session webhook URL should not contain a fragment");
 
         assert_eq!(error.kind(), ErrorKind::InvalidInput);
     }

@@ -17,7 +17,7 @@ pub use crate::openapi::{
     DownloadedFile, InteractiveCard, InteractiveCardResponse, InteractiveCardSendOptions,
     InteractiveCardUpdate, InteractiveCardUpdateOptions, MediaType, MediaUpload,
     MessageFileDownload, OpenApi, RobotActionButton, RobotActionCard, RobotActionCardLayout,
-    RobotApi, RobotMessage, RobotVideo, UploadedMedia,
+    RobotApi, RobotMessage, RobotMessageResponse, RobotVideo, UploadedMedia,
 };
 
 #[cfg(feature = "stream")]

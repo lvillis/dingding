@@ -16,6 +16,7 @@ const PING_ALIASES: [&str; 2] = ["/ping", "ping"];
 static PATH_HIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static IDENT_HIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static STRING_HIT_COUNT: AtomicUsize = AtomicUsize::new(0);
+static PASCAL_IDENT_HIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static ALIASES_HIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static ALIASES_PATH_HIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -34,6 +35,12 @@ async fn ping_ident(_ctx: GroupContext) -> Result<()> {
 #[dingding::handler(scope = "private", msg = "text", command = "/ping")]
 async fn ping_string(_ctx: PrivateContext) -> Result<()> {
     STRING_HIT_COUNT.fetch_add(1, Ordering::SeqCst);
+    Ok(())
+}
+
+#[dingding::handler(scope = Group, msg = Text, command = "/ping")]
+async fn ping_pascal_ident(_ctx: GroupContext) -> Result<()> {
+    PASCAL_IDENT_HIT_COUNT.fetch_add(1, Ordering::SeqCst);
     Ok(())
 }
 
@@ -96,6 +103,21 @@ async fn handler_macro_still_accepts_string_filters() {
 
     assert_eq!(outcome, HandleOutcome::Matched);
     assert_eq!(STRING_HIT_COUNT.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn handler_macro_accepts_pascal_case_bare_ident_filters() {
+    PASCAL_IDENT_HIT_COUNT.store(0, Ordering::SeqCst);
+
+    let client = DingTalk::builder().build().expect("client");
+    let bot = Bot::new(client).route(ping_pascal_ident_route());
+    let outcome = bot
+        .handle_event(BotEvent::text(ConversationScope::Group, "/ping"))
+        .await
+        .expect("handler should run");
+
+    assert_eq!(outcome, HandleOutcome::Matched);
+    assert_eq!(PASCAL_IDENT_HIT_COUNT.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

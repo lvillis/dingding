@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
     let message = message()?;
     let msg_key = message.msg_key()?.to_string();
 
-    let process_query_key = match target {
+    let response = match target {
         Target::Group(open_conversation_id) => {
             robot
                 .send_group_message(open_conversation_id, message)
@@ -54,7 +54,10 @@ async fn main() -> Result<()> {
         Target::Private(user_id) => robot.send_private_message([user_id], message).await?,
     };
 
-    println!("message sent: msg_key={msg_key} process_query_key={process_query_key}");
+    println!(
+        "message sent: msg_key={msg_key} process_query_key={}",
+        response.process_query_key()
+    );
     Ok(())
 }
 

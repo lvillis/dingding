@@ -222,9 +222,23 @@ fn validate_non_empty(value: &str, field: &'static str) -> Result<()> {
 }
 
 fn validate_http_url(value: &str, field: &'static str) -> Result<()> {
-    validate_non_empty(value, field)?;
+    let trimmed = value.trim();
+    validate_non_empty(trimmed, field)?;
+    if trimmed != value {
+        return Err(Error::invalid_input(
+            field,
+            "value must not contain leading or trailing whitespace",
+        ));
+    }
+
     let parsed = Url::parse(value)
         .map_err(|source| Error::invalid_input(field, format!("invalid URL: {source}")))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(Error::invalid_input(
+            field,
+            "URL must not contain username or password",
+        ));
+    }
     if matches!(parsed.scheme(), "http" | "https") {
         Ok(())
     } else {
@@ -592,7 +606,7 @@ impl At {
 fn push_unique_trimmed(values: &mut Vec<String>, value: impl Into<String>) {
     let value = value.into();
     let value = value.trim();
-    if !values.iter().any(|existing| existing == value) {
+    if !value.is_empty() && !values.iter().any(|existing| existing == value) {
         values.push(value.to_string());
     }
 }
@@ -750,6 +764,24 @@ mod tests {
     }
 
     #[test]
+    fn rejects_manually_constructed_untrimmed_urls() {
+        let message = WebhookMessage::Link {
+            link: LinkContent {
+                title: "title".to_string(),
+                text: "body".to_string(),
+                message_url: " https://example.com/path ".to_string(),
+                pic_url: Some(" https://example.com/pic.png ".to_string()),
+            },
+        };
+
+        let error = message
+            .validate()
+            .expect_err("serialized URL would contain whitespace");
+
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn webhook_response_exposes_helpers() {
         let ok = WebhookResponse {
             errcode: 0,
@@ -778,9 +810,9 @@ mod tests {
     fn normalizes_mention_values() {
         let at = At::new()
             .mobile(" 13800000000 ")
-            .mobiles(["13900000000", " 13900000000 "])
+            .mobiles(["13900000000", " 13900000000 ", " "])
             .user_id(" user-1 ")
-            .user_ids(["user-1", " user-2 "]);
+            .user_ids(["user-1", " user-2 ", ""]);
 
         assert_eq!(at.mobiles, ["13800000000", "13900000000"]);
         assert_eq!(at.user_ids, ["user-1", "user-2"]);
@@ -798,11 +830,19 @@ mod tests {
     #[test]
     fn rejects_empty_mention_values() {
         let mobile_error = WebhookMessage::text("hello")
-            .at(At::new().mobile(" "))
+            .at(At {
+                mobiles: vec![" ".to_string()],
+                user_ids: Vec::new(),
+                is_at_all: false,
+            })
             .validate()
             .expect_err("empty mobile should fail");
         let user_id_error = WebhookMessage::markdown("title", "body")
-            .at(At::new().user_id(""))
+            .at(At {
+                mobiles: Vec::new(),
+                user_ids: vec!["".to_string()],
+                is_at_all: false,
+            })
             .validate()
             .expect_err("empty user id should fail");
 
@@ -879,6 +919,15 @@ mod tests {
         let error = WebhookMessage::link("title", "text", "ftp://example.com")
             .validate()
             .expect_err("non-http link should fail");
+
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn rejects_link_url_userinfo() {
+        let error = WebhookMessage::link("title", "text", "https://user:pass@example.com")
+            .validate()
+            .expect_err("link URL should not contain credentials");
 
         assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
     }

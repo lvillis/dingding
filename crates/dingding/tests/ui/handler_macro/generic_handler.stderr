@@ -1,0 +1,5 @@
+error: dingding handlers must not have generic parameters
+ --> tests/ui/handler_macro/generic_handler.rs:2:14
+  |
+2 | async fn ping<T>(_ctx: dingding::bot::AnyContext) -> dingding::Result<()> {
+  |              ^^^
