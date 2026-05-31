@@ -1,0 +1,7 @@
+error: dingding handlers may accept at most `(ctx, event)`
+ --> tests/ui/handler_macro/too_many_args.rs:3:5
+  |
+3 | /     _ctx: dingding::bot::AnyContext,
+4 | |     _event: dingding::bot::BotEvent,
+5 | |     _extra: (),
+  | |_______________^

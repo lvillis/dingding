@@ -1,0 +1,5 @@
+error: dingding handlers must be async functions
+ --> tests/ui/handler_macro/non_async_handler.rs:2:1
+  |
+2 | fn ping(_ctx: dingding::bot::AnyContext) -> dingding::Result<()> {
+  | ^^

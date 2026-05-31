@@ -18,8 +18,7 @@ pub(crate) fn create_signature(timestamp: &str, secret: &str) -> Result<String> 
     let mut mac =
         Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|_error| Error::Signature)?;
     mac.update(string_to_sign.as_bytes());
-    let signature = STANDARD.encode(mac.finalize().into_bytes());
-    Ok(urlencoding::encode(&signature).into_owned())
+    Ok(STANDARD.encode(mac.finalize().into_bytes()))
 }
 
 #[cfg(test)]
@@ -29,9 +28,6 @@ mod tests {
     #[test]
     fn creates_expected_signature() {
         let signature = create_signature("1700000000000", "secret").expect("signature");
-        assert_eq!(
-            signature,
-            "OuzzJR5%2BxZ4%2FEYwqtNt6sMYZQMTa%2FHEGvc9miJe7XzY%3D"
-        );
+        assert_eq!(signature, "OuzzJR5+xZ4/EYwqtNt6sMYZQMTa/HEGvc9miJe7XzY=");
     }
 }

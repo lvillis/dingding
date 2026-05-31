@@ -1,0 +1,5 @@
+error: command must be a string literal or path to a string constant
+ --> tests/ui/handler_macro/invalid_command_type.rs:1:56
+  |
+1 | #[dingding::handler(scope = any, msg = text, command = 123)]
+  |                                                        ^^^

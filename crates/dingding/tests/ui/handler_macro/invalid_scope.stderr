@@ -1,0 +1,5 @@
+error: scope must be one of: Scope::Any, Scope::Group, Scope::Private
+ --> tests/ui/handler_macro/invalid_scope.rs:1:29
+  |
+1 | #[dingding::handler(scope = channel, msg = text)]
+  |                             ^^^^^^^

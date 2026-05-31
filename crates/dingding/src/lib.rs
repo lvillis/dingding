@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 #![warn(rustdoc::broken_intra_doc_links)]
+#![cfg_attr(test, allow(clippy::expect_used, clippy::panic))]
 
 //! DingTalk SDK and bot framework.
 //!

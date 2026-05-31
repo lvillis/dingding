@@ -170,8 +170,9 @@ struct CachedToken {
 #[cfg(feature = "openapi")]
 fn normalize_token_ttl(expires_in_seconds: Option<i64>) -> Duration {
     match expires_in_seconds {
-        Some(value) if value > 0 => Duration::from_secs(value as u64).max(Duration::from_secs(30)),
-        _ => Duration::from_secs(7200),
+        Some(value) if value > 0 => Duration::from_secs(value as u64),
+        Some(_) => Duration::ZERO,
+        None => Duration::from_secs(7200),
     }
 }
 
@@ -199,6 +200,17 @@ mod tests {
         cache.store(credentials.clone(), "token".to_string(), Some(30));
 
         assert_eq!(cache.get(&credentials).as_deref(), Some("token"));
+    }
+
+    #[cfg(feature = "openapi")]
+    #[test]
+    fn token_cache_does_not_extend_expired_tokens() {
+        let credentials = AppCredentials::new("app-key", "app-secret");
+        let cache = MemoryTokenCache::new().with_refresh_margin(Duration::ZERO);
+
+        cache.store(credentials.clone(), "token".to_string(), Some(0));
+
+        assert_eq!(cache.get(&credentials), None);
     }
 
     #[test]

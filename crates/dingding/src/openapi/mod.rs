@@ -237,7 +237,7 @@ impl RobotApi {
 
         let request = RobotGroupMessageRequest {
             msg_param: message.msg_param_json()?,
-            msg_key: message.msg_key().to_string(),
+            msg_key: message.msg_key()?.to_string(),
             robot_code,
             open_conversation_id,
         };
@@ -391,7 +391,7 @@ impl RobotApi {
 
         let request = RobotPrivateMessageRequest {
             msg_param: message.msg_param_json()?,
-            msg_key: message.msg_key().to_string(),
+            msg_key: message.msg_key()?.to_string(),
             robot_code,
             user_ids,
         };
@@ -960,8 +960,8 @@ impl InteractiveCard {
     where
         T: Serialize,
     {
-        Ok(Self::new(card_template_id, card_biz_id, card_data)?
-            .single_chat_receiver_json(single_chat_receiver))
+        Self::new(card_template_id, card_biz_id, card_data)?
+            .single_chat_receiver_json(single_chat_receiver)
     }
 
     /// Creates a private-chat interactive card for a DingTalk user id.
@@ -974,7 +974,7 @@ impl InteractiveCard {
     where
         T: Serialize,
     {
-        Ok(Self::new(card_template_id, card_biz_id, card_data)?.single_chat_user_id(user_id))
+        Self::new(card_template_id, card_biz_id, card_data)?.single_chat_user_id(user_id)
     }
 
     /// Creates an interactive card from a raw JSON object string for `cardData`.
@@ -1006,19 +1006,19 @@ impl InteractiveCard {
     }
 
     /// Sends this card to a private chat target using DingTalk's raw `singleChatReceiver` JSON.
-    #[must_use]
-    pub fn single_chat_receiver_json(mut self, value: impl Into<String>) -> Self {
-        self.single_chat_receiver = Some(value.into().trim().to_string());
-        self
+    pub fn single_chat_receiver_json(mut self, value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        let value = normalize_json_object_str("single_chat_receiver", &value)?;
+        self.single_chat_receiver = Some(value);
+        Ok(self)
     }
 
     /// Sends this card to a private chat with the supplied DingTalk user id.
-    #[must_use]
-    pub fn single_chat_user_id(mut self, user_id: impl Into<String>) -> Self {
+    pub fn single_chat_user_id(mut self, user_id: impl Into<String>) -> Result<Self> {
         let user_id = user_id.into();
-        let user_id = user_id.trim();
+        let user_id = non_empty_trimmed(&user_id, "user_id")?;
         self.single_chat_receiver = Some(serde_json::json!({ "userId": user_id }).to_string());
-        self
+        Ok(self)
     }
 
     /// Sets the card callback URL for HTTP callback mode.
@@ -1137,7 +1137,7 @@ impl InteractiveCard {
                 non_empty_trimmed(open_conversation_id, "open_conversation_id")?;
             }
             (None, Some(single_chat_receiver)) => {
-                non_empty_trimmed(single_chat_receiver, "single_chat_receiver")?;
+                normalize_json_object_str("single_chat_receiver", single_chat_receiver)?;
             }
             (None, None) => {
                 return Err(Error::invalid_input(
@@ -1154,7 +1154,7 @@ impl InteractiveCard {
         }
 
         if let Some(callback_url) = &self.callback_url {
-            non_empty_trimmed(callback_url, "callback_url")?;
+            validate_http_url(callback_url, "callback_url")?;
         }
         if let Some(value) = &self.user_id_private_data_map_json {
             normalize_json_object_str("user_id_private_data_map", value)?;
@@ -2016,19 +2016,21 @@ impl RobotMessage {
     }
 
     /// Returns the DingTalk robot message template key.
-    #[must_use]
-    pub fn msg_key(&self) -> &str {
-        match self {
+    pub fn msg_key(&self) -> Result<&str> {
+        Ok(match self {
             Self::Text { .. } => "sampleText",
             Self::Markdown { .. } => "sampleMarkdown",
             Self::Link { .. } => "sampleLink",
             Self::Image { .. } => "sampleImageMsg",
-            Self::ActionCard { card } => card.msg_key().unwrap_or("sampleActionCard"),
+            Self::ActionCard { card } => card.msg_key()?,
             Self::Audio { .. } => "sampleAudio",
             Self::File { .. } => "sampleFile",
             Self::Video { .. } => "sampleVideo",
-            Self::Custom { msg_key, .. } => msg_key,
-        }
+            Self::Custom { msg_key, .. } => {
+                non_empty_trimmed(msg_key, "msg_key")?;
+                msg_key
+            }
+        })
     }
 
     /// Returns the JSON-encoded `msgParam` object expected by DingTalk.
@@ -2212,6 +2214,20 @@ fn normalize_json_array_str(field: &'static str, value: &str) -> Result<String> 
     Ok(serde_json::to_string(&value)?)
 }
 
+fn validate_http_url(value: &str, field: &'static str) -> Result<()> {
+    let value = non_empty_trimmed(value, field)?;
+    let url = url::Url::parse(&value)
+        .map_err(|source| Error::invalid_input(field, format!("invalid URL: {source}")))?;
+    if matches!(url.scheme(), "http" | "https") {
+        Ok(())
+    } else {
+        Err(Error::invalid_input(
+            field,
+            "URL scheme must be http or https",
+        ))
+    }
+}
+
 fn normalize_user_ids<I, S>(user_ids: I) -> Result<Vec<String>>
 where
     I: IntoIterator<Item = S>,
@@ -2247,7 +2263,7 @@ where
             normalized.push(value.to_string());
         }
     }
-    serde_json::to_string(&normalized).expect("string list serializes")
+    Value::Array(normalized.into_iter().map(Value::String).collect()).to_string()
 }
 
 fn media_upload_multipart_body(upload: &MediaUpload) -> Result<(String, Vec<u8>)> {
@@ -2645,7 +2661,7 @@ mod tests {
     fn robot_text_message_uses_sample_text_key() {
         let message = RobotMessage::text("hello");
 
-        assert_eq!(message.msg_key(), "sampleText");
+        assert_eq!(message.msg_key().expect("msg key"), "sampleText");
         assert_eq!(
             message.msg_param_json().expect("json"),
             r#"{"content":"hello"}"#
@@ -2656,7 +2672,7 @@ mod tests {
     fn robot_markdown_message_uses_sample_markdown_key() {
         let message = RobotMessage::markdown("title", "**body**");
 
-        assert_eq!(message.msg_key(), "sampleMarkdown");
+        assert_eq!(message.msg_key().expect("msg key"), "sampleMarkdown");
         assert_eq!(
             message.msg_param_json().expect("json"),
             r#"{"title":"title","text":"**body**"}"#
@@ -2680,11 +2696,11 @@ mod tests {
                 .size(640, 360),
         );
 
-        assert_eq!(link.msg_key(), "sampleLink");
-        assert_eq!(image.msg_key(), "sampleImageMsg");
-        assert_eq!(audio.msg_key(), "sampleAudio");
-        assert_eq!(file.msg_key(), "sampleFile");
-        assert_eq!(video.msg_key(), "sampleVideo");
+        assert_eq!(link.msg_key().expect("msg key"), "sampleLink");
+        assert_eq!(image.msg_key().expect("msg key"), "sampleImageMsg");
+        assert_eq!(audio.msg_key().expect("msg key"), "sampleAudio");
+        assert_eq!(file.msg_key().expect("msg key"), "sampleFile");
+        assert_eq!(video.msg_key().expect("msg key"), "sampleVideo");
 
         assert_eq!(
             serde_json::from_str::<Value>(&link.msg_param_json().expect("link")).expect("json"),
@@ -2731,9 +2747,9 @@ mod tests {
                 .horizontal(),
         );
 
-        assert_eq!(single.msg_key(), "sampleActionCard");
-        assert_eq!(vertical.msg_key(), "sampleActionCard2");
-        assert_eq!(horizontal.msg_key(), "sampleActionCard6");
+        assert_eq!(single.msg_key().expect("msg key"), "sampleActionCard");
+        assert_eq!(vertical.msg_key().expect("msg key"), "sampleActionCard2");
+        assert_eq!(horizontal.msg_key().expect("msg key"), "sampleActionCard6");
         assert_eq!(
             serde_json::from_str::<Value>(&horizontal.msg_param_json().expect("json"))
                 .expect("json"),
@@ -2749,6 +2765,17 @@ mod tests {
     }
 
     #[test]
+    fn robot_action_card_msg_key_rejects_invalid_layout() {
+        let message = RobotMessage::action_card(RobotActionCard::new("title", "body"));
+
+        let error = message
+            .msg_key()
+            .expect_err("action card without buttons should not produce a template key");
+
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn robot_custom_message_uses_supplied_key_and_param() {
         let message = RobotMessage::custom(
             "sampleActionCard",
@@ -2761,7 +2788,7 @@ mod tests {
         )
         .expect("custom message");
 
-        assert_eq!(message.msg_key(), "sampleActionCard");
+        assert_eq!(message.msg_key().expect("msg key"), "sampleActionCard");
         assert_eq!(
             message.msg_param_json().expect("json"),
             r#"{"singleTitle":"open","singleURL":"https://example.com","text":"body","title":"title"}"#
@@ -2778,7 +2805,7 @@ mod tests {
         )
         .expect("custom message");
 
-        assert_eq!(message.msg_key(), "sampleText");
+        assert_eq!(message.msg_key().expect("msg key"), "sampleText");
         assert_eq!(
             message.msg_param_json().expect("json"),
             r#"{"content":"hello"}"#
@@ -2918,10 +2945,28 @@ mod tests {
         let invalid_update = InteractiveCardUpdate::private_data("biz")
             .validate()
             .expect_err("some update data is required");
+        let invalid_private_user =
+            InteractiveCard::private_user(" ", "template", "biz", serde_json::json!({}))
+                .expect_err("empty private user id should fail");
+        let invalid_private_receiver =
+            InteractiveCard::private_receiver("not json", "template", "biz", serde_json::json!({}))
+                .expect_err("singleChatReceiver must be JSON object");
+        let invalid_callback_url =
+            InteractiveCard::group("cid", "template", "biz", serde_json::json!({}))
+                .expect("card")
+                .callback_url("ftp://example.com/callback")
+                .validate()
+                .expect_err("callback URL should require HTTP");
 
         assert_eq!(invalid_data.kind(), crate::ErrorKind::InvalidInput);
         assert_eq!(missing_target.kind(), crate::ErrorKind::InvalidInput);
         assert_eq!(invalid_update.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(invalid_private_user.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(
+            invalid_private_receiver.kind(),
+            crate::ErrorKind::InvalidInput
+        );
+        assert_eq!(invalid_callback_url.kind(), crate::ErrorKind::InvalidInput);
     }
 
     #[test]

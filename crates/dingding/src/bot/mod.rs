@@ -835,7 +835,7 @@ impl CallbackVerifier {
         }
 
         Ok(Self {
-            app_secret,
+            app_secret: app_secret.trim().to_string(),
             max_clock_skew: Duration::from_secs(300),
         })
     }
@@ -3086,7 +3086,7 @@ mod tests {
         let now = UNIX_EPOCH + Duration::from_millis(1_700_000_000_000);
         let signature = test_callback_signature(timestamp, app_secret);
         let encoded_signature = urlencoding::encode(&signature);
-        let verifier = CallbackVerifier::new(app_secret).expect("verifier");
+        let verifier = CallbackVerifier::new(format!(" {app_secret} ")).expect("verifier");
 
         verifier
             .verify_at(timestamp, &encoded_signature, now)

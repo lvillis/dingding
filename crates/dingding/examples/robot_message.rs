@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
     let robot = ding.openapi().robot(required_env(ROBOT_CODE_ENV)?);
     let target = target()?;
     let message = message()?;
-    let msg_key = message.msg_key().to_string();
+    let msg_key = message.msg_key()?.to_string();
 
     let process_query_key = match target {
         Target::Group(open_conversation_id) => {

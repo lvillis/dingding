@@ -1,0 +1,5 @@
+error: msg must be one of: Msg::Any, Msg::Text, Msg::Markdown, Msg::Audio, Msg::Picture, Msg::Video, Msg::File, Msg::RichText
+ --> tests/ui/handler_macro/invalid_msg.rs:1:40
+  |
+1 | #[dingding::handler(scope = any, msg = tex)]
+  |                                        ^^^
