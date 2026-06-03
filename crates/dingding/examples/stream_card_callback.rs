@@ -64,8 +64,8 @@ async fn handle_card_callback(event: CardCallbackEvent) -> Result<StreamFrameRes
                 ("status", format!("approved by {user_id}")),
                 ("lastAction", action.to_string()),
                 ("env", env.to_string()),
-            ])
-            .user_private_data([("notice", format!("you approved {card_biz_id}"))]),
+            ])?
+            .user_private_data([("notice", format!("you approved {card_biz_id}"))])?,
         "reject" | "cancel" => {
             let status = form
                 .reason
@@ -78,13 +78,13 @@ async fn handle_card_callback(event: CardCallbackEvent) -> Result<StreamFrameRes
                     ("status", status),
                     ("lastAction", action.to_string()),
                     ("env", env.to_string()),
-                ])
-                .user_private_data([("notice", format!("you rejected {card_biz_id}"))])
+                ])?
+                .user_private_data([("notice", format!("you rejected {card_biz_id}"))])?
         }
         _ => CardCallbackResponse::new().user_private_data([(
             "notice",
             format!("received action `{action}` for {card_biz_id}"),
-        )]),
+        )])?,
     };
 
     response.into_stream_response()

@@ -38,8 +38,8 @@ use dingding::{DingTalk, Result};
 #[tokio::main]
 async fn main() -> Result<()> {
     DingTalk::new()?
-        .webhook("access-token")
-        .signing_secret("SEC...")
+        .webhook("access-token")?
+        .signing_secret("SEC...")?
         .send_markdown("deploy", "**done**")
         .await
 }

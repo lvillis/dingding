@@ -158,14 +158,15 @@ impl MessageType {
             return Self::Unknown("missing".to_string());
         }
 
-        match value.to_ascii_lowercase().as_str() {
+        match normalized_filter_value(value).as_str() {
+            "any" => Self::Any,
             "text" => Self::Text,
             "markdown" => Self::Markdown,
-            "audio" => Self::Audio,
-            "picture" => Self::Picture,
+            "audio" | "voice" => Self::Audio,
+            "picture" | "image" => Self::Picture,
             "video" => Self::Video,
             "file" => Self::File,
-            "richtext" | "rich_text" => Self::RichText,
+            "richtext" => Self::RichText,
             _ => Self::Unknown(value.to_string()),
         }
     }
@@ -476,7 +477,7 @@ pub struct RichTextMessage {
 impl RichTextMessage {
     fn from_content(content: Option<&Value>) -> Self {
         let items = content
-            .and_then(|value| value.get("richText"))
+            .and_then(|value| value_by_names(value, &["richText"]))
             .and_then(Value::as_array)
             .map(|values| values.iter().filter_map(RichTextItem::from_value).collect())
             .unwrap_or_default();
@@ -509,17 +510,18 @@ pub enum RichTextItem {
 
 impl RichTextItem {
     fn from_value(value: &Value) -> Option<Self> {
-        if let Some(text) = value.get("text").and_then(Value::as_str) {
+        if let Some(text) = value_by_names(value, &["text"]).and_then(Value::as_str) {
             return Some(Self::Text {
                 text: text.to_string(),
             });
         }
 
-        let item_type = value.get("type").and_then(value_string);
+        let item_type = value_by_names(value, &["type"]).and_then(value_string);
         match item_type.as_deref() {
             Some(kind) if kind.eq_ignore_ascii_case("picture") => Some(Self::Picture {
-                download_code: value.get("downloadCode").and_then(value_string),
-                picture_download_code: value.get("pictureDownloadCode").and_then(value_string),
+                download_code: value_by_names(value, &["downloadCode"]).and_then(value_string),
+                picture_download_code: value_by_names(value, &["pictureDownloadCode"])
+                    .and_then(value_string),
             }),
             Some(kind) => Some(Self::Unknown {
                 item_type: Some(kind.to_string()),
@@ -530,13 +532,15 @@ impl RichTextItem {
 }
 
 fn content_string(content: Option<&Value>, key: &str) -> Option<String> {
-    content
-        .and_then(|value| value.get(key))
-        .and_then(value_string)
+    content_value(content, key).and_then(value_string)
 }
 
 fn content_u64(content: Option<&Value>, key: &str) -> Option<u64> {
-    content.and_then(|value| value.get(key)).and_then(value_u64)
+    content_value(content, key).and_then(value_u64)
+}
+
+fn content_value<'a>(content: Option<&'a Value>, key: &str) -> Option<&'a Value> {
+    content.and_then(|value| value_by_names(value, &[key]))
 }
 
 fn value_u64(value: &Value) -> Option<u64> {
@@ -579,27 +583,48 @@ fn non_empty_trimmed_string(value: &str) -> Option<String> {
 }
 
 fn raw_string(raw: &Value, keys: &[&str]) -> Option<String> {
-    keys.iter()
-        .find_map(|key| raw.get(*key).and_then(value_string))
+    value_by_names(raw, keys).and_then(value_string)
 }
 
 fn raw_value_bool_any(raw: &Value, keys: &[&str]) -> Option<bool> {
-    keys.iter()
-        .find_map(|key| raw.get(*key).and_then(value_bool))
+    value_by_names(raw, keys).and_then(value_bool)
 }
 
 fn raw_value_u64_any(raw: &Value, keys: &[&str]) -> Option<u64> {
-    keys.iter()
-        .find_map(|key| raw.get(*key).and_then(value_u64))
+    value_by_names(raw, keys).and_then(value_u64)
 }
 
 fn raw_array<'a>(raw: &'a Value, keys: &[&str]) -> Option<&'a Vec<Value>> {
-    keys.iter()
-        .find_map(|key| raw.get(*key).and_then(Value::as_array))
+    value_by_names(raw, keys).and_then(Value::as_array)
+}
+
+fn value_by_names<'a>(raw: &'a Value, names: &[&str]) -> Option<&'a Value> {
+    names.iter().find_map(|name| {
+        raw.get(name).or_else(|| {
+            raw.as_object()?
+                .iter()
+                .find(|(key, _value)| field_name_matches(key, name))
+                .map(|(_key, value)| value)
+        })
+    })
+}
+
+fn field_name_matches(left: &str, right: &str) -> bool {
+    normalized_filter_value(left) == normalized_filter_value(right)
+}
+
+fn normalized_filter_value(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !matches!(ch, '-' | '_'))
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn normalized_content_from_raw(raw: &Value) -> Option<Value> {
-    raw.get("content").cloned().map(normalize_content_value)
+    value_by_names(raw, &["content"])
+        .cloned()
+        .map(normalize_content_value)
 }
 
 fn normalize_content_value(value: Value) -> Value {
@@ -616,10 +641,7 @@ fn normalize_content_value(value: Value) -> Value {
 }
 
 fn conversation_scope_from_raw(raw: &Value) -> ConversationScope {
-    let Some(value) = raw
-        .get("conversationType")
-        .or_else(|| raw.get("conversation_type"))
-    else {
+    let Some(value) = value_by_names(raw, &["conversationType", "conversation_type"]) else {
         return ConversationScope::Unknown("missing".to_string());
     };
 
@@ -634,13 +656,13 @@ fn conversation_scope_from_raw(raw: &Value) -> ConversationScope {
 }
 
 fn text_content_from_raw(raw: &Value, message_type: &MessageType) -> Option<String> {
-    let from_text = raw.get("text").and_then(text_content_from_value);
+    let from_text = value_by_names(raw, &["text"]).and_then(text_content_from_value);
     if from_text.is_some() {
         return from_text;
     }
 
     matches!(message_type, MessageType::Text)
-        .then(|| raw.get("content").and_then(text_content_from_value))
+        .then(|| value_by_names(raw, &["content"]).and_then(text_content_from_value))
         .flatten()
 }
 
@@ -649,8 +671,7 @@ fn text_content_from_value(value: &Value) -> Option<String> {
         return string_or_stringified_text_content(content);
     }
 
-    value
-        .get("content")
+    value_by_names(value, &["content"])
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
 }
@@ -659,7 +680,7 @@ fn string_or_stringified_text_content(value: &str) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.starts_with('{')
         && let Ok(value) = serde_json::from_str::<Value>(trimmed)
-        && let Some(content) = value.get("content").and_then(Value::as_str)
+        && let Some(content) = value_by_names(&value, &["content"]).and_then(Value::as_str)
     {
         return Some(content.to_string());
     }
@@ -711,11 +732,9 @@ impl BotEvent {
     #[must_use]
     pub fn from_value(raw: Value) -> Self {
         let conversation_scope = conversation_scope_from_raw(&raw);
-        let message_type = MessageType::from_raw(
-            raw.get("msgtype")
-                .or_else(|| raw.get("msgType"))
-                .and_then(Value::as_str),
-        );
+        let message_type =
+            value_by_names(&raw, &["msgtype", "msgType", "msg_type"]).and_then(value_string);
+        let message_type = MessageType::from_raw(message_type.as_deref());
         let text =
             text_content_from_raw(&raw, &message_type).map(|content| TextMessage { content });
         let content = normalized_content_from_raw(&raw);
@@ -826,15 +845,10 @@ impl CallbackVerifier {
     /// Creates a verifier from the robot app secret.
     pub fn new(app_secret: impl Into<String>) -> Result<Self> {
         let app_secret = app_secret.into();
-        if app_secret.trim().is_empty() {
-            return Err(Error::invalid_input(
-                "app_secret",
-                "value must not be empty",
-            ));
-        }
+        validate_callback_secret(&app_secret)?;
 
         Ok(Self {
-            app_secret: app_secret.trim().to_string(),
+            app_secret,
             max_clock_skew: Duration::from_secs(300),
         })
     }
@@ -887,6 +901,35 @@ impl CallbackVerifier {
 
         verify_callback_signature(timestamp_millis, &self.app_secret, &actual)
     }
+}
+
+fn validate_callback_secret(value: &str) -> Result<()> {
+    if value.chars().any(char::is_control) {
+        return Err(Error::invalid_input(
+            "app_secret",
+            "value must not contain control characters",
+        ));
+    }
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(Error::invalid_input(
+            "app_secret",
+            "value must not be empty",
+        ));
+    }
+    if trimmed != value {
+        return Err(Error::invalid_input(
+            "app_secret",
+            "value must not contain leading or trailing whitespace",
+        ));
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Err(Error::invalid_input(
+            "app_secret",
+            "value must not contain whitespace",
+        ));
+    }
+    Ok(())
 }
 
 /// DingTalk callback header values.
@@ -985,7 +1028,12 @@ impl fmt::Display for BotAck {
 
 fn parse_conversation_scope(value: &str) -> ConversationScope {
     let value = value.trim();
-    match value.to_ascii_lowercase().as_str() {
+    if value.is_empty() {
+        return ConversationScope::Unknown("missing".to_string());
+    }
+
+    match normalized_filter_value(value).as_str() {
+        "any" => ConversationScope::Any,
         "1" | "private" | "single" | "oto" => ConversationScope::Private,
         "2" | "group" => ConversationScope::Group,
         _ => ConversationScope::Unknown(value.to_string()),
@@ -1388,7 +1436,7 @@ impl<S> BotContext<S> {
         content: impl Into<String>,
         at: crate::webhook::At,
     ) -> Result<crate::webhook::WebhookResponse> {
-        self.reply_message_response(crate::webhook::WebhookMessage::text(content).at(at))
+        self.reply_message_response(crate::webhook::WebhookMessage::text(content).at(at)?)
             .await
     }
 
@@ -1435,7 +1483,7 @@ impl<S> BotContext<S> {
         text: impl Into<String>,
         at: crate::webhook::At,
     ) -> Result<crate::webhook::WebhookResponse> {
-        self.reply_message_response(crate::webhook::WebhookMessage::markdown(title, text).at(at))
+        self.reply_message_response(crate::webhook::WebhookMessage::markdown(title, text).at(at)?)
             .await
     }
 
@@ -1454,7 +1502,7 @@ impl<S> BotContext<S> {
     ) -> Result<crate::webhook::WebhookResponse> {
         let webhook = self.session_webhook_available()?;
         self.client
-            .session_webhook(webhook)
+            .session_webhook(webhook)?
             .send_message(message)
             .await
     }
@@ -1537,7 +1585,7 @@ impl Route {
     /// Restricts text messages to a command prefix.
     #[must_use]
     pub fn command(mut self, command: impl Into<String>) -> Self {
-        self.commands = Some(normalize_commands([command]));
+        self.commands = Some(collect_commands([command]));
         self
     }
 
@@ -1548,7 +1596,7 @@ impl Route {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.commands = Some(normalize_commands(commands));
+        self.commands = Some(collect_commands(commands));
         self
     }
 
@@ -1601,6 +1649,24 @@ impl Route {
         self
     }
 
+    /// Validates this route configuration.
+    pub fn validate(&self) -> Result<()> {
+        if self.handler.is_none() {
+            return Err(Error::InvalidConfig(
+                "bot route handler is required".to_string(),
+            ));
+        }
+        if let Some(commands) = &self.commands {
+            if !matches!(self.message_type, MessageType::Any | MessageType::Text) {
+                return Err(Error::InvalidConfig(
+                    "text commands require MessageType::Text or MessageType::Any".to_string(),
+                ));
+            }
+            validate_commands(commands)?;
+        }
+        Ok(())
+    }
+
     fn matches(&self, event: &BotEvent) -> bool {
         self.scope.accepts(&event.conversation_scope)
             && self.message_type.accepts(&event.message_type)
@@ -1624,25 +1690,66 @@ impl Route {
     }
 }
 
-fn normalize_commands<I, S>(commands: I) -> Vec<Arc<str>>
+fn collect_commands<I, S>(commands: I) -> Vec<Arc<str>>
 where
     I: IntoIterator<Item = S>,
     S: Into<String>,
 {
-    let mut normalized = Vec::<Arc<str>>::new();
-    for command in commands {
-        let command = command.into();
-        let command = command.trim();
-        if command.is_empty()
-            || normalized
-                .iter()
-                .any(|existing| existing.as_ref() == command)
-        {
-            continue;
-        }
-        normalized.push(Arc::<str>::from(command));
+    commands
+        .into_iter()
+        .map(|command| Arc::<str>::from(command.into()))
+        .collect()
+}
+
+fn validate_commands(commands: &[Arc<str>]) -> Result<()> {
+    if commands.is_empty() {
+        return Err(Error::invalid_input(
+            "commands",
+            "at least one text command is required",
+        ));
     }
-    normalized
+
+    for (index, command) in commands.iter().enumerate() {
+        validate_command(command)?;
+        if commands[..index]
+            .iter()
+            .any(|existing| existing.as_ref() == command.as_ref())
+        {
+            return Err(Error::invalid_input(
+                "commands",
+                "text command aliases must be unique",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_command(command: &str) -> Result<()> {
+    if command.chars().any(char::is_control) {
+        return Err(Error::invalid_input(
+            "command",
+            "text command must not contain control characters",
+        ));
+    }
+    if command.trim().is_empty() {
+        return Err(Error::invalid_input(
+            "command",
+            "text command must not be empty",
+        ));
+    }
+    if command.trim() != command {
+        return Err(Error::invalid_input(
+            "command",
+            "text command must not contain leading or trailing whitespace",
+        ));
+    }
+    if command.chars().any(char::is_whitespace) {
+        return Err(Error::invalid_input(
+            "command",
+            "text command must not contain whitespace",
+        ));
+    }
+    Ok(())
 }
 
 fn text_route<F, Fut>(scope: ConversationScope, command: impl Into<String>, handler: F) -> Route
@@ -1746,6 +1853,11 @@ impl Bot {
     pub(crate) fn state_arc(mut self, state: BotState) -> Self {
         self.state = Some(state);
         self
+    }
+
+    #[cfg(feature = "stream")]
+    pub(crate) fn has_routes(&self) -> bool {
+        !self.routes.is_empty() || self.fallback.is_some()
     }
 
     /// Registers a route.
@@ -1895,6 +2007,8 @@ impl Bot {
 
     /// Dispatches an event to the first matching route.
     pub async fn handle_event(&self, event: BotEvent) -> Result<HandleOutcome> {
+        self.validate()?;
+
         for route in &self.routes {
             if !route.matches(&event) {
                 continue;
@@ -1917,6 +2031,17 @@ impl Bot {
         }
 
         Ok(HandleOutcome::Ignored)
+    }
+
+    /// Validates all configured routes.
+    pub fn validate(&self) -> Result<()> {
+        for route in &self.routes {
+            route.validate()?;
+        }
+        if let Some(route) = &self.fallback {
+            route.validate()?;
+        }
+        Ok(())
     }
 
     /// Parses and dispatches an event from JSON.
@@ -2042,12 +2167,16 @@ mod tests {
 
     #[test]
     fn conversation_scope_exposes_parse_and_display_helpers() {
+        let any = ConversationScope::from_dingtalk_value("Any");
         let group = ConversationScope::from_dingtalk_value("2");
         let private: ConversationScope = "single".parse().expect("scope parse");
+        let missing = ConversationScope::from_dingtalk_value(" ");
         let unknown = ConversationScope::from("future");
 
+        assert_eq!(any, ConversationScope::Any);
         assert_eq!(group, ConversationScope::Group);
         assert_eq!(private, ConversationScope::Private);
+        assert_eq!(missing, ConversationScope::Unknown("missing".to_string()));
         assert_eq!(group.as_str(), "group");
         assert_eq!(private.to_string(), "private");
         assert!(group.is_group());
@@ -2059,13 +2188,19 @@ mod tests {
 
     #[test]
     fn message_type_exposes_parse_and_display_helpers() {
+        let any = MessageType::from_dingtalk_value("any");
         let text = MessageType::from_dingtalk_value(" TEXT ");
-        let rich_text: MessageType = "rich_text".parse().expect("message type parse");
+        let rich_text: MessageType = "rich-text".parse().expect("message type parse");
+        let image = MessageType::from_dingtalk_value("image");
+        let voice = MessageType::from_dingtalk_value("voice");
         let unknown = MessageType::from("sticker");
         let missing = MessageType::from_dingtalk_value(" ");
 
+        assert_eq!(any, MessageType::Any);
         assert_eq!(text, MessageType::Text);
         assert_eq!(rich_text, MessageType::RichText);
+        assert_eq!(image, MessageType::Picture);
+        assert_eq!(voice, MessageType::Audio);
         assert_eq!(missing, MessageType::Unknown("missing".to_string()));
         assert_eq!(text.as_str(), "text");
         assert_eq!(rich_text.to_string(), "richText");
@@ -2358,19 +2493,16 @@ mod tests {
         let client = DingTalk::builder().build().expect("client");
         let seen = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
         let seen_aliases = Arc::clone(&seen);
-        let bot = Bot::new(client).on_group_text_commands(
-            ["/ping", "ping", " /ping "],
-            move |ctx, _event| {
-                let seen_aliases = Arc::clone(&seen_aliases);
-                async move {
-                    seen_aliases.lock().expect("alias lock").push((
-                        ctx.command().unwrap_or_default().to_string(),
-                        ctx.args_or_empty().to_string(),
-                    ));
-                    Ok(())
-                }
-            },
-        );
+        let bot = Bot::new(client).on_group_text_commands(["/ping", "ping"], move |ctx, _event| {
+            let seen_aliases = Arc::clone(&seen_aliases);
+            async move {
+                seen_aliases.lock().expect("alias lock").push((
+                    ctx.command().unwrap_or_default().to_string(),
+                    ctx.args_or_empty().to_string(),
+                ));
+                Ok(())
+            }
+        });
 
         let slash_outcome = bot
             .handle_event(BotEvent::text(ConversationScope::Group, "/ping api"))
@@ -2393,7 +2525,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_text_commands_match_nothing() {
+    async fn empty_text_commands_are_invalid() {
         let client = DingTalk::builder().build().expect("client");
         let hit = Arc::new(AtomicBool::new(false));
         let seen = Arc::clone(&hit);
@@ -2409,13 +2541,52 @@ mod tests {
             },
         );
 
-        let outcome = bot
+        let error = bot
             .handle_event(BotEvent::text(ConversationScope::Group, "/anything"))
             .await
-            .expect("handled");
+            .expect_err("empty command route should fail");
 
-        assert_eq!(outcome, HandleOutcome::Ignored);
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
         assert!(!hit.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn command_routes_reject_ambiguous_configuration() {
+        let untrimmed = Route::new(ConversationScope::Any)
+            .message_type(MessageType::Text)
+            .command(" /ping ")
+            .handle(|_ctx, _event| async { Ok(()) })
+            .validate()
+            .expect_err("commands should not be rewritten");
+        let duplicate = Route::new(ConversationScope::Any)
+            .message_type(MessageType::Text)
+            .commands(["/ping", "/ping"])
+            .handle(|_ctx, _event| async { Ok(()) })
+            .validate()
+            .expect_err("duplicate aliases should fail");
+        let non_text = Route::new(ConversationScope::Any)
+            .message_type(MessageType::Picture)
+            .command("/ping")
+            .handle(|_ctx, _event| async { Ok(()) })
+            .validate()
+            .expect_err("command routes should not be attached to non-text messages");
+
+        assert_eq!(untrimmed.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(duplicate.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(non_text.kind(), crate::ErrorKind::InvalidConfig);
+    }
+
+    #[tokio::test]
+    async fn route_without_handler_is_invalid() {
+        let client = DingTalk::builder().build().expect("client");
+        let bot = Bot::new(client).route(Route::new(ConversationScope::Any));
+
+        let error = bot
+            .handle_event(BotEvent::text(ConversationScope::Group, "/anything"))
+            .await
+            .expect_err("route without handler should fail");
+
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidConfig);
     }
 
     #[tokio::test]
@@ -2824,18 +2995,18 @@ mod tests {
             "conversationType": 2,
             "conversation_title": "ops",
             "messageId": "message-1",
-            "msgType": " TEXT ",
+            "msg_type": " TEXT ",
             "sender_id": "sender-open-id",
-            "sender_staff_id": "staff-1",
+            "sender-staff-id": "staff-1",
             "sender_nick": "Alice",
             "is_admin": 1,
-            "is_in_at_list": "true",
-            "open_conversation_id": "cid-example",
+            "is-in-at-list": "true",
+            "open-conversation-id": "cid-example",
             "content": "/ping",
-            "at_users": [
+            "at-users": [
                 {
                     "dingtalk_id": "$:LWCP_v1:$example",
-                    "userId": "staff-2"
+                    "user-id": "staff-2"
                 }
             ]
         }));
@@ -3114,6 +3285,63 @@ mod tests {
     }
 
     #[test]
+    fn parses_content_field_name_variants() {
+        let file = BotEvent::from_value(serde_json::json!({
+            "conversationType": "1",
+            "msgtype": "file",
+            "content": {
+                "download-code": 3003,
+                "file_name": "report.pdf",
+                "file-id": 1001,
+                "space_id": 2002
+            }
+        }));
+        assert!(matches!(
+            &file.message,
+            IncomingMessage::File(FileMessage {
+                download_code: Some(download_code),
+                file_name: Some(file_name),
+                file_id: Some(file_id),
+                space_id: Some(space_id),
+            }) if download_code == "3003"
+                && file_name == "report.pdf"
+                && file_id == "1001"
+                && space_id == "2002"
+        ));
+
+        let rich_text = BotEvent::from_value(serde_json::json!({
+            "conversation-type": "1",
+            "msg-type": "richText",
+            "content": {
+                "rich-text": [
+                    { "Text": "hello" },
+                    {
+                        "Type": "picture",
+                        "download-code": 4004,
+                        "picture_download_code": 5005
+                    }
+                ]
+            }
+        }));
+        let IncomingMessage::RichText(message) = &rich_text.message else {
+            panic!("expected rich text");
+        };
+
+        assert_eq!(message.items.len(), 2);
+        assert!(matches!(
+            &message.items[0],
+            RichTextItem::Text { text } if text == "hello"
+        ));
+        assert!(matches!(
+            &message.items[1],
+            RichTextItem::Picture {
+                download_code: Some(download_code),
+                picture_download_code: Some(picture_download_code),
+            } if download_code == "4004" && picture_download_code == "5005"
+        ));
+    }
+
+    #[test]
     fn incoming_message_accessors_return_typed_payloads() {
         let text = BotEvent::text(ConversationScope::Private, "/ping");
         let markdown = BotEvent::from_value(serde_json::json!({
@@ -3192,11 +3420,11 @@ mod tests {
     #[test]
     fn verifies_callback_signature() {
         let timestamp = "1700000000000";
-        let app_secret = "this is a secret";
+        let app_secret = "callback-secret";
         let now = UNIX_EPOCH + Duration::from_millis(1_700_000_000_000);
         let signature = test_callback_signature(timestamp, app_secret);
         let encoded_signature = urlencoding::encode(&signature);
-        let verifier = CallbackVerifier::new(format!(" {app_secret} ")).expect("verifier");
+        let verifier = CallbackVerifier::new(app_secret).expect("verifier");
 
         verifier
             .verify_at(timestamp, &encoded_signature, now)
@@ -3204,9 +3432,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_untrimmed_callback_secret() {
+        let error = CallbackVerifier::new(" callback-secret ")
+            .expect_err("callback secret should not be rewritten");
+
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn verifies_callback_signature_with_trimmed_header_values() {
         let timestamp = "1700000000000";
-        let app_secret = "this is a secret";
+        let app_secret = "callback-secret";
         let now = UNIX_EPOCH + Duration::from_millis(1_700_000_000_000);
         let signature = test_callback_signature(timestamp, app_secret);
         let verifier = CallbackVerifier::new(app_secret).expect("verifier");
@@ -3219,7 +3455,7 @@ mod tests {
     #[test]
     fn rejects_stale_callback_signature() {
         let timestamp = "1700000000000";
-        let app_secret = "this is a secret";
+        let app_secret = "callback-secret";
         let now = UNIX_EPOCH + Duration::from_millis(1_700_001_000_000);
         let signature = test_callback_signature(timestamp, app_secret);
         let verifier = CallbackVerifier::new(app_secret).expect("verifier");
@@ -3237,7 +3473,7 @@ mod tests {
             .expect("clock")
             .as_millis()
             .to_string();
-        let app_secret = "this is a secret";
+        let app_secret = "callback-secret";
         let signature = test_callback_signature(&timestamp, app_secret);
         let client = DingTalk::builder().build().expect("client");
         let hit = Arc::new(AtomicBool::new(false));
@@ -3276,7 +3512,7 @@ mod tests {
     async fn rejects_callback_without_signature_headers() {
         let client = DingTalk::builder().build().expect("client");
         let bot = Bot::new(client);
-        let verifier = CallbackVerifier::new("this is a secret").expect("verifier");
+        let verifier = CallbackVerifier::new("callback-secret").expect("verifier");
         let body = br#"{"conversationType":"2","msgtype":"text","text":{"content":"/ping"}}"#;
         let error = bot
             .handle_callback_parts(&verifier, None, None, body)
@@ -3293,7 +3529,7 @@ mod tests {
             .expect("clock")
             .as_millis()
             .to_string();
-        let app_secret = "this is a secret";
+        let app_secret = "callback-secret";
         let signature = test_callback_signature(&timestamp, app_secret);
         let client = DingTalk::builder().build().expect("client");
         let bot = Bot::new(client);

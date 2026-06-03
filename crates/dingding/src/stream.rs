@@ -88,6 +88,7 @@ pub struct StreamBotBuilder {
     fallback: Option<Route>,
     state: Option<BotState>,
     subscriptions: Vec<StreamSubscription>,
+    subscriptions_replaced: bool,
     local_ip: Option<String>,
     user_agent: Option<String>,
     reconnect: ReconnectPolicy,
@@ -104,7 +105,8 @@ impl StreamBotBuilder {
             routes: Vec::new(),
             fallback: None,
             state: None,
-            subscriptions: vec![StreamSubscription::bot_messages()],
+            subscriptions: Vec::new(),
+            subscriptions_replaced: false,
             local_ip: None,
             user_agent: None,
             reconnect: ReconnectPolicy::default(),
@@ -319,14 +321,18 @@ impl StreamBotBuilder {
         self
     }
 
-    /// Replaces Stream subscriptions.
+    /// Replaces inferred Stream subscriptions.
+    ///
+    /// Bot-message defaults are not added when this is used. Card callback handlers still add the
+    /// required card callback topic automatically.
     #[must_use]
     pub fn subscriptions(mut self, subscriptions: Vec<StreamSubscription>) -> Self {
         self.subscriptions = subscriptions;
+        self.subscriptions_replaced = true;
         self
     }
 
-    /// Adds a Stream subscription.
+    /// Adds a Stream subscription in addition to inferred subscriptions.
     #[must_use]
     pub fn subscription(mut self, subscription: StreamSubscription) -> Self {
         self.subscriptions.push(subscription);
@@ -428,7 +434,6 @@ impl StreamBotBuilder {
         F: Fn(CardCallbackEvent) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<StreamFrameResponse>> + Send + 'static,
     {
-        self = self.subscription_once(StreamSubscription::card_callbacks());
         let handler = Arc::new(handler);
         self.card_callback_handler = Some(Arc::new(move |event| {
             let handler = Arc::clone(&handler);
@@ -437,56 +442,81 @@ impl StreamBotBuilder {
         self
     }
 
-    fn subscription_once(mut self, subscription: StreamSubscription) -> Self {
-        if !self.subscriptions.iter().any(|existing| {
-            existing.kind == subscription.kind && existing.topic == subscription.topic
-        }) {
-            self.subscriptions.push(subscription);
-        }
-        self
-    }
-
     /// Builds the Stream bot.
     pub fn build(self) -> Result<StreamBot> {
-        let client = match self.client {
+        let Self {
+            client,
+            credentials,
+            routes,
+            fallback,
+            state,
+            subscriptions,
+            subscriptions_replaced,
+            local_ip,
+            user_agent,
+            reconnect,
+            event_handler,
+            frame_handler,
+            card_callback_handler,
+        } = self;
+
+        let has_bot_route = !routes.is_empty() || fallback.is_some();
+        let has_frame_handler = frame_handler.is_some() || card_callback_handler.is_some();
+        if !has_bot_route && !has_frame_handler {
+            return Err(Error::InvalidConfig(
+                "stream bot route, frame handler, or card callback handler is required".to_string(),
+            ));
+        }
+        validate_bot_routes(&routes, fallback.as_ref())?;
+
+        let client = match client {
             Some(client) => client,
             None => {
-                let credentials = self.credentials.clone().ok_or(Error::MissingCredentials)?;
+                let credentials = credentials.clone().ok_or(Error::MissingCredentials)?;
                 DingTalk::builder().app_credentials(credentials).build()?
             }
         };
 
-        let mut bot = Bot::new(client.clone());
-        for route in self.routes {
-            bot = bot.route(route);
-        }
-        if let Some(route) = self.fallback {
-            bot = bot.fallback_route(route);
-        }
-        if let Some(state) = self.state {
-            bot = bot.state_arc(state);
+        let mut stream = StreamClient::builder(client.clone())?
+            .subscriptions(resolve_implicit_subscriptions(
+                subscriptions,
+                subscriptions_replaced,
+                has_bot_route,
+                frame_handler.is_some(),
+                card_callback_handler.is_some(),
+            ))
+            .reconnect_policy(reconnect);
+
+        if has_bot_route {
+            let mut bot = Bot::new(client.clone());
+            for route in routes {
+                bot = bot.route(route);
+            }
+            if let Some(route) = fallback {
+                bot = bot.fallback_route(route);
+            }
+            if let Some(state) = state {
+                bot = bot.state_arc(state);
+            }
+            stream = stream.bot(bot);
         }
 
-        let mut stream = StreamClient::builder(client.clone())?
-            .subscriptions(self.subscriptions)
-            .reconnect_policy(self.reconnect)
-            .bot(bot);
-        if let Some(credentials) = self.credentials {
+        if let Some(credentials) = credentials {
             stream = stream.credentials(credentials);
         }
-        if let Some(local_ip) = self.local_ip {
+        if let Some(local_ip) = local_ip {
             stream = stream.local_ip(local_ip);
         }
-        if let Some(user_agent) = self.user_agent {
+        if let Some(user_agent) = user_agent {
             stream = stream.user_agent(user_agent);
         }
-        if let Some(handler) = self.event_handler {
+        if let Some(handler) = event_handler {
             stream = stream.on_event_handler(handler);
         }
-        if let Some(handler) = self.frame_handler {
+        if let Some(handler) = frame_handler {
             stream = stream.on_frame_handler(handler);
         }
-        if let Some(handler) = self.card_callback_handler {
+        if let Some(handler) = card_callback_handler {
             stream = stream.on_card_callback_handler(handler);
         }
 
@@ -911,6 +941,7 @@ pub struct StreamClientBuilder {
     client: DingTalk,
     credentials: Option<AppCredentials>,
     subscriptions: Vec<StreamSubscription>,
+    subscriptions_replaced: bool,
     local_ip: Option<String>,
     user_agent: String,
     reconnect: ReconnectPolicy,
@@ -926,7 +957,8 @@ impl StreamClientBuilder {
         Ok(Self {
             client,
             credentials,
-            subscriptions: vec![StreamSubscription::bot_messages()],
+            subscriptions: Vec::new(),
+            subscriptions_replaced: false,
             local_ip: None,
             user_agent: concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")).to_string(),
             reconnect: ReconnectPolicy::default(),
@@ -962,14 +994,18 @@ impl StreamClientBuilder {
         self
     }
 
-    /// Replaces Stream subscriptions.
+    /// Replaces inferred Stream subscriptions.
+    ///
+    /// Bot-message defaults are not added when this is used. Card callback handlers still add the
+    /// required card callback topic automatically.
     #[must_use]
     pub fn subscriptions(mut self, subscriptions: Vec<StreamSubscription>) -> Self {
         self.subscriptions = subscriptions;
+        self.subscriptions_replaced = true;
         self
     }
 
-    /// Adds a Stream subscription.
+    /// Adds a Stream subscription in addition to inferred subscriptions.
     #[must_use]
     pub fn subscription(mut self, subscription: StreamSubscription) -> Self {
         self.subscriptions.push(subscription);
@@ -1074,7 +1110,6 @@ impl StreamClientBuilder {
         F: Fn(CardCallbackEvent) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<StreamFrameResponse>> + Send + 'static,
     {
-        self = self.subscription_once(StreamSubscription::card_callbacks());
         let handler = Arc::new(handler);
         self.card_callback_handler = Some(Arc::new(move |event| {
             let handler = Arc::clone(&handler);
@@ -1093,26 +1128,8 @@ impl StreamClientBuilder {
         self
     }
 
-    fn subscription_once(mut self, subscription: StreamSubscription) -> Self {
-        if !self.subscriptions.iter().any(|existing| {
-            existing.kind == subscription.kind && existing.topic == subscription.topic
-        }) {
-            self.subscriptions.push(subscription);
-        }
-        self
-    }
-
     /// Builds a Stream client.
     pub fn build(self) -> Result<StreamClient> {
-        let credentials = self.credentials.ok_or(Error::MissingCredentials)?;
-        credentials.validate()?;
-        let subscriptions = normalize_subscriptions(self.subscriptions)?;
-        self.reconnect.validate()?;
-        let user_agent = non_empty_trimmed(&self.user_agent, "user_agent")?;
-        let local_ip = self
-            .local_ip
-            .map(|value| non_empty_trimmed(&value, "local_ip"))
-            .transpose()?;
         if self.bot.is_none()
             && self.frame_handler.is_none()
             && self.card_callback_handler.is_none()
@@ -1122,6 +1139,35 @@ impl StreamClientBuilder {
                     .to_string(),
             ));
         }
+        if let Some(bot) = &self.bot {
+            if !bot.has_routes() {
+                return Err(Error::InvalidConfig(
+                    "stream bot router requires at least one route or fallback".to_string(),
+                ));
+            }
+            bot.validate()?;
+        }
+        let credentials = self.credentials.ok_or(Error::MissingCredentials)?;
+        credentials.validate()?;
+
+        let subscriptions = resolve_implicit_subscriptions(
+            self.subscriptions,
+            self.subscriptions_replaced,
+            self.bot.is_some(),
+            self.frame_handler.is_some(),
+            self.card_callback_handler.is_some(),
+        );
+        let subscriptions = normalize_subscriptions(subscriptions)?;
+        self.reconnect.validate()?;
+        validate_user_agent(&self.user_agent)?;
+        let user_agent = self.user_agent;
+        let local_ip = self
+            .local_ip
+            .map(|value| {
+                validate_protocol_token(&value, "local_ip")?;
+                Ok::<String, Error>(value)
+            })
+            .transpose()?;
 
         Ok(StreamClient {
             client: self.client,
@@ -1279,9 +1325,8 @@ impl StreamSubscription {
     /// Creates a custom Stream subscription.
     #[must_use]
     pub fn new(kind: StreamSubscriptionType, topic: impl Into<String>) -> Self {
-        let topic = topic.into();
         Self {
-            topic: topic.trim().to_string(),
+            topic: topic.into(),
             kind,
         }
     }
@@ -1300,7 +1345,7 @@ impl StreamSubscription {
 
     /// Validates this subscription.
     pub fn validate(&self) -> Result<()> {
-        non_empty_trimmed(&self.topic, "subscription.topic")?;
+        validate_protocol_token(&self.topic, "subscription.topic")?;
         Ok(())
     }
 }
@@ -1316,8 +1361,8 @@ fn normalize_subscriptions(
     }
 
     let mut normalized = Vec::new();
-    for mut subscription in subscriptions {
-        subscription.topic = non_empty_trimmed(&subscription.topic, "subscription.topic")?;
+    for subscription in subscriptions {
+        subscription.validate()?;
         if !normalized.iter().any(|existing: &StreamSubscription| {
             existing.kind == subscription.kind && existing.topic == subscription.topic
         }) {
@@ -1326,6 +1371,44 @@ fn normalize_subscriptions(
     }
 
     Ok(normalized)
+}
+
+fn validate_bot_routes(routes: &[Route], fallback: Option<&Route>) -> Result<()> {
+    for route in routes {
+        route.validate()?;
+    }
+    if let Some(route) = fallback {
+        route.validate()?;
+    }
+    Ok(())
+}
+
+fn resolve_implicit_subscriptions(
+    mut subscriptions: Vec<StreamSubscription>,
+    subscriptions_replaced: bool,
+    bot_messages: bool,
+    frame_handler: bool,
+    card_callbacks: bool,
+) -> Vec<StreamSubscription> {
+    if !subscriptions_replaced && (bot_messages || frame_handler) {
+        push_subscription_once(&mut subscriptions, StreamSubscription::bot_messages());
+    }
+    if card_callbacks {
+        push_subscription_once(&mut subscriptions, StreamSubscription::card_callbacks());
+    }
+    subscriptions
+}
+
+fn push_subscription_once(
+    subscriptions: &mut Vec<StreamSubscription>,
+    subscription: StreamSubscription,
+) {
+    if !subscriptions
+        .iter()
+        .any(|existing| existing.kind == subscription.kind && existing.topic == subscription.topic)
+    {
+        subscriptions.push(subscription);
+    }
 }
 
 /// Stream subscription type.
@@ -1488,7 +1571,9 @@ struct OpenConnectionRequest<'a> {
 }
 
 fn websocket_url(ticket: &OpenConnectionResponse) -> Result<Url> {
-    let mut url = Url::parse(&ticket.endpoint)
+    let endpoint = non_empty_trimmed(&ticket.endpoint, "stream.endpoint")?;
+    let ticket_value = normalize_protocol_token(&ticket.ticket, "stream.ticket")?;
+    let mut url = Url::parse(&endpoint)
         .map_err(|source| Error::Stream(format!("invalid stream endpoint: {source}")))?;
     if !matches!(url.scheme(), "ws" | "wss") {
         return Err(Error::Stream(
@@ -1517,7 +1602,7 @@ fn websocket_url(ticket: &OpenConnectionResponse) -> Result<Url> {
         for (name, value) in query_pairs {
             query.append_pair(&name, &value);
         }
-        query.append_pair("ticket", &ticket.ticket);
+        query.append_pair("ticket", &ticket_value);
     }
     Ok(url)
 }
@@ -1544,7 +1629,11 @@ struct RawOpenConnectionResponse {
         deserialize_with = "crate::transport::deserialize_optional_string"
     )]
     api_code: Option<String>,
-    #[serde(alias = "message")]
+    #[serde(
+        default,
+        alias = "message",
+        deserialize_with = "crate::transport::deserialize_optional_string"
+    )]
     errmsg: Option<String>,
     #[serde(
         default,
@@ -1603,7 +1692,7 @@ impl RawOpenConnectionResponse {
         let ticket = self
             .ticket
             .as_deref()
-            .and_then(|value| non_empty_trimmed(value, "ticket").ok())
+            .and_then(|value| normalize_protocol_token(value, "ticket").ok())
             .ok_or_else(|| {
                 api_error_from_body(
                     -1,
@@ -1631,7 +1720,7 @@ impl StreamFrame {
     pub fn from_text(text: &str) -> Result<Self> {
         let raw = serde_json::from_str::<RawStreamFrame>(text)?;
         Ok(Self {
-            frame_type: StreamFrameType::from_raw(&raw.frame_type),
+            frame_type: StreamFrameType::from_raw(&raw.frame_type)?,
             headers: raw.headers.normalized()?,
             data: raw.data,
         })
@@ -2195,27 +2284,25 @@ impl CardCallbackResponse {
     }
 
     /// Sets card-level parameters to update.
-    #[must_use]
-    pub fn card_data<I, K, V>(mut self, values: I) -> Self
+    pub fn card_data<I, K, V>(mut self, values: I) -> Result<Self>
     where
         I: IntoIterator<Item = (K, V)>,
         K: Into<String>,
         V: Into<String>,
     {
-        self.card_data = Some(CardCallbackResponseData::new(values));
-        self
+        self.card_data = Some(CardCallbackResponseData::new("card_data", values)?);
+        Ok(self)
     }
 
     /// Sets user-private parameters to update.
-    #[must_use]
-    pub fn user_private_data<I, K, V>(mut self, values: I) -> Self
+    pub fn user_private_data<I, K, V>(mut self, values: I) -> Result<Self>
     where
         I: IntoIterator<Item = (K, V)>,
         K: Into<String>,
         V: Into<String>,
     {
-        self.user_private_data = Some(CardCallbackResponseData::new(values));
-        self
+        self.user_private_data = Some(CardCallbackResponseData::new("user_private_data", values)?);
+        Ok(self)
     }
 
     /// Converts this value into a Stream ACK response.
@@ -2225,6 +2312,12 @@ impl CardCallbackResponse {
     }
 
     fn validate(&self) -> Result<()> {
+        if self.card_data.is_none() && self.user_private_data.is_none() {
+            return Err(Error::invalid_input(
+                "card_callback_response",
+                "card_data or user_private_data is required",
+            ));
+        }
         if let Some(card_data) = &self.card_data {
             card_data.validate("card_data")?;
         }
@@ -2242,18 +2335,27 @@ struct CardCallbackResponseData {
 }
 
 impl CardCallbackResponseData {
-    fn new<I, K, V>(values: I) -> Self
+    fn new<I, K, V>(field: &'static str, values: I) -> Result<Self>
     where
         I: IntoIterator<Item = (K, V)>,
         K: Into<String>,
         V: Into<String>,
     {
-        Self {
-            card_param_map: values
-                .into_iter()
-                .map(|(key, value)| (key.into().trim().to_string(), value.into()))
-                .collect(),
+        let mut card_param_map = BTreeMap::new();
+        for (key, value) in values {
+            let key = key.into();
+            validate_protocol_token(&key, field)?;
+            if card_param_map.contains_key(&key) {
+                return Err(Error::invalid_input(
+                    field,
+                    "card parameter keys must be unique",
+                ));
+            }
+            card_param_map.insert(key, value.into());
         }
+        let data = Self { card_param_map };
+        data.validate(field)?;
+        Ok(data)
     }
 
     fn validate(&self, field: &'static str) -> Result<()> {
@@ -2264,10 +2366,55 @@ impl CardCallbackResponseData {
             ));
         }
         for key in self.card_param_map.keys() {
-            non_empty_trimmed(key, field)?;
+            validate_protocol_token(key, field)?;
         }
         Ok(())
     }
+}
+
+fn validate_protocol_token(value: &str, field: &'static str) -> Result<()> {
+    let normalized = normalize_protocol_token(value, field)?;
+    if normalized != value {
+        return Err(Error::invalid_input(
+            field,
+            "value must not contain leading or trailing whitespace",
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_protocol_token(value: &str, field: &'static str) -> Result<String> {
+    if value.chars().any(char::is_control) {
+        return Err(Error::invalid_input(
+            field,
+            "value must not contain control characters",
+        ));
+    }
+    let value = non_empty_trimmed(value, field)?;
+    if value.chars().any(char::is_whitespace) {
+        return Err(Error::invalid_input(
+            field,
+            "value must not contain whitespace",
+        ));
+    }
+    Ok(value)
+}
+
+fn validate_user_agent(value: &str) -> Result<()> {
+    if value.chars().any(char::is_control) {
+        return Err(Error::invalid_input(
+            "user_agent",
+            "value must not contain control characters",
+        ));
+    }
+    let trimmed = non_empty_trimmed(value, "user_agent")?;
+    if trimmed != value {
+        return Err(Error::invalid_input(
+            "user_agent",
+            "value must not contain leading or trailing whitespace",
+        ));
+    }
+    Ok(())
 }
 
 fn callback_content(raw: &Value) -> Option<Value> {
@@ -2325,21 +2472,28 @@ fn trimmed_str_value(value: &Value) -> Option<&str> {
 
 fn string_vec_from_value(value: &Value) -> Vec<String> {
     match value {
-        Value::Array(values) => values
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .collect(),
-        Value::String(text) => serde_json::from_str::<Vec<String>>(text)
-            .unwrap_or_else(|_| vec![text.trim().to_string()])
-            .into_iter()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .collect(),
+        Value::Array(values) => normalized_string_values(values),
+        Value::String(text) => string_vec_from_text(text),
+        Value::Number(_) => normalized_string_value(value).into_iter().collect(),
         _ => Vec::new(),
     }
+}
+
+fn string_vec_from_text(text: &str) -> Vec<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Vec::new();
+    }
+
+    match serde_json::from_str::<Value>(text) {
+        Ok(Value::Array(values)) => normalized_string_values(&values),
+        Ok(value) => normalized_string_value(&value).into_iter().collect(),
+        Err(_error) => vec![text.to_string()],
+    }
+}
+
+fn normalized_string_values(values: &[Value]) -> Vec<String> {
+    values.iter().filter_map(normalized_string_value).collect()
 }
 
 fn field_name_matches(left: &str, right: &str) -> bool {
@@ -2355,7 +2509,10 @@ fn field_name_matches(left: &str, right: &str) -> bool {
 
 #[derive(Debug, Deserialize)]
 struct RawStreamFrame {
-    #[serde(rename = "type")]
+    #[serde(
+        rename = "type",
+        deserialize_with = "crate::transport::deserialize_string"
+    )]
     frame_type: String,
     headers: StreamHeaders,
     data: Value,
@@ -2364,9 +2521,17 @@ struct RawStreamFrame {
 /// DingTalk Stream frame headers.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StreamHeaders {
-    #[serde(alias = "Topic")]
+    #[serde(
+        alias = "Topic",
+        deserialize_with = "crate::transport::deserialize_string"
+    )]
     topic: String,
-    #[serde(rename = "messageId", alias = "message_id", alias = "MessageId")]
+    #[serde(
+        rename = "messageId",
+        alias = "message_id",
+        alias = "MessageId",
+        deserialize_with = "crate::transport::deserialize_string"
+    )]
     message_id: String,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
@@ -2442,13 +2607,13 @@ pub enum StreamFrameType {
 }
 
 impl StreamFrameType {
-    fn from_raw(value: &str) -> Self {
-        let value = value.trim();
+    fn from_raw(value: &str) -> Result<Self> {
+        let value = non_empty_trimmed(value, "stream.type")?;
         match value.to_ascii_uppercase().as_str() {
-            "SYSTEM" => Self::System,
-            "CALLBACK" => Self::Callback,
-            "EVENT" => Self::Event,
-            _ => Self::Unknown(value.to_string()),
+            "SYSTEM" => Ok(Self::System),
+            "CALLBACK" => Ok(Self::Callback),
+            "EVENT" => Ok(Self::Event),
+            _ => Ok(Self::Unknown(value)),
         }
     }
 
@@ -2613,13 +2778,8 @@ enum StreamAckData {
 impl StreamAckData {
     fn to_json_string(&self) -> String {
         match self {
-            Self::Response(value) => serde_json::to_string(&serde_json::json!({
-                "response": value,
-            }))
-            .unwrap_or_else(|_error| r#"{"response":null}"#.to_string()),
-            Self::Raw(value) => {
-                serde_json::to_string(value).unwrap_or_else(|_error| "{}".to_string())
-            }
+            Self::Response(value) => serde_json::json!({ "response": value }).to_string(),
+            Self::Raw(value) => value.to_string(),
         }
     }
 }
@@ -2629,6 +2789,11 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    fn test_bot(client: DingTalk) -> Bot {
+        Bot::new(client)
+            .route(Route::new(ConversationScope::Any).handle(|_ctx, _event| async { Ok(()) }))
+    }
 
     #[test]
     fn websocket_url_appends_ticket() {
@@ -2670,6 +2835,34 @@ mod tests {
 
         assert_eq!(userinfo.kind(), crate::ErrorKind::Stream);
         assert_eq!(fragment.kind(), crate::ErrorKind::Stream);
+    }
+
+    #[test]
+    fn websocket_url_rejects_blank_endpoint_or_ticket() {
+        let endpoint = websocket_url(&OpenConnectionResponse {
+            endpoint: " ".to_string(),
+            ticket: "ticket-1".to_string(),
+        })
+        .expect_err("blank endpoint should fail");
+        let ticket = websocket_url(&OpenConnectionResponse {
+            endpoint: "wss://example.com/connect".to_string(),
+            ticket: " ".to_string(),
+        })
+        .expect_err("blank ticket should fail");
+
+        assert_eq!(endpoint.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(ticket.kind(), crate::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn websocket_url_rejects_ticket_whitespace() {
+        let error = websocket_url(&OpenConnectionResponse {
+            endpoint: "wss://example.com/connect".to_string(),
+            ticket: "ticket value".to_string(),
+        })
+        .expect_err("ticket should not contain whitespace");
+
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -2766,7 +2959,7 @@ mod tests {
             .app_key_and_secret("client-id", "client-secret")
             .build()
             .expect("client");
-        let bot = Bot::new(client.clone());
+        let bot = test_bot(client.clone());
         let stream = StreamClient::builder(client)
             .expect("builder")
             .bot(bot)
@@ -2807,7 +3000,7 @@ mod tests {
             .app_key_and_secret("client-id", "client-secret")
             .build()
             .expect("client");
-        let bot = Bot::new(client.clone());
+        let bot = test_bot(client.clone());
         let stream = StreamClient::builder(client)
             .expect("builder")
             .bot(bot)
@@ -2847,7 +3040,7 @@ mod tests {
             .app_key_and_secret("client-id", "client-secret")
             .build()
             .expect("client");
-        let bot = Bot::new(client.clone());
+        let bot = test_bot(client.clone());
         let stream = StreamClient::builder(client)
             .expect("builder")
             .bot(bot)
@@ -2904,7 +3097,7 @@ mod tests {
 
     #[test]
     fn stream_subscription_builders_set_kind_and_topic() {
-        let event = StreamSubscription::event(" /v1.0/example/events ");
+        let event = StreamSubscription::event("/v1.0/example/events");
         let callback =
             StreamSubscription::new(StreamSubscriptionType::Callback, "/v1.0/example/callbacks");
         let card = StreamSubscription::card_callbacks();
@@ -2928,12 +3121,12 @@ mod tests {
             .app_key_and_secret("client-id", "client-secret")
             .build()
             .expect("client");
-        let bot = Bot::new(client.clone());
+        let bot = test_bot(client.clone());
 
         let stream = StreamClient::builder(client)
             .expect("builder")
             .subscriptions(vec![
-                StreamSubscription::event(" /v1.0/example/events "),
+                StreamSubscription::event("/v1.0/example/events"),
                 StreamSubscription::event("/v1.0/example/events"),
                 StreamSubscription::callback("/v1.0/example/events"),
             ])
@@ -2954,6 +3147,23 @@ mod tests {
     }
 
     #[test]
+    fn stream_builder_infers_only_card_subscription_for_card_callbacks() {
+        let client = DingTalk::builder()
+            .app_key_and_secret("client-id", "client-secret")
+            .build()
+            .expect("client");
+
+        let stream = StreamClient::builder(client)
+            .expect("builder")
+            .on_card_callback(|_event| async { Ok(()) })
+            .build()
+            .expect("stream");
+
+        assert_eq!(stream.subscriptions.len(), 1);
+        assert_eq!(stream.subscriptions[0].topic(), CARD_CALLBACK_TOPIC);
+    }
+
+    #[test]
     fn stream_exit_exposes_stable_labels() {
         assert_eq!(StreamExit::Closed.as_str(), "closed");
         assert_eq!(StreamExit::Closed.to_string(), "closed");
@@ -2969,12 +3179,11 @@ mod tests {
             .app_key_and_secret("client-id", "client-secret")
             .build()
             .expect("client");
-        let bot = Bot::new(client.clone());
 
         let result = StreamClient::builder(client)
             .expect("builder")
             .subscriptions(vec![StreamSubscription::callback(" ")])
-            .bot(bot)
+            .on_frame(|_frame| async { Ok(()) })
             .build();
         let Err(error) = result else {
             panic!("empty topic should fail");
@@ -2984,11 +3193,46 @@ mod tests {
     }
 
     #[test]
-    fn stream_builder_requires_bot_or_frame_handler() {
+    fn stream_builder_rejects_subscription_topic_whitespace() {
         let client = DingTalk::builder()
             .app_key_and_secret("client-id", "client-secret")
             .build()
             .expect("client");
+
+        let result = StreamClient::builder(client)
+            .expect("builder")
+            .subscriptions(vec![StreamSubscription::callback("/v1.0/example events")])
+            .on_frame(|_frame| async { Ok(()) })
+            .build();
+        let Err(error) = result else {
+            panic!("topic should not contain whitespace");
+        };
+
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn stream_builder_rejects_untrimmed_user_agent() {
+        let client = DingTalk::builder()
+            .app_key_and_secret("client-id", "client-secret")
+            .build()
+            .expect("client");
+
+        let result = StreamClient::builder(client)
+            .expect("builder")
+            .user_agent(" dingding/0.1 ")
+            .on_frame(|_frame| async { Ok(()) })
+            .build();
+        let Err(error) = result else {
+            panic!("user agent should not be rewritten");
+        };
+
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn stream_builder_requires_bot_or_frame_handler() {
+        let client = DingTalk::builder().build().expect("client");
 
         let result = StreamClient::builder(client).expect("builder").build();
         let Err(error) = result else {
@@ -2999,13 +3243,92 @@ mod tests {
     }
 
     #[test]
+    fn stream_builder_reports_missing_credentials_after_handler_validation() {
+        let client = DingTalk::builder().build().expect("client");
+
+        let result = StreamClient::builder(client)
+            .expect("builder")
+            .on_frame(|_frame| async { Ok(()) })
+            .build();
+        let Err(error) = result else {
+            panic!("credentials should be required");
+        };
+
+        assert_eq!(error.kind(), crate::ErrorKind::MissingCredentials);
+    }
+
+    #[test]
+    fn stream_builder_rejects_empty_bot_router() {
+        let client = DingTalk::builder()
+            .app_key_and_secret("client-id", "client-secret")
+            .build()
+            .expect("client");
+        let bot = Bot::new(client.clone());
+
+        let result = StreamClient::builder(client)
+            .expect("builder")
+            .bot(bot)
+            .build();
+        let Err(error) = result else {
+            panic!("empty bot should fail");
+        };
+
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidConfig);
+    }
+
+    #[test]
+    fn stream_builder_rejects_invalid_bot_routes() {
+        let client = DingTalk::builder()
+            .app_key_and_secret("client-id", "client-secret")
+            .build()
+            .expect("client");
+        let bot = Bot::new(client.clone()).route(Route::new(ConversationScope::Any));
+
+        let result = StreamClient::builder(client)
+            .expect("builder")
+            .bot(bot)
+            .build();
+        let Err(error) = result else {
+            panic!("invalid bot route should fail");
+        };
+
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidConfig);
+    }
+
+    #[test]
     fn stream_bot_builder_builds_from_credentials() {
         let result = StreamBot::builder()
             .client_id_and_secret("client-id", "client-secret")
-            .route(Route::new(ConversationScope::Any))
+            .route(Route::new(ConversationScope::Any).handle(|_ctx, _event| async { Ok(()) }))
             .build();
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn stream_bot_builder_requires_route_or_frame_handler() {
+        let result = StreamBot::builder()
+            .client_id_and_secret("client-id", "client-secret")
+            .build();
+
+        let Err(error) = result else {
+            panic!("handler should be required");
+        };
+
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidConfig);
+    }
+
+    #[test]
+    fn stream_bot_builder_validates_routes_before_credentials() {
+        let result = StreamBot::builder()
+            .route(Route::new(ConversationScope::Any))
+            .build();
+
+        let Err(error) = result else {
+            panic!("invalid route should fail before credentials");
+        };
+
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidConfig);
     }
 
     #[test]
@@ -3063,6 +3386,47 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn stream_bot_builder_frame_handler_receives_bot_messages_without_routes() {
+        let seen = Arc::new(Mutex::new(None::<String>));
+        let seen_topic = Arc::clone(&seen);
+        let stream_bot = StreamBot::builder()
+            .client_id_and_secret("client-id", "client-secret")
+            .on_frame(move |frame| {
+                let seen_topic = Arc::clone(&seen_topic);
+                async move {
+                    *seen_topic.lock().expect("topic lock") = Some(frame.topic().to_string());
+                    Ok(())
+                }
+            })
+            .build()
+            .expect("stream bot");
+
+        let handled = stream_bot
+            .client
+            .handle_text_frame(
+                r#"{
+                    "specVersion":"1.0",
+                    "type":"CALLBACK",
+                    "headers":{
+                        "topic":"/v1.0/im/bot/messages/get",
+                        "messageId":"message-1",
+                        "contentType":"application/json"
+                    },
+                    "data":"{\"conversationType\":\"2\",\"msgtype\":\"text\",\"text\":{\"content\":\"/ping\"}}"
+                }"#,
+            )
+            .await
+            .expect("handled");
+        let value = serde_json::to_value(handled.ack).expect("json");
+
+        assert_eq!(value["code"], 200);
+        assert_eq!(
+            seen.lock().expect("topic lock").as_deref(),
+            Some(BOT_MESSAGE_TOPIC)
+        );
+    }
+
     #[test]
     fn stream_frame_normalizes_headers_and_unknown_type() {
         let frame = StreamFrame::from_text(
@@ -3085,6 +3449,43 @@ mod tests {
         );
         assert_eq!(frame.topic(), "/v1.0/example/events");
         assert_eq!(frame.message_id(), "message-1");
+    }
+
+    #[test]
+    fn stream_frame_accepts_numeric_message_id() {
+        let frame = StreamFrame::from_text(
+            r#"{
+                "specVersion":"1.0",
+                "type":"EVENT",
+                "headers":{
+                    "topic":"/v1.0/example/events",
+                    "MessageId":12345
+                },
+                "data":{"ok":true}
+            }"#,
+        )
+        .expect("frame");
+
+        assert_eq!(frame.message_id(), "12345");
+        assert_eq!(frame.data_json().expect("data")["ok"], true);
+    }
+
+    #[test]
+    fn stream_frame_rejects_blank_type() {
+        let error = StreamFrame::from_text(
+            r#"{
+                "specVersion":"1.0",
+                "type":" ",
+                "headers":{
+                    "topic":"/v1.0/example/events",
+                    "messageId":"message-1"
+                },
+                "data":{"ok":true}
+            }"#,
+        )
+        .expect_err("blank frame type should fail");
+
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -3143,6 +3544,13 @@ mod tests {
                 .subscriptions
                 .iter()
                 .any(|subscription| subscription.topic() == CARD_CALLBACK_TOPIC)
+        );
+        assert!(
+            !stream
+                .client
+                .subscriptions
+                .iter()
+                .any(|subscription| subscription.topic() == BOT_MESSAGE_TOPIC)
         );
     }
 
@@ -3232,7 +3640,7 @@ mod tests {
             "userId": "user-1",
             "content": {
                 "cardPrivateData": {
-                    "actionIds": ["approve"],
+                    "actionIds": ["approve", 1001],
                     "params": {
                         "env": "prod",
                         "approved": "true"
@@ -3247,7 +3655,10 @@ mod tests {
         assert_eq!(payload.operator().corp_id(), Some("corp-1"));
         assert_eq!(payload.operator().user_id(), Some("user-1"));
         assert_eq!(payload.action(), Some("approve"));
-        assert_eq!(payload.action_ids(), ["approve".to_string()]);
+        assert_eq!(
+            payload.action_ids(),
+            ["approve".to_string(), "1001".to_string()]
+        );
         assert_eq!(payload.action_value().string("env"), Some("prod"));
         assert_eq!(
             payload
@@ -3265,13 +3676,16 @@ mod tests {
     fn card_callback_payload_parses_json_string_content() {
         let event = CardCallbackEvent::from_value(serde_json::json!({
             "cardBizId": "card-biz-id",
-            "content": "{\"cardPrivateData\":{\"actionIds\":\"[\\\"save\\\"]\",\"params\":{\"field\":\"value\"}}}"
+            "content": "{\"cardPrivateData\":{\"actionIds\":\"[\\\"save\\\",1001]\",\"params\":{\"field\":\"value\"}}}"
         }));
         let payload = event.payload();
 
         assert_eq!(payload.card_biz_id(), Some("card-biz-id"));
         assert_eq!(payload.action(), Some("save"));
-        assert_eq!(payload.action_ids(), ["save".to_string()]);
+        assert_eq!(
+            payload.action_ids(),
+            ["save".to_string(), "1001".to_string()]
+        );
         assert_eq!(payload.action_value().string("field"), Some("value"));
     }
 
@@ -3340,8 +3754,10 @@ mod tests {
     #[test]
     fn card_callback_response_serializes_card_param_maps() {
         let response = CardCallbackResponse::new()
-            .card_data([(" status ", "done")])
+            .card_data([("status", "done")])
+            .expect("card data")
             .user_private_data([("clicked", "true")])
+            .expect("private data")
             .into_stream_response()
             .expect("response");
 
@@ -3359,10 +3775,30 @@ mod tests {
     fn card_callback_response_rejects_empty_param_maps() {
         let error = CardCallbackResponse::new()
             .card_data(Vec::<(&str, &str)>::new())
-            .into_stream_response()
             .expect_err("empty param map should fail");
+        let empty_response = CardCallbackResponse::new()
+            .into_stream_response()
+            .expect_err("empty card callback response should fail");
 
         assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(empty_response.kind(), crate::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn card_callback_response_rejects_invalid_param_keys() {
+        let error = CardCallbackResponse::new()
+            .card_data([("bad key", "done")])
+            .expect_err("card parameter keys should be protocol tokens");
+        let untrimmed = CardCallbackResponse::new()
+            .card_data([(" status ", "done")])
+            .expect_err("card parameter keys should not be rewritten");
+        let duplicate = CardCallbackResponse::new()
+            .card_data([("status", "done"), ("status", "again")])
+            .expect_err("duplicate card parameter keys should fail");
+
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(untrimmed.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(duplicate.kind(), crate::ErrorKind::InvalidInput);
     }
 
     #[tokio::test]

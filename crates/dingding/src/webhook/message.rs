@@ -84,7 +84,7 @@ impl WebhookMessage {
             link: LinkContent {
                 title: title.into(),
                 text: text.into(),
-                message_url: trimmed_string(message_url),
+                message_url: message_url.into(),
                 pic_url: None,
             },
         }
@@ -104,7 +104,7 @@ impl WebhookMessage {
                 text: text.into(),
                 btn_orientation: None,
                 single_title: Some(button_title.into()),
-                single_url: Some(trimmed_string(button_url)),
+                single_url: Some(button_url.into()),
                 btns: None,
             },
         }
@@ -138,33 +138,56 @@ impl WebhookMessage {
     }
 
     /// Adds mention metadata to text or markdown messages.
-    #[must_use]
-    pub fn at(mut self, at: At) -> Self {
+    pub fn at(mut self, at: At) -> Result<Self> {
+        if at.is_empty() {
+            return Ok(self);
+        }
+        at.validate()?;
         match &mut self {
             Self::Text { at: slot, .. } | Self::Markdown { at: slot, .. } => {
-                *slot = (!at.is_empty()).then_some(at);
+                *slot = Some(at);
+                Ok(self)
             }
-            Self::Link { .. } | Self::ActionCard { .. } | Self::FeedCard { .. } => {}
+            Self::Link { .. } | Self::ActionCard { .. } | Self::FeedCard { .. } => Err(
+                Error::invalid_input("at", "mentions are only supported for text and markdown"),
+            ),
         }
-        self
     }
 
     /// Adds an image URL to a link message.
-    #[must_use]
-    pub fn image_url(mut self, image_url: impl Into<String>) -> Self {
-        if let Self::Link { link } = &mut self {
-            link.pic_url = Some(trimmed_string(image_url));
+    pub fn image_url(mut self, image_url: impl Into<String>) -> Result<Self> {
+        let image_url = image_url.into();
+        validate_http_url(&image_url, "link.pic_url")?;
+        match &mut self {
+            Self::Link { link } => {
+                link.pic_url = Some(image_url);
+                Ok(self)
+            }
+            Self::Text { .. }
+            | Self::Markdown { .. }
+            | Self::ActionCard { .. }
+            | Self::FeedCard { .. } => Err(Error::invalid_input(
+                "image_url",
+                "image URLs are only supported for link messages",
+            )),
         }
-        self
     }
 
     /// Sets action-card button orientation.
-    #[must_use]
-    pub fn button_orientation(mut self, orientation: ButtonOrientation) -> Self {
-        if let Self::ActionCard { action_card } = &mut self {
-            action_card.btn_orientation = Some(orientation.as_dingtalk_value().to_string());
+    pub fn button_orientation(mut self, orientation: ButtonOrientation) -> Result<Self> {
+        match &mut self {
+            Self::ActionCard { action_card } => {
+                action_card.btn_orientation = Some(orientation.as_dingtalk_value().to_string());
+                Ok(self)
+            }
+            Self::Text { .. }
+            | Self::Markdown { .. }
+            | Self::Link { .. }
+            | Self::FeedCard { .. } => Err(Error::invalid_input(
+                "button_orientation",
+                "button orientation is only supported for action card messages",
+            )),
         }
-        self
     }
 
     /// Validates this message before sending.
@@ -247,10 +270,6 @@ fn validate_http_url(value: &str, field: &'static str) -> Result<()> {
             "URL scheme must be http or https",
         ))
     }
-}
-
-fn trimmed_string(value: impl Into<String>) -> String {
-    value.into().trim().to_string()
 }
 
 /// Action-card button orientation.
@@ -432,7 +451,7 @@ impl ActionCardButton {
     pub fn new(title: impl Into<String>, action_url: impl Into<String>) -> Self {
         Self {
             title: title.into(),
-            action_url: trimmed_string(action_url),
+            action_url: action_url.into(),
         }
     }
 
@@ -465,8 +484,8 @@ impl FeedCardLink {
     ) -> Self {
         Self {
             title: title.into(),
-            message_url: trimmed_string(message_url),
-            pic_url: trimmed_string(pic_url),
+            message_url: message_url.into(),
+            pic_url: pic_url.into(),
         }
     }
 
@@ -515,7 +534,7 @@ impl At {
     /// Adds a mobile number.
     #[must_use]
     pub fn mobile(mut self, value: impl Into<String>) -> Self {
-        push_unique_trimmed(&mut self.mobiles, value);
+        push_unique(&mut self.mobiles, value.into());
         self
     }
 
@@ -527,7 +546,7 @@ impl At {
         S: Into<String>,
     {
         for value in values {
-            push_unique_trimmed(&mut self.mobiles, value);
+            push_unique(&mut self.mobiles, value.into());
         }
         self
     }
@@ -535,7 +554,7 @@ impl At {
     /// Adds a DingTalk user id.
     #[must_use]
     pub fn user_id(mut self, value: impl Into<String>) -> Self {
-        push_unique_trimmed(&mut self.user_ids, value);
+        push_unique(&mut self.user_ids, value.into());
         self
     }
 
@@ -547,7 +566,7 @@ impl At {
         S: Into<String>,
     {
         for value in values {
-            push_unique_trimmed(&mut self.user_ids, value);
+            push_unique(&mut self.user_ids, value.into());
         }
         self
     }
@@ -559,8 +578,10 @@ impl At {
     #[cfg(feature = "bot")]
     #[must_use]
     pub fn mentioned_user(mut self, user: &crate::bot::AtUser) -> Self {
-        if let Some(staff_id) = user.staff_id.as_deref() {
-            push_unique_non_empty(&mut self.user_ids, staff_id);
+        if let Some(staff_id) = user.staff_id.as_deref()
+            && validate_mention_value(staff_id, "at.user_ids").is_ok()
+        {
+            push_unique(&mut self.user_ids, staff_id);
         }
         self
     }
@@ -594,28 +615,42 @@ impl At {
     /// Validates mention metadata before sending.
     pub fn validate(&self) -> Result<()> {
         for mobile in &self.mobiles {
-            validate_non_empty(mobile, "at.mobiles")?;
+            validate_mention_value(mobile, "at.mobiles")?;
         }
         for user_id in &self.user_ids {
-            validate_non_empty(user_id, "at.user_ids")?;
+            validate_mention_value(user_id, "at.user_ids")?;
         }
         Ok(())
     }
 }
 
-fn push_unique_trimmed(values: &mut Vec<String>, value: impl Into<String>) {
-    let value = value.into();
-    let value = value.trim();
-    if !value.is_empty() && !values.iter().any(|existing| existing == value) {
-        values.push(value.to_string());
+fn validate_mention_value(value: &str, field: &'static str) -> Result<()> {
+    validate_non_empty(value, field)?;
+    if value.trim() != value {
+        return Err(Error::invalid_input(
+            field,
+            "value must not contain leading or trailing whitespace",
+        ));
     }
+    if value.chars().any(char::is_whitespace) {
+        return Err(Error::invalid_input(
+            field,
+            "value must not contain whitespace",
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(Error::invalid_input(
+            field,
+            "value must not contain control characters",
+        ));
+    }
+    Ok(())
 }
 
-#[cfg(feature = "bot")]
-fn push_unique_non_empty(values: &mut Vec<String>, value: &str) {
-    let value = value.trim();
-    if !value.is_empty() && !values.iter().any(|existing| existing == value) {
-        values.push(value.to_string());
+fn push_unique(values: &mut Vec<String>, value: impl Into<String>) {
+    let value = value.into();
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
     }
 }
 
@@ -670,10 +705,12 @@ mod tests {
 
     #[test]
     fn serializes_markdown_with_mentions() {
-        let message = WebhookMessage::markdown("title", "**body**").at(At::new()
-            .mobile("13800000000")
-            .mobiles(["13900000000"])
-            .user_ids(["user-1"]));
+        let message = WebhookMessage::markdown("title", "**body**")
+            .at(At::new()
+                .mobile("13800000000")
+                .mobiles(["13900000000"])
+                .user_ids(["user-1"]))
+            .expect("mentions");
         let value = serde_json::to_value(message).expect("serialize");
 
         assert_eq!(
@@ -696,7 +733,8 @@ mod tests {
     #[test]
     fn serializes_action_card_orientation() {
         let message = WebhookMessage::action_card("title", "body", "open", "https://example.com")
-            .button_orientation(ButtonOrientation::Horizontal);
+            .button_orientation(ButtonOrientation::Horizontal)
+            .expect("orientation");
         let value = serde_json::to_value(message).expect("serialize");
 
         assert_eq!(
@@ -728,9 +766,11 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_webhook_message_urls() {
-        let link = WebhookMessage::link("title", "body", " https://example.com/page ")
-            .image_url(" https://example.com/pic.png ");
+    fn webhook_message_builders_reject_untrimmed_urls() {
+        let link_image_error = WebhookMessage::link("title", "body", "https://example.com/page")
+            .image_url(" https://example.com/pic.png ")
+            .expect_err("link image URL whitespace should fail");
+        let link = WebhookMessage::link("title", "body", " https://example.com/page ");
         let action_card =
             WebhookMessage::action_card("title", "body", "open", " https://example.com/action ");
         let feed_card = WebhookMessage::feed_card(vec![FeedCardLink::new(
@@ -740,27 +780,47 @@ mod tests {
         )]);
         let button = ActionCardButton::new("open", " https://example.com/button ");
 
+        assert_eq!(link_image_error.kind(), crate::ErrorKind::InvalidInput);
         assert_eq!(
-            serde_json::to_value(link).expect("serialize"),
-            json!({
-                "msgtype": "link",
-                "link": {
-                    "title": "title",
-                    "text": "body",
-                    "messageUrl": "https://example.com/page",
-                    "picUrl": "https://example.com/pic.png"
-                }
-            })
+            link.validate()
+                .expect_err("link URL whitespace should fail")
+                .kind(),
+            crate::ErrorKind::InvalidInput
         );
         assert_eq!(
-            serde_json::to_value(action_card).expect("serialize")["actionCard"]["singleURL"],
-            "https://example.com/action"
+            action_card
+                .validate()
+                .expect_err("action URL whitespace should fail")
+                .kind(),
+            crate::ErrorKind::InvalidInput
         );
         assert_eq!(
-            serde_json::to_value(feed_card).expect("serialize")["feedCard"]["links"][0]["messageURL"],
-            "https://example.com/feed"
+            feed_card
+                .validate()
+                .expect_err("feed URL whitespace should fail")
+                .kind(),
+            crate::ErrorKind::InvalidInput
         );
-        assert_eq!(button.action_url, "https://example.com/button");
+        assert_eq!(
+            button
+                .validate()
+                .expect_err("button URL whitespace should fail")
+                .kind(),
+            crate::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn rejects_variant_specific_setters_on_unsupported_message_types() {
+        let image_error = WebhookMessage::text("hello")
+            .image_url("https://example.com/pic.png")
+            .expect_err("text messages do not support link images");
+        let orientation_error = WebhookMessage::text("hello")
+            .button_orientation(ButtonOrientation::Horizontal)
+            .expect_err("text messages do not support action-card orientation");
+
+        assert_eq!(image_error.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(orientation_error.kind(), crate::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -807,15 +867,32 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_mention_values() {
+    fn mention_builders_deduplicate_without_rewriting_values() {
         let at = At::new()
-            .mobile(" 13800000000 ")
-            .mobiles(["13900000000", " 13900000000 ", " "])
-            .user_id(" user-1 ")
-            .user_ids(["user-1", " user-2 ", ""]);
+            .mobile("13800000000")
+            .mobiles(["13900000000", "13900000000"])
+            .user_id("user-1")
+            .user_ids(["user-1", "user-2"]);
 
         assert_eq!(at.mobiles, ["13800000000", "13900000000"]);
         assert_eq!(at.user_ids, ["user-1", "user-2"]);
+
+        let invalid = At::new().mobile(" 13800000000 ");
+        let empty = At::new().user_ids([""]);
+        assert_eq!(
+            invalid
+                .validate()
+                .expect_err("mention values should not be rewritten")
+                .kind(),
+            crate::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            empty
+                .validate()
+                .expect_err("empty mention values should not be dropped")
+                .kind(),
+            crate::ErrorKind::InvalidInput
+        );
     }
 
     #[test]
@@ -835,7 +912,6 @@ mod tests {
                 user_ids: Vec::new(),
                 is_at_all: false,
             })
-            .validate()
             .expect_err("empty mobile should fail");
         let user_id_error = WebhookMessage::markdown("title", "body")
             .at(At {
@@ -843,11 +919,31 @@ mod tests {
                 user_ids: vec!["".to_string()],
                 is_at_all: false,
             })
-            .validate()
             .expect_err("empty user id should fail");
 
         assert_eq!(mobile_error.kind(), crate::ErrorKind::InvalidInput);
         assert_eq!(user_id_error.kind(), crate::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn rejects_manually_constructed_whitespace_mention_values() {
+        let untrimmed_user_id = WebhookMessage::text("hello")
+            .at(At {
+                mobiles: Vec::new(),
+                user_ids: vec![" user-1 ".to_string()],
+                is_at_all: false,
+            })
+            .expect_err("manual user id should not keep whitespace");
+        let internal_space_mobile = WebhookMessage::text("hello")
+            .at(At {
+                mobiles: vec!["138 0000 0000".to_string()],
+                user_ids: Vec::new(),
+                is_at_all: false,
+            })
+            .expect_err("mobile should not contain whitespace");
+
+        assert_eq!(untrimmed_user_id.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(internal_space_mobile.kind(), crate::ErrorKind::InvalidInput);
     }
 
     #[cfg(feature = "bot")]
@@ -856,7 +952,7 @@ mod tests {
         let users = [
             crate::bot::AtUser {
                 dingtalk_id: Some("$:LWCP_v1:$open-id".to_string()),
-                staff_id: Some(" staff-1 ".to_string()),
+                staff_id: Some("staff-1".to_string()),
             },
             crate::bot::AtUser {
                 dingtalk_id: None,
@@ -883,10 +979,21 @@ mod tests {
 
     #[test]
     fn empty_mentions_are_omitted() {
-        let message = WebhookMessage::text("hello").at(At::new());
+        let message = WebhookMessage::text("hello")
+            .at(At::new())
+            .expect("empty mentions");
         let value = serde_json::to_value(message).expect("serialize");
 
         assert!(value.get("at").is_none());
+    }
+
+    #[test]
+    fn rejects_mentions_on_unsupported_message_types() {
+        let error = WebhookMessage::link("title", "body", "https://example.com")
+            .at(At::new().user_id("user-1"))
+            .expect_err("link messages do not support webhook mentions");
+
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
     }
 
     #[test]

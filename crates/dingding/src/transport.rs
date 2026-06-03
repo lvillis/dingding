@@ -70,6 +70,20 @@ impl Default for TransportConfig {
     }
 }
 
+impl TransportConfig {
+    fn validate(&self) -> Result<()> {
+        validate_client_name(&self.client_name)?;
+        validate_duration("connect_timeout", self.connect_timeout)?;
+        if let Some(request_timeout) = self.request_timeout {
+            validate_duration("request_timeout", request_timeout)?;
+        }
+        if let Some(total_timeout) = self.total_timeout {
+            validate_duration("total_timeout", total_timeout)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Transport {
     webhook_http: HttpClient,
@@ -86,6 +100,8 @@ impl Transport {
     ) -> Result<Self> {
         #[cfg(not(feature = "openapi"))]
         let _ = openapi_base_url;
+
+        config.validate()?;
 
         Ok(Self {
             webhook_http: build_http_client(webhook_base_url, config)?,
@@ -213,6 +229,35 @@ fn build_http_client(base_url: &Url, config: &TransportConfig) -> Result<HttpCli
     Ok(builder.build()?)
 }
 
+fn validate_client_name(value: &str) -> Result<()> {
+    if value.chars().any(char::is_control) {
+        return Err(Error::InvalidConfig(
+            "client_name must not contain control characters".to_string(),
+        ));
+    }
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(Error::InvalidConfig(
+            "client_name must not be empty".to_string(),
+        ));
+    }
+    if trimmed != value {
+        return Err(Error::InvalidConfig(
+            "client_name must not contain leading or trailing whitespace".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_duration(field: &'static str, value: Duration) -> Result<()> {
+    if value.is_zero() {
+        return Err(Error::InvalidConfig(format!(
+            "{field} must be greater than zero"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct StandardApiResponse {
     #[serde(default, deserialize_with = "deserialize_optional_i64")]
@@ -224,7 +269,11 @@ pub(crate) struct StandardApiResponse {
         deserialize_with = "deserialize_optional_string"
     )]
     pub(crate) api_code: Option<String>,
-    #[serde(alias = "message")]
+    #[serde(
+        default,
+        alias = "message",
+        deserialize_with = "deserialize_optional_string"
+    )]
     pub(crate) errmsg: Option<String>,
     #[serde(
         default,
@@ -481,7 +530,11 @@ struct DingTalkResult<T> {
         deserialize_with = "deserialize_optional_string"
     )]
     api_code: Option<String>,
-    #[serde(alias = "message")]
+    #[serde(
+        default,
+        alias = "message",
+        deserialize_with = "deserialize_optional_string"
+    )]
     errmsg: Option<String>,
     result: Option<T>,
     #[serde(
@@ -641,6 +694,21 @@ where
     Ok(normalize_response_string(&value))
 }
 
+#[cfg(feature = "stream")]
+pub(crate) fn deserialize_string<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    let value = match value {
+        Value::String(value) => value,
+        Value::Number(value) => value.to_string(),
+        _ => return Err(DeError::custom("expected string or number")),
+    };
+
+    Ok(value.trim().to_string())
+}
+
 fn body_snippet_for_error(body: &str, config: BodySnippetConfig) -> Option<String> {
     if !config.enabled || config.max_bytes == 0 {
         return None;
@@ -720,6 +788,16 @@ mod tests {
         assert_eq!(parsed.api_code.as_deref(), Some("InvalidParameter"));
         assert_eq!(parsed.errmsg.as_deref(), Some("bad request"));
         assert_eq!(parsed.request_id.as_deref(), Some("request-1"));
+    }
+
+    #[test]
+    fn standard_api_response_normalizes_numeric_message() {
+        let parsed = serde_json::from_str::<StandardApiResponse>(
+            r#"{"errcode":"40001","errmsg":12345,"requestId":"request-1"}"#,
+        )
+        .expect("response");
+
+        assert_eq!(parsed.errmsg.as_deref(), Some("12345"));
     }
 
     #[test]

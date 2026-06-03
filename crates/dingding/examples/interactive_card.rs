@@ -19,7 +19,7 @@ const UPDATE_CARD_DATA_ENV: &str = "DINGTALK_CARD_UPDATE_DATA_JSON";
 #[tokio::main]
 async fn main() -> Result<()> {
     let ding = DingTalk::builder().app_credentials_from_env()?.build()?;
-    let robot = ding.openapi().robot(required_env(ROBOT_CODE_ENV)?);
+    let robot = ding.openapi().robot(required_env(ROBOT_CODE_ENV)?)?;
 
     let card = build_card()?;
     let response = robot.send_interactive_card(card).await?;
@@ -80,7 +80,7 @@ fn build_card() -> Result<InteractiveCard> {
     };
 
     if let Some(callback_url) = optional_env(CALLBACK_URL_ENV) {
-        card = card.callback_url(callback_url);
+        card = card.callback_url(callback_url)?;
     }
 
     Ok(card)

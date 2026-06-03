@@ -17,7 +17,7 @@ const VIDEO_DURATION_SECONDS_ENV: &str = "DINGTALK_VIDEO_DURATION_SECONDS";
 #[tokio::main]
 async fn main() -> Result<()> {
     let ding = DingTalk::builder().app_credentials_from_env()?.build()?;
-    let robot = ding.openapi().robot(required_env(ROBOT_CODE_ENV)?);
+    let robot = ding.openapi().robot(required_env(ROBOT_CODE_ENV)?)?;
     let target = target()?;
     let upload = media_upload()?;
 

@@ -21,6 +21,14 @@ pub struct OpenApi {
     credentials: Option<AppCredentials>,
 }
 
+impl fmt::Debug for OpenApi {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenApi")
+            .field("has_credentials", &self.credentials.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl OpenApi {
     pub(crate) fn new(client: DingTalk, credentials: Option<AppCredentials>) -> Self {
         Self {
@@ -36,10 +44,10 @@ impl OpenApi {
     }
 
     /// Returns a copy of this OpenAPI service with explicit app credentials.
-    #[must_use]
-    pub fn with_credentials(mut self, credentials: AppCredentials) -> Self {
+    pub fn with_credentials(mut self, credentials: AppCredentials) -> Result<Self> {
+        credentials.validate()?;
         self.credentials = Some(credentials);
-        self
+        Ok(self)
     }
 
     /// Returns an access token, using the in-memory cache when possible.
@@ -128,14 +136,14 @@ impl OpenApi {
     /// Uploads a DingTalk media resource for robot image, voice, video, or file messages.
     pub async fn upload_media(&self, upload: MediaUpload) -> Result<UploadedMedia> {
         upload.validate()?;
-        let media_type = normalize_no_control_chars(upload.media_type().as_str(), "media_type")?;
+        let media_type = upload.media_type().as_str();
 
         let access_token = self.access_token().await?;
         let mut url = self.client.webhook_endpoint(&["media", "upload"])?;
         {
             let mut query = url.query_pairs_mut();
             query.append_pair("access_token", &access_token);
-            query.append_pair("type", &media_type);
+            query.append_pair("type", media_type);
         }
 
         let (content_type, body) = media_upload_multipart_body(&upload)?;
@@ -153,12 +161,13 @@ impl OpenApi {
     }
 
     /// Creates a robot message helper for an app robot code.
-    #[must_use]
-    pub fn robot(&self, robot_code: impl Into<String>) -> RobotApi {
-        RobotApi {
+    pub fn robot(&self, robot_code: impl Into<String>) -> Result<RobotApi> {
+        let robot_code = robot_code.into();
+        validate_machine_identifier(&robot_code, "robot_code")?;
+        Ok(RobotApi {
             openapi: self.clone(),
-            robot_code: normalize_robot_code(robot_code),
-        }
+            robot_code,
+        })
     }
 }
 
@@ -169,6 +178,15 @@ pub struct RobotApi {
     robot_code: String,
 }
 
+impl fmt::Debug for RobotApi {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RobotApi")
+            .field("robot_code", &self.robot_code)
+            .field("openapi", &self.openapi)
+            .finish()
+    }
+}
+
 impl RobotApi {
     /// Returns the robot code used by this helper.
     #[must_use]
@@ -177,10 +195,11 @@ impl RobotApi {
     }
 
     /// Returns a copy of this helper with another robot code.
-    #[must_use]
-    pub fn with_robot_code(mut self, robot_code: impl Into<String>) -> Self {
-        self.robot_code = normalize_robot_code(robot_code);
-        self
+    pub fn with_robot_code(mut self, robot_code: impl Into<String>) -> Result<Self> {
+        let robot_code = robot_code.into();
+        validate_machine_identifier(&robot_code, "robot_code")?;
+        self.robot_code = robot_code;
+        Ok(self)
     }
 
     /// Returns the underlying OpenAPI service.
@@ -199,9 +218,10 @@ impl RobotApi {
         &self,
         download_code: impl Into<String>,
     ) -> Result<MessageFileDownload> {
-        let robot_code = non_empty_trimmed(&self.robot_code, "robot_code")?;
+        validate_machine_identifier(&self.robot_code, "robot_code")?;
+        let robot_code = self.robot_code.clone();
         let download_code = download_code.into();
-        let download_code = non_empty_trimmed(&download_code, "download_code")?;
+        validate_machine_identifier(&download_code, "download_code")?;
 
         let request = MessageFileDownloadRequest {
             robot_code,
@@ -249,9 +269,10 @@ impl RobotApi {
         open_conversation_id: impl AsRef<str>,
         message: RobotMessage,
     ) -> Result<RobotMessageResponse> {
-        let robot_code = non_empty_trimmed(&self.robot_code, "robot_code")?;
-        let open_conversation_id =
-            non_empty_trimmed(open_conversation_id.as_ref(), "open_conversation_id")?;
+        validate_machine_identifier(&self.robot_code, "robot_code")?;
+        validate_machine_identifier(open_conversation_id.as_ref(), "open_conversation_id")?;
+        let robot_code = self.robot_code.clone();
+        let open_conversation_id = open_conversation_id.as_ref().to_string();
         message.validate()?;
 
         let request = RobotGroupMessageRequest {
@@ -407,7 +428,8 @@ impl RobotApi {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let robot_code = non_empty_trimmed(&self.robot_code, "robot_code")?;
+        validate_machine_identifier(&self.robot_code, "robot_code")?;
+        let robot_code = self.robot_code.clone();
         let user_ids = normalize_user_ids(user_ids)?;
         message.validate()?;
 
@@ -654,7 +676,8 @@ impl RobotApi {
         &self,
         card: InteractiveCard,
     ) -> Result<InteractiveCardResponse> {
-        let robot_code = non_empty_trimmed(&self.robot_code, "robot_code")?;
+        validate_machine_identifier(&self.robot_code, "robot_code")?;
+        let robot_code = self.robot_code.clone();
         card.validate()?;
 
         let request = card.to_send_request(robot_code);
@@ -684,10 +707,6 @@ impl RobotApi {
 
         parse_interactive_card_response(&body, self.openapi.client.transport().error_body_snippet())
     }
-}
-
-fn normalize_robot_code(robot_code: impl Into<String>) -> String {
-    robot_code.into().trim().to_string()
 }
 
 /// DingTalk media resource type accepted by the legacy media upload API.
@@ -721,7 +740,7 @@ impl MediaType {
     /// Creates a media type from DingTalk's wire value.
     pub fn from_raw(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
-        let value = non_empty_trimmed(&value, "media_type")?;
+        let value = normalize_machine_identifier(&value, "media_type")?;
         Ok(match value.to_ascii_lowercase().as_str() {
             "image" => Self::Image,
             "voice" | "audio" => Self::Voice,
@@ -757,7 +776,7 @@ impl MediaUpload {
     ) -> Self {
         Self {
             media_type,
-            file_name: file_name.into().trim().to_string(),
+            file_name: file_name.into(),
             content_type: None,
             bytes: bytes.into(),
         }
@@ -790,7 +809,7 @@ impl MediaUpload {
     /// Sets the part content type for the uploaded file.
     #[must_use]
     pub fn content_type(mut self, value: impl Into<String>) -> Self {
-        self.content_type = Some(value.into().trim().to_string());
+        self.content_type = Some(value.into());
         self
     }
 
@@ -819,8 +838,8 @@ impl MediaUpload {
     }
 
     fn validate(&self) -> Result<()> {
-        validate_no_control_chars(self.media_type.as_str(), "media_type")?;
-        validate_no_control_chars(&self.file_name, "file_name")?;
+        validate_machine_identifier(self.media_type.as_str(), "media_type")?;
+        validate_file_name(&self.file_name, "file_name")?;
         if self.bytes.is_empty() {
             return Err(Error::invalid_input(
                 "media",
@@ -828,7 +847,7 @@ impl MediaUpload {
             ));
         }
         if let Some(content_type) = &self.content_type {
-            validate_no_control_chars(content_type, "content_type")?;
+            validate_header_value(content_type, "content_type")?;
         }
         Ok(())
     }
@@ -857,7 +876,6 @@ impl UploadedMedia {
     }
 
     /// Returns DingTalk's creation timestamp in milliseconds when supplied.
-    #[must_use]
     pub fn created_at_millis(&self) -> Option<u64> {
         self.created_at_millis
     }
@@ -998,8 +1016,8 @@ impl InteractiveCard {
     where
         T: Serialize,
     {
-        Ok(Self::new(card_template_id, card_biz_id, card_data)?
-            .open_conversation_id(open_conversation_id))
+        Self::new(card_template_id, card_biz_id, card_data)?
+            .open_conversation_id(open_conversation_id)
     }
 
     /// Creates a private-chat interactive card from DingTalk's raw `singleChatReceiver` JSON.
@@ -1035,10 +1053,14 @@ impl InteractiveCard {
         card_biz_id: impl Into<String>,
         card_data_json: impl Into<String>,
     ) -> Result<Self> {
+        let card_template_id = card_template_id.into();
+        let card_biz_id = card_biz_id.into();
         let card_data_json = card_data_json.into();
+        validate_machine_identifier(&card_template_id, "card_template_id")?;
+        validate_machine_identifier(&card_biz_id, "card_biz_id")?;
         Ok(Self {
-            card_template_id: card_template_id.into().trim().to_string(),
-            card_biz_id: card_biz_id.into().trim().to_string(),
+            card_template_id,
+            card_biz_id,
             card_data_json: normalize_json_object_str("card_data", &card_data_json)?,
             open_conversation_id: None,
             single_chat_receiver: None,
@@ -1051,10 +1073,11 @@ impl InteractiveCard {
     }
 
     /// Sends this card to a group conversation.
-    #[must_use]
-    pub fn open_conversation_id(mut self, value: impl Into<String>) -> Self {
-        self.open_conversation_id = Some(value.into().trim().to_string());
-        self
+    pub fn open_conversation_id(mut self, value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        validate_machine_identifier(&value, "open_conversation_id")?;
+        self.open_conversation_id = Some(value);
+        Ok(self)
     }
 
     /// Sends this card to a private chat target using DingTalk's raw `singleChatReceiver` JSON.
@@ -1068,7 +1091,7 @@ impl InteractiveCard {
     /// Sends this card to a private chat with the supplied DingTalk user id.
     pub fn single_chat_user_id(mut self, user_id: impl Into<String>) -> Result<Self> {
         let user_id = user_id.into();
-        let user_id = non_empty_trimmed(&user_id, "user_id")?;
+        validate_machine_identifier(&user_id, "user_id")?;
         self.single_chat_receiver = Some(serde_json::json!({ "userId": user_id }).to_string());
         Ok(self)
     }
@@ -1076,10 +1099,11 @@ impl InteractiveCard {
     /// Sets the card callback URL for HTTP callback mode.
     ///
     /// Stream mode card callbacks are received on `/v1.0/card/instances/callback`.
-    #[must_use]
-    pub fn callback_url(mut self, value: impl Into<String>) -> Self {
-        self.callback_url = Some(value.into().trim().to_string());
-        self
+    pub fn callback_url(mut self, value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        validate_http_endpoint_url(&value, "callback_url")?;
+        self.callback_url = Some(value);
+        Ok(self)
     }
 
     /// Sets whether DingTalk should use pull strategy for this card.
@@ -1097,14 +1121,13 @@ impl InteractiveCard {
     }
 
     /// Mentions users when sending this card.
-    #[must_use]
-    pub fn at_users<I, S>(mut self, user_ids: I) -> Self
+    pub fn at_users<I, S>(mut self, user_ids: I) -> Result<Self>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        self.send_options = self.send_options.at_users(user_ids);
-        self
+        self.send_options = self.send_options.at_users(user_ids)?;
+        Ok(self)
     }
 
     /// Mentions everyone when sending this card.
@@ -1115,14 +1138,13 @@ impl InteractiveCard {
     }
 
     /// Restricts card receivers with DingTalk's `receiverListJson` option.
-    #[must_use]
-    pub fn receiver_users<I, S>(mut self, user_ids: I) -> Self
+    pub fn receiver_users<I, S>(mut self, user_ids: I) -> Result<Self>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        self.send_options = self.send_options.receiver_users(user_ids);
-        self
+        self.send_options = self.send_options.receiver_users(user_ids)?;
+        Ok(self)
     }
 
     /// Sets card property JSON from a serializable object.
@@ -1139,7 +1161,7 @@ impl InteractiveCard {
     where
         T: Serialize,
     {
-        self.user_id_private_data_map_json = Some(normalize_json_object(
+        self.user_id_private_data_map_json = Some(normalize_private_data_map(
             "user_id_private_data_map",
             serde_json::to_value(value)?,
         )?);
@@ -1151,7 +1173,7 @@ impl InteractiveCard {
     where
         T: Serialize,
     {
-        self.union_id_private_data_map_json = Some(normalize_json_object(
+        self.union_id_private_data_map_json = Some(normalize_private_data_map(
             "union_id_private_data_map",
             serde_json::to_value(value)?,
         )?);
@@ -1177,8 +1199,8 @@ impl InteractiveCard {
     }
 
     fn validate(&self) -> Result<()> {
-        non_empty_trimmed(&self.card_template_id, "card_template_id")?;
-        non_empty_trimmed(&self.card_biz_id, "card_biz_id")?;
+        validate_machine_identifier(&self.card_template_id, "card_template_id")?;
+        validate_machine_identifier(&self.card_biz_id, "card_biz_id")?;
         normalize_json_object_str("card_data", &self.card_data_json)?;
 
         match (
@@ -1186,7 +1208,7 @@ impl InteractiveCard {
             self.single_chat_receiver.as_deref(),
         ) {
             (Some(open_conversation_id), None) => {
-                non_empty_trimmed(open_conversation_id, "open_conversation_id")?;
+                validate_machine_identifier(open_conversation_id, "open_conversation_id")?;
             }
             (None, Some(single_chat_receiver)) => {
                 normalize_json_object_str("single_chat_receiver", single_chat_receiver)?;
@@ -1209,10 +1231,10 @@ impl InteractiveCard {
             validate_http_endpoint_url(callback_url, "callback_url")?;
         }
         if let Some(value) = &self.user_id_private_data_map_json {
-            normalize_json_object_str("user_id_private_data_map", value)?;
+            normalize_private_data_map_str("user_id_private_data_map", value)?;
         }
         if let Some(value) = &self.union_id_private_data_map_json {
-            normalize_json_object_str("union_id_private_data_map", value)?;
+            normalize_private_data_map_str("union_id_private_data_map", value)?;
         }
         self.send_options.validate()
     }
@@ -1255,21 +1277,23 @@ impl InteractiveCardSendOptions {
     }
 
     /// Sets raw `atUserListJson`.
-    #[must_use]
-    pub fn at_user_list_json(mut self, value: impl Into<String>) -> Self {
-        self.at_user_list_json = Some(value.into().trim().to_string());
-        self
+    pub fn at_user_list_json(mut self, value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        self.at_user_list_json = Some(normalize_json_string_array_str(
+            "at_user_list_json",
+            &value,
+        )?);
+        Ok(self)
     }
 
     /// Mentions users when sending the card.
-    #[must_use]
-    pub fn at_users<I, S>(mut self, user_ids: I) -> Self
+    pub fn at_users<I, S>(mut self, user_ids: I) -> Result<Self>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        self.at_user_list_json = json_string_list(user_ids);
-        self
+        self.at_user_list_json = json_string_list("at_user_list_json", user_ids)?;
+        Ok(self)
     }
 
     /// Sets `atAll`.
@@ -1280,21 +1304,23 @@ impl InteractiveCardSendOptions {
     }
 
     /// Sets raw `receiverListJson`.
-    #[must_use]
-    pub fn receiver_list_json(mut self, value: impl Into<String>) -> Self {
-        self.receiver_list_json = Some(value.into().trim().to_string());
-        self
+    pub fn receiver_list_json(mut self, value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        self.receiver_list_json = Some(normalize_json_string_array_str(
+            "receiver_list_json",
+            &value,
+        )?);
+        Ok(self)
     }
 
     /// Restricts receivers to the supplied user ids.
-    #[must_use]
-    pub fn receiver_users<I, S>(mut self, user_ids: I) -> Self
+    pub fn receiver_users<I, S>(mut self, user_ids: I) -> Result<Self>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        self.receiver_list_json = json_string_list(user_ids);
-        self
+        self.receiver_list_json = json_string_list("receiver_list_json", user_ids)?;
+        Ok(self)
     }
 
     /// Sets card property JSON from a serializable object.
@@ -1327,10 +1353,10 @@ impl InteractiveCardSendOptions {
 
     fn validate(&self) -> Result<()> {
         if let Some(value) = &self.at_user_list_json {
-            normalize_json_array_str("at_user_list_json", value)?;
+            normalize_json_string_array_str("at_user_list_json", value)?;
         }
         if let Some(value) = &self.receiver_list_json {
-            normalize_json_array_str("receiver_list_json", value)?;
+            normalize_json_string_array_str("receiver_list_json", value)?;
         }
         if let Some(value) = &self.card_property_json {
             normalize_json_object_str("card_property", value)?;
@@ -1355,8 +1381,10 @@ impl InteractiveCardUpdate {
     where
         T: Serialize,
     {
+        let card_biz_id = card_biz_id.into();
+        validate_machine_identifier(&card_biz_id, "card_biz_id")?;
         Ok(Self {
-            card_biz_id: card_biz_id.into().trim().to_string(),
+            card_biz_id,
             card_data_json: Some(normalize_json_object(
                 "card_data",
                 serde_json::to_value(card_data)?,
@@ -1368,15 +1396,16 @@ impl InteractiveCardUpdate {
     }
 
     /// Creates an update intended for per-user private data without global `cardData`.
-    #[must_use]
-    pub fn private_data(card_biz_id: impl Into<String>) -> Self {
-        Self {
-            card_biz_id: card_biz_id.into().trim().to_string(),
+    pub fn private_data(card_biz_id: impl Into<String>) -> Result<Self> {
+        let card_biz_id = card_biz_id.into();
+        validate_machine_identifier(&card_biz_id, "card_biz_id")?;
+        Ok(Self {
+            card_biz_id,
             card_data_json: None,
             user_id_private_data_map_json: None,
             union_id_private_data_map_json: None,
             update_options: InteractiveCardUpdateOptions::new(),
-        }
+        })
     }
 
     /// Creates an update from raw JSON object string for `cardData`.
@@ -1384,9 +1413,11 @@ impl InteractiveCardUpdate {
         card_biz_id: impl Into<String>,
         card_data_json: impl Into<String>,
     ) -> Result<Self> {
+        let card_biz_id = card_biz_id.into();
         let card_data_json = card_data_json.into();
+        validate_machine_identifier(&card_biz_id, "card_biz_id")?;
         Ok(Self {
-            card_biz_id: card_biz_id.into().trim().to_string(),
+            card_biz_id,
             card_data_json: Some(normalize_json_object_str("card_data", &card_data_json)?),
             user_id_private_data_map_json: None,
             union_id_private_data_map_json: None,
@@ -1399,7 +1430,7 @@ impl InteractiveCardUpdate {
     where
         T: Serialize,
     {
-        self.user_id_private_data_map_json = Some(normalize_json_object(
+        self.user_id_private_data_map_json = Some(normalize_private_data_map(
             "user_id_private_data_map",
             serde_json::to_value(value)?,
         )?);
@@ -1411,7 +1442,7 @@ impl InteractiveCardUpdate {
     where
         T: Serialize,
     {
-        self.union_id_private_data_map_json = Some(normalize_json_object(
+        self.union_id_private_data_map_json = Some(normalize_private_data_map(
             "union_id_private_data_map",
             serde_json::to_value(value)?,
         )?);
@@ -1446,16 +1477,16 @@ impl InteractiveCardUpdate {
     }
 
     fn validate(&self) -> Result<()> {
-        non_empty_trimmed(&self.card_biz_id, "card_biz_id")?;
+        validate_machine_identifier(&self.card_biz_id, "card_biz_id")?;
 
         if let Some(value) = &self.card_data_json {
             normalize_json_object_str("card_data", value)?;
         }
         if let Some(value) = &self.user_id_private_data_map_json {
-            normalize_json_object_str("user_id_private_data_map", value)?;
+            normalize_private_data_map_str("user_id_private_data_map", value)?;
         }
         if let Some(value) = &self.union_id_private_data_map_json {
-            normalize_json_object_str("union_id_private_data_map", value)?;
+            normalize_private_data_map_str("union_id_private_data_map", value)?;
         }
         if self.card_data_json.is_none()
             && self.user_id_private_data_map_json.is_none()
@@ -1556,8 +1587,8 @@ impl RobotActionButton {
     #[must_use]
     pub fn new(title: impl Into<String>, url: impl Into<String>) -> Self {
         Self {
-            title: title.into().trim().to_string(),
-            url: url.into().trim().to_string(),
+            title: title.into(),
+            url: url.into(),
         }
     }
 
@@ -1605,8 +1636,8 @@ impl RobotActionCard {
     #[must_use]
     pub fn new(title: impl Into<String>, text: impl Into<String>) -> Self {
         Self {
-            title: title.into().trim().to_string(),
-            text: text.into().trim().to_string(),
+            title: title.into(),
+            text: text.into(),
             buttons: Vec::new(),
             layout: RobotActionCardLayout::Vertical,
         }
@@ -1781,7 +1812,7 @@ impl RobotVideo {
     #[must_use]
     pub fn new(video_media_id: impl Into<String>, duration_seconds: u64) -> Self {
         Self {
-            video_media_id: video_media_id.into().trim().to_string(),
+            video_media_id: video_media_id.into(),
             duration_seconds,
             video_type: None,
             pic_media_id: None,
@@ -1793,14 +1824,14 @@ impl RobotVideo {
     /// Sets the video file type. DingTalk currently documents `mp4`.
     #[must_use]
     pub fn video_type(mut self, value: impl Into<String>) -> Self {
-        self.video_type = Some(value.into().trim().to_string());
+        self.video_type = Some(value.into());
         self
     }
 
     /// Sets the uploaded cover image media id.
     #[must_use]
     pub fn cover(mut self, pic_media_id: impl Into<String>) -> Self {
-        self.pic_media_id = Some(pic_media_id.into().trim().to_string());
+        self.pic_media_id = Some(pic_media_id.into());
         self
     }
 
@@ -1825,7 +1856,7 @@ impl RobotVideo {
     }
 
     fn validate(&self) -> Result<()> {
-        non_empty_trimmed(&self.video_media_id, "video_media_id")?;
+        validate_machine_identifier(&self.video_media_id, "video_media_id")?;
         if self.duration_seconds == 0 {
             return Err(Error::invalid_input(
                 "duration_seconds",
@@ -1833,10 +1864,10 @@ impl RobotVideo {
             ));
         }
         if let Some(video_type) = &self.video_type {
-            non_empty_trimmed(video_type, "video_type")?;
+            validate_machine_identifier(video_type, "video_type")?;
         }
         if let Some(pic_media_id) = &self.pic_media_id {
-            non_empty_trimmed(pic_media_id, "pic_media_id")?;
+            validate_machine_identifier(pic_media_id, "pic_media_id")?;
         }
         if matches!(self.width, Some(0)) {
             return Err(Error::invalid_input(
@@ -1882,7 +1913,7 @@ pub enum RobotMessage {
     },
     /// Image message.
     Image {
-        /// DingTalk media id or image URL expected by DingTalk's `photoURL` field.
+        /// DingTalk media id or HTTP image URL expected by DingTalk's `photoURL` field.
         photo_url: String,
     },
     /// Action-card message.
@@ -1948,7 +1979,7 @@ impl RobotMessage {
         Self::Link {
             title: title.into(),
             text: text.into(),
-            message_url: message_url.into().trim().to_string(),
+            message_url: message_url.into(),
             pic_url: None,
         }
     }
@@ -1964,8 +1995,8 @@ impl RobotMessage {
         Self::Link {
             title: title.into(),
             text: text.into(),
-            message_url: message_url.into().trim().to_string(),
-            pic_url: Some(pic_url.into().trim().to_string()),
+            message_url: message_url.into(),
+            pic_url: Some(pic_url.into()),
         }
     }
 
@@ -1973,7 +2004,7 @@ impl RobotMessage {
     #[must_use]
     pub fn image(photo_url: impl Into<String>) -> Self {
         Self::Image {
-            photo_url: photo_url.into().trim().to_string(),
+            photo_url: photo_url.into(),
         }
     }
 
@@ -2003,7 +2034,7 @@ impl RobotMessage {
     #[must_use]
     pub fn audio(media_id: impl Into<String>, duration_millis: u64) -> Self {
         Self::Audio {
-            media_id: media_id.into().trim().to_string(),
+            media_id: media_id.into(),
             duration_millis,
         }
     }
@@ -2016,9 +2047,9 @@ impl RobotMessage {
         file_type: impl Into<String>,
     ) -> Self {
         Self::File {
-            media_id: media_id.into().trim().to_string(),
-            file_name: file_name.into().trim().to_string(),
-            file_type: file_type.into().trim().to_string(),
+            media_id: media_id.into(),
+            file_name: file_name.into(),
+            file_type: file_type.into(),
         }
     }
 
@@ -2044,7 +2075,7 @@ impl RobotMessage {
         T: Serialize,
     {
         let msg_key = msg_key.into();
-        let msg_key = non_empty_trimmed(&msg_key, "msg_key")?;
+        validate_machine_identifier(&msg_key, "msg_key")?;
         let value = serde_json::to_value(msg_param)?;
         let msg_param_json = normalize_robot_msg_param_value(value)?;
 
@@ -2060,7 +2091,7 @@ impl RobotMessage {
         msg_param_json: impl Into<String>,
     ) -> Result<Self> {
         let msg_key = msg_key.into();
-        let msg_key = non_empty_trimmed(&msg_key, "msg_key")?;
+        validate_machine_identifier(&msg_key, "msg_key")?;
         let msg_param_json = msg_param_json.into();
         let msg_param_json = normalize_robot_msg_param_json(&msg_param_json)?;
 
@@ -2082,7 +2113,7 @@ impl RobotMessage {
             Self::File { .. } => "sampleFile",
             Self::Video { .. } => "sampleVideo",
             Self::Custom { msg_key, .. } => {
-                non_empty_trimmed(msg_key, "msg_key")?;
+                validate_machine_identifier(msg_key, "msg_key")?;
                 msg_key
             }
         })
@@ -2158,7 +2189,7 @@ impl RobotMessage {
                 };
                 Ok(serde_json::to_string(&param)?)
             }
-            Self::Custom { msg_param_json, .. } => Ok(msg_param_json.clone()),
+            Self::Custom { msg_param_json, .. } => normalize_robot_msg_param_json(msg_param_json),
         }
     }
 
@@ -2186,7 +2217,7 @@ impl RobotMessage {
                 }
             }
             Self::Image { photo_url } => {
-                non_empty_trimmed(photo_url, "photo_url")?;
+                validate_robot_image_reference(photo_url, "photo_url")?;
             }
             Self::ActionCard { card } => {
                 card.validate()?;
@@ -2195,7 +2226,7 @@ impl RobotMessage {
                 media_id,
                 duration_millis,
             } => {
-                non_empty_trimmed(media_id, "media_id")?;
+                validate_machine_identifier(media_id, "media_id")?;
                 if *duration_millis == 0 {
                     return Err(Error::invalid_input(
                         "duration_millis",
@@ -2208,9 +2239,9 @@ impl RobotMessage {
                 file_name,
                 file_type,
             } => {
-                non_empty_trimmed(media_id, "media_id")?;
-                non_empty_trimmed(file_name, "file_name")?;
-                non_empty_trimmed(file_type, "file_type")?;
+                validate_machine_identifier(media_id, "media_id")?;
+                validate_file_name(file_name, "file_name")?;
+                validate_machine_identifier(file_type, "file_type")?;
             }
             Self::Video { video } => {
                 video.validate()?;
@@ -2219,7 +2250,7 @@ impl RobotMessage {
                 msg_key,
                 msg_param_json,
             } => {
-                non_empty_trimmed(msg_key, "msg_key")?;
+                validate_machine_identifier(msg_key, "msg_key")?;
                 normalize_robot_msg_param_json(msg_param_json)?;
             }
         }
@@ -2236,11 +2267,11 @@ fn normalize_robot_msg_param_json(value: &str) -> Result<String> {
 }
 
 fn infer_file_type(file_name: &str) -> Result<String> {
-    let file_name = non_empty_trimmed(file_name, "file_name")?;
+    validate_file_name(file_name, "file_name")?;
     let (_stem, extension) = file_name
         .rsplit_once('.')
         .ok_or_else(|| Error::invalid_input("file_name", "file name must contain an extension"))?;
-    non_empty_trimmed(extension, "file_type").map(|value| value.to_ascii_lowercase())
+    normalize_machine_identifier(extension, "file_type").map(|value| value.to_ascii_lowercase())
 }
 
 fn normalize_json_object(field: &'static str, value: Value) -> Result<String> {
@@ -2261,18 +2292,81 @@ fn normalize_json_object_str(field: &'static str, value: &str) -> Result<String>
     normalize_json_object(field, value)
 }
 
-fn normalize_json_array_str(field: &'static str, value: &str) -> Result<String> {
+fn normalize_private_data_map(field: &'static str, value: Value) -> Result<String> {
+    let Value::Object(object) = value else {
+        return Err(Error::invalid_input(
+            field,
+            "value must serialize to a JSON object",
+        ));
+    };
+
+    for key in object.keys() {
+        validate_machine_identifier(key, field)?;
+    }
+
+    Ok(serde_json::to_string(&Value::Object(object))?)
+}
+
+fn normalize_private_data_map_str(field: &'static str, value: &str) -> Result<String> {
     let value = non_empty_trimmed(value, field)?;
     let value = serde_json::from_str::<Value>(&value)
         .map_err(|source| Error::invalid_input(field, format!("invalid JSON: {source}")))?;
-    if !value.is_array() {
+    normalize_private_data_map(field, value)
+}
+
+fn normalize_json_string_array_str(field: &'static str, value: &str) -> Result<String> {
+    let value = non_empty_trimmed(value, field)?;
+    let value = serde_json::from_str::<Value>(&value)
+        .map_err(|source| Error::invalid_input(field, format!("invalid JSON: {source}")))?;
+    let Value::Array(values) = value else {
         return Err(Error::invalid_input(field, "value must be a JSON array"));
+    };
+
+    let mut normalized = Vec::with_capacity(values.len());
+    for value in values {
+        let Value::String(value) = value else {
+            return Err(Error::invalid_input(
+                field,
+                "array elements must be strings",
+            ));
+        };
+        validate_machine_identifier(&value, field)?;
+        normalized.push(Value::String(value));
     }
-    Ok(serde_json::to_string(&value)?)
+    if normalized.is_empty() {
+        return Err(Error::invalid_input(
+            field,
+            "at least one user id is required",
+        ));
+    }
+    Ok(Value::Array(normalized).to_string())
 }
 
 fn validate_http_url(value: &str, field: &'static str) -> Result<()> {
     parse_http_url(value, field).map(|_url| ())
+}
+
+fn validate_robot_image_reference(value: &str, field: &'static str) -> Result<()> {
+    let trimmed = non_empty_trimmed(value, field)?;
+    if trimmed != value {
+        return Err(Error::invalid_input(
+            field,
+            "value must not contain leading or trailing whitespace",
+        ));
+    }
+
+    if value.contains("://") || url::Url::parse(value).is_ok() {
+        return validate_http_url(value, field);
+    }
+
+    if value.chars().any(char::is_whitespace) {
+        return Err(Error::invalid_input(
+            field,
+            "media id must not contain whitespace",
+        ));
+    }
+
+    validate_no_control_chars(value, field)
 }
 
 fn validate_http_endpoint_url(value: &str, field: &'static str) -> Result<()> {
@@ -2321,12 +2415,57 @@ fn validate_no_control_chars(value: &str, field: &'static str) -> Result<()> {
     normalize_no_control_chars(value, field).map(|_value| ())
 }
 
+fn validate_header_value(value: &str, field: &'static str) -> Result<()> {
+    validate_no_control_chars(value, field)?;
+    let trimmed = non_empty_trimmed(value, field)?;
+    if trimmed != value {
+        return Err(Error::invalid_input(
+            field,
+            "value must not contain leading or trailing whitespace",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_file_name(value: &str, field: &'static str) -> Result<()> {
+    validate_header_value(value, field)?;
+    if value.contains(['/', '\\']) {
+        return Err(Error::invalid_input(
+            field,
+            "file name must not contain path separators",
+        ));
+    }
+    Ok(())
+}
+
 fn normalize_no_control_chars(value: &str, field: &'static str) -> Result<String> {
-    let value = non_empty_trimmed(value, field)?;
     if value.chars().any(char::is_control) {
         return Err(Error::invalid_input(
             field,
             "value must not contain control characters",
+        ));
+    }
+    let value = non_empty_trimmed(value, field)?;
+    Ok(value)
+}
+
+fn validate_machine_identifier(value: &str, field: &'static str) -> Result<()> {
+    let normalized = normalize_machine_identifier(value, field)?;
+    if normalized != value {
+        return Err(Error::invalid_input(
+            field,
+            "value must not contain leading or trailing whitespace",
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_machine_identifier(value: &str, field: &'static str) -> Result<String> {
+    let value = normalize_no_control_chars(value, field)?;
+    if value.chars().any(char::is_whitespace) {
+        return Err(Error::invalid_input(
+            field,
+            "value must not contain whitespace",
         ));
     }
     Ok(value)
@@ -2337,11 +2476,12 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let mut values = Vec::new();
+    let mut values = Vec::<String>::new();
     for value in user_ids {
-        let value = non_empty_trimmed(value.as_ref(), "user_id")?;
-        if !values.contains(&value) {
-            values.push(value);
+        let value = value.as_ref();
+        validate_machine_identifier(value, "user_id")?;
+        if !values.iter().any(|existing| existing == value) {
+            values.push(value.to_string());
         }
     }
 
@@ -2355,30 +2495,39 @@ where
     Ok(values)
 }
 
-fn json_string_list<I, S>(values: I) -> Option<String>
+fn json_string_list<I, S>(field: &'static str, values: I) -> Result<Option<String>>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
     let mut normalized = Vec::<String>::new();
     for value in values {
-        let value = value.as_ref().trim();
-        if !value.is_empty() && !normalized.iter().any(|existing| existing == value) {
+        let value = value.as_ref();
+        validate_machine_identifier(value, field)?;
+        if !normalized.iter().any(|existing| existing == value) {
             normalized.push(value.to_string());
         }
     }
-    (!normalized.is_empty())
-        .then(|| Value::Array(normalized.into_iter().map(Value::String).collect()).to_string())
+    if normalized.is_empty() {
+        return Err(Error::invalid_input(
+            field,
+            "at least one user id is required",
+        ));
+    }
+
+    Ok(Some(
+        Value::Array(normalized.into_iter().map(Value::String).collect()).to_string(),
+    ))
 }
 
 fn media_upload_multipart_body(upload: &MediaUpload) -> Result<(String, Vec<u8>)> {
     upload.validate()?;
-    let media_type = normalize_no_control_chars(upload.media_type().as_str(), "media_type")?;
+    let media_type = upload.media_type().as_str();
 
     let boundary = media_upload_boundary(upload);
     let mut body = Vec::new();
 
-    multipart_text_field(&mut body, &boundary, "type", &media_type);
+    multipart_text_field(&mut body, &boundary, "type", media_type);
     multipart_file_field(
         &mut body,
         &boundary,
@@ -2586,9 +2735,8 @@ fn parse_process_query_key_response(
         .unwrap_or(&raw);
     let process_query_key = payload
         .get("processQueryKey")
-        .or_else(|| payload.get("process_query_key"))
-        .and_then(Value::as_str);
-    let process_query_key = required_response_string(
+        .or_else(|| payload.get("process_query_key"));
+    let process_query_key = required_response_value_string(
         process_query_key,
         "process_query_key",
         "missing processQueryKey in DingTalk response",
@@ -2598,6 +2746,19 @@ fn parse_process_query_key_response(
     )?;
 
     Ok((process_query_key, raw))
+}
+
+fn required_response_value_string(
+    value: Option<&Value>,
+    field: &'static str,
+    message: &'static str,
+    request_id: Option<String>,
+    body: &str,
+    error_body_snippet: BodySnippetConfig,
+) -> Result<String> {
+    value
+        .and_then(|value| response_value_string(value, field))
+        .ok_or_else(|| api_error_from_body(-1, message, request_id, body, error_body_snippet))
 }
 
 fn required_response_string(
@@ -2611,6 +2772,14 @@ fn required_response_string(
     value
         .and_then(|value| non_empty_trimmed(value, field).ok())
         .ok_or_else(|| api_error_from_body(-1, message, request_id, body, error_body_snippet))
+}
+
+fn response_value_string(value: &Value, field: &'static str) -> Option<String> {
+    match value {
+        Value::String(value) => non_empty_trimmed(value, field).ok(),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
 }
 
 fn response_request_id(value: &Value) -> Option<String> {
@@ -2674,7 +2843,11 @@ struct AccessTokenResponse {
         deserialize_with = "crate::transport::deserialize_optional_string"
     )]
     api_code: Option<String>,
-    #[serde(alias = "message")]
+    #[serde(
+        default,
+        alias = "message",
+        deserialize_with = "crate::transport::deserialize_optional_string"
+    )]
     errmsg: Option<String>,
     #[serde(alias = "accessToken")]
     access_token: Option<String>,
@@ -2708,7 +2881,11 @@ struct RawMediaUploadResponse {
         deserialize_with = "crate::transport::deserialize_optional_string"
     )]
     api_code: Option<String>,
-    #[serde(alias = "message")]
+    #[serde(
+        default,
+        alias = "message",
+        deserialize_with = "crate::transport::deserialize_optional_string"
+    )]
     errmsg: Option<String>,
     #[serde(
         default,
@@ -2961,7 +3138,7 @@ mod tests {
     }
 
     #[test]
-    fn robot_message_builders_trim_identifier_and_url_fields() {
+    fn robot_message_builders_reject_untrimmed_identifier_and_url_fields() {
         let link = RobotMessage::link_with_image(
             "title",
             "body",
@@ -2971,21 +3148,16 @@ mod tests {
         let file = RobotMessage::file(" media-file ", " report.pdf ", " pdf ");
 
         assert_eq!(
-            serde_json::from_str::<Value>(&link.msg_param_json().expect("link")).expect("json"),
-            serde_json::json!({
-                "title": "title",
-                "text": "body",
-                "messageUrl": "https://example.com/open",
-                "picUrl": "https://example.com/pic.png"
-            })
+            link.msg_param_json()
+                .expect_err("URL whitespace should be rejected")
+                .kind(),
+            crate::ErrorKind::InvalidInput
         );
         assert_eq!(
-            serde_json::from_str::<Value>(&file.msg_param_json().expect("file")).expect("json"),
-            serde_json::json!({
-                "mediaId": "media-file",
-                "fileName": "report.pdf",
-                "fileType": "pdf"
-            })
+            file.msg_param_json()
+                .expect_err("media id whitespace should be rejected")
+                .kind(),
+            crate::ErrorKind::InvalidInput
         );
     }
 
@@ -3005,6 +3177,82 @@ mod tests {
         let error = message
             .validate()
             .expect_err("link message URL should not contain credentials");
+
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn robot_image_messages_validate_http_urls() {
+        RobotMessage::image("@lADOpwk3K80C0M0C0A")
+            .validate()
+            .expect("media id image should be accepted");
+
+        let non_http = RobotMessage::image("ftp://example.com/image.png")
+            .validate()
+            .expect_err("image URL should require HTTP");
+        let userinfo = RobotMessage::image("https://user:pass@example.com/image.png")
+            .validate()
+            .expect_err("image URL should not contain credentials");
+        let whitespace = RobotMessage::image("not a media id")
+            .validate()
+            .expect_err("media id must not contain whitespace");
+
+        assert_eq!(non_http.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(userinfo.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(whitespace.kind(), crate::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn robot_messages_validate_machine_identifiers_strictly() {
+        let audio = RobotMessage::Audio {
+            media_id: " media-1 ".to_string(),
+            duration_millis: 1,
+        }
+        .validate()
+        .expect_err("manual media id should not contain surrounding whitespace");
+        let file_type = RobotMessage::File {
+            media_id: "media-1".to_string(),
+            file_name: "report.pdf".to_string(),
+            file_type: "p df".to_string(),
+        }
+        .validate()
+        .expect_err("manual file type should not contain whitespace");
+        let file_name = RobotMessage::File {
+            media_id: "media-1".to_string(),
+            file_name: " report.pdf ".to_string(),
+            file_type: "pdf".to_string(),
+        }
+        .validate()
+        .expect_err("manual file name should not contain surrounding whitespace");
+        let file_path = RobotMessage::File {
+            media_id: "media-1".to_string(),
+            file_name: "reports/report.pdf".to_string(),
+            file_type: "pdf".to_string(),
+        }
+        .validate()
+        .expect_err("manual file name should not contain path separators");
+        let video = RobotMessage::video(RobotVideo::new("video media", 10))
+            .validate()
+            .expect_err("video media id should not contain whitespace");
+        let custom = RobotMessage::Custom {
+            msg_key: " sampleText ".to_string(),
+            msg_param_json: r#"{"content":"hello"}"#.to_string(),
+        }
+        .msg_key()
+        .expect_err("manual msg key should not contain surrounding whitespace");
+
+        assert_eq!(audio.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(file_type.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(file_name.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(file_path.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(video.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(custom.kind(), crate::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn inferred_file_type_rejects_untrimmed_file_names() {
+        let error = RobotMessage::file_with_inferred_type("media-1", " report.pdf ")
+            .expect_err("inference should not rewrite file names");
 
         assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
     }
@@ -3122,7 +3370,7 @@ mod tests {
     #[test]
     fn media_upload_normalizes_custom_media_type_wire_value() {
         let upload = MediaUpload::new(
-            MediaType::Other(" custom ".to_string()),
+            MediaType::from_raw(" custom ").expect("media type"),
             "demo.bin",
             b"BIN".to_vec(),
         );
@@ -3131,6 +3379,18 @@ mod tests {
 
         assert!(body.contains("\r\ncustom\r\n"));
         assert!(!body.contains("\r\n custom \r\n"));
+    }
+
+    #[test]
+    fn media_upload_rejects_manual_whitespace_media_type() {
+        let error = media_upload_multipart_body(&MediaUpload::new(
+            MediaType::Other(" custom ".to_string()),
+            "demo.bin",
+            b"BIN".to_vec(),
+        ))
+        .expect_err("manual media type should be strict");
+
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -3155,6 +3415,19 @@ mod tests {
         assert_eq!(file_name_error.kind(), crate::ErrorKind::InvalidInput);
         assert_eq!(content_type_error.kind(), crate::ErrorKind::InvalidInput);
         assert_eq!(media_type_error.kind(), crate::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn media_upload_rejects_untrimmed_or_path_file_names() {
+        let untrimmed =
+            media_upload_multipart_body(&MediaUpload::file(" report.pdf ", b"PDF".to_vec()))
+                .expect_err("file names should not be rewritten");
+        let path =
+            media_upload_multipart_body(&MediaUpload::file("reports/report.pdf", b"PDF".to_vec()))
+                .expect_err("file names should not include paths");
+
+        assert_eq!(untrimmed.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(path.kind(), crate::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -3196,15 +3469,18 @@ mod tests {
     #[test]
     fn interactive_card_send_request_is_serialized() {
         let card = InteractiveCard::group(
-            " open-cid ",
-            " template-id ",
-            " card-biz-id ",
+            "open-cid",
+            "template-id",
+            "card-biz-id",
             serde_json::json!({ "title": "Deploy", "status": "ok" }),
         )
         .expect("card")
-        .callback_url(" https://example.com/card/callback ")
-        .at_users([" user-1 ", "user-1", "user-2"])
-        .receiver_users([" user-1 "])
+        .callback_url("https://example.com/card/callback")
+        .expect("callback url")
+        .at_users(["user-1", "user-1", "user-2"])
+        .expect("at users")
+        .receiver_users(["user-1"])
+        .expect("receiver users")
         .pull_strategy(true)
         .card_property(serde_json::json!({ "theme": "blue" }))
         .expect("card property")
@@ -3239,27 +3515,49 @@ mod tests {
     }
 
     #[test]
-    fn interactive_card_empty_user_lists_are_omitted() {
+    fn interactive_card_user_lists_reject_empty_inputs() {
         let card = InteractiveCard::group(
             "open-cid",
             "template-id",
             "card-biz-id",
             serde_json::json!({ "title": "Deploy" }),
         )
-        .expect("card")
-        .at_users([" ", ""])
-        .receiver_users(Vec::<&str>::new());
+        .expect("card");
 
-        let request = card.to_send_request("robot-code".to_string());
-        let value = serde_json::to_value(request).expect("serialize");
+        let empty_at_users = card
+            .clone()
+            .at_users(Vec::<&str>::new())
+            .expect_err("empty at user list should fail");
+        let blank_at_users = card
+            .clone()
+            .at_users([" "])
+            .expect_err("blank at user ids should fail");
+        let empty_receivers = card
+            .receiver_users(Vec::<&str>::new())
+            .expect_err("empty receiver list should fail");
 
-        assert!(value.get("sendOptions").is_none());
+        assert_eq!(empty_at_users.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(blank_at_users.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(empty_receivers.kind(), crate::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn interactive_card_raw_user_lists_are_canonicalized() {
+        let options = InteractiveCardSendOptions::new()
+            .at_user_list_json(r#" [ "user-1" , "user-2" ] "#)
+            .expect("at users")
+            .receiver_list_json(r#"["user-1"]"#)
+            .expect("receivers");
+        let value = serde_json::to_value(options).expect("serialize");
+
+        assert_eq!(value["atUserListJson"], r#"["user-1","user-2"]"#);
+        assert_eq!(value["receiverListJson"], r#"["user-1"]"#);
     }
 
     #[test]
     fn interactive_card_update_request_is_serialized() {
         let update = InteractiveCardUpdate::card_data(
-            " card-biz-id ",
+            "card-biz-id",
             serde_json::json!({ "status": "done" }),
         )
         .expect("update")
@@ -3278,7 +3576,7 @@ mod tests {
     #[test]
     fn interactive_card_private_user_builds_receiver_json() {
         let card = InteractiveCard::private_user(
-            " user-1 ",
+            "user-1",
             "template-id",
             "card-biz-id",
             serde_json::json!({ "title": "hello" }),
@@ -3309,6 +3607,17 @@ mod tests {
     }
 
     #[test]
+    fn parses_numeric_process_query_key_response() {
+        let response = parse_robot_message_response(
+            r#"{"errcode":0,"processQueryKey":12345}"#,
+            BodySnippetConfig::default(),
+        )
+        .expect("response");
+
+        assert_eq!(response.process_query_key(), "12345");
+    }
+
+    #[test]
     fn interactive_card_response_errors_preserve_numeric_request_id() {
         let error = parse_interactive_card_response(
             r#"{"requestId":12345,"result":{}}"#,
@@ -3330,6 +3639,7 @@ mod tests {
                 .validate()
                 .expect_err("target is required");
         let invalid_update = InteractiveCardUpdate::private_data("biz")
+            .expect("update")
             .validate()
             .expect_err("some update data is required");
         let invalid_private_user =
@@ -3342,14 +3652,45 @@ mod tests {
             InteractiveCard::group("cid", "template", "biz", serde_json::json!({}))
                 .expect("card")
                 .callback_url("ftp://example.com/callback")
-                .validate()
                 .expect_err("callback URL should require HTTP");
         let callback_url_fragment =
             InteractiveCard::group("cid", "template", "biz", serde_json::json!({}))
                 .expect("card")
                 .callback_url("https://example.com/callback#token")
-                .validate()
                 .expect_err("callback URL should not contain a fragment");
+        let invalid_at_users = InteractiveCardSendOptions::new()
+            .at_user_list_json(r#"[" user-1 "]"#)
+            .expect_err("raw atUserListJson values should be strict user ids");
+        let empty_raw_at_users = InteractiveCardSendOptions::new()
+            .at_user_list_json(r#"[]"#)
+            .expect_err("raw atUserListJson should not be empty");
+        let invalid_receivers = InteractiveCardSendOptions::new()
+            .receiver_list_json(r#"[123]"#)
+            .expect_err("raw receiverListJson values should be strings");
+        let empty_raw_receivers = InteractiveCardSendOptions::new()
+            .receiver_list_json(r#"[]"#)
+            .expect_err("raw receiverListJson should not be empty");
+        let invalid_typed_at_users = InteractiveCardSendOptions::new()
+            .at_users([" user-1 "])
+            .expect_err("typed at users should be strict user ids");
+        let invalid_card_id =
+            InteractiveCard::group("cid", "template id", "biz", serde_json::json!({}))
+                .expect_err("card template id should be a machine identifier");
+        let untrimmed_card_id =
+            InteractiveCard::group("cid", " template", "biz", serde_json::json!({}))
+                .expect_err("card template id should not be rewritten");
+        let untrimmed_conversation_id =
+            InteractiveCard::group(" cid ", "template", "biz", serde_json::json!({}))
+                .expect_err("conversation id should not be rewritten");
+        let invalid_update_id = InteractiveCardUpdate::private_data(" biz ")
+            .expect_err("card update id should not be rewritten");
+        let invalid_private_data_key =
+            InteractiveCard::group("cid", "template", "biz", serde_json::json!({}))
+                .expect("card")
+                .user_private_data(serde_json::json!({
+                    " user-1 ": { "status": "ok" }
+                }))
+                .expect_err("private data keys should be strict user ids");
 
         assert_eq!(invalid_data.kind(), crate::ErrorKind::InvalidInput);
         assert_eq!(missing_target.kind(), crate::ErrorKind::InvalidInput);
@@ -3361,6 +3702,25 @@ mod tests {
         );
         assert_eq!(invalid_callback_url.kind(), crate::ErrorKind::InvalidInput);
         assert_eq!(callback_url_fragment.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(invalid_at_users.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(empty_raw_at_users.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(invalid_receivers.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(empty_raw_receivers.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(
+            invalid_typed_at_users.kind(),
+            crate::ErrorKind::InvalidInput
+        );
+        assert_eq!(invalid_card_id.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(untrimmed_card_id.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(
+            untrimmed_conversation_id.kind(),
+            crate::ErrorKind::InvalidInput
+        );
+        assert_eq!(invalid_update_id.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(
+            invalid_private_data_key.kind(),
+            crate::ErrorKind::InvalidInput
+        );
     }
 
     #[test]
@@ -3368,8 +3728,13 @@ mod tests {
         let client = DingTalk::builder().build().expect("client");
         let openapi = client
             .openapi()
-            .with_credentials(AppCredentials::new("app-key", "app-secret"));
-        let robot = openapi.robot(" robot-a ").with_robot_code(" robot-b ");
+            .with_credentials(AppCredentials::new("app-key", "app-secret"))
+            .expect("openapi credentials");
+        let robot = openapi
+            .robot("robot-a")
+            .expect("robot")
+            .with_robot_code("robot-b")
+            .expect("robot code");
 
         assert_eq!(
             robot
@@ -3382,6 +3747,28 @@ mod tests {
     }
 
     #[test]
+    fn openapi_robot_helpers_validate_configuration_immediately() {
+        let client = DingTalk::builder().build().expect("client");
+        let openapi = client.openapi();
+        let robot_error = openapi
+            .robot(" robot-a ")
+            .expect_err("robot code should not be rewritten");
+        let credential_error = openapi
+            .clone()
+            .with_credentials(AppCredentials::new("app-key", " app-secret "))
+            .expect_err("credentials should be validated immediately");
+        let reconfigured_error = openapi
+            .robot("robot-a")
+            .expect("robot")
+            .with_robot_code("robot b")
+            .expect_err("new robot code should be validated immediately");
+
+        assert_eq!(robot_error.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(credential_error.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(reconfigured_error.kind(), crate::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn rejects_custom_message_without_object_param() {
         let error = RobotMessage::custom("sampleText", ["not", "an", "object"])
             .expect_err("array msgParam should fail");
@@ -3390,25 +3777,56 @@ mod tests {
     }
 
     #[test]
+    fn custom_message_serializes_canonical_msg_param_json() {
+        let message = RobotMessage::Custom {
+            msg_key: "sampleText".to_string(),
+            msg_param_json: r#" { "content" : "hello" } "#.to_string(),
+        };
+
+        assert_eq!(
+            message.msg_param_json().expect("json"),
+            r#"{"content":"hello"}"#
+        );
+    }
+
+    #[test]
     fn rejects_empty_custom_msg_key() {
         let error = RobotMessage::custom(" ", serde_json::json!({"content": "hello"}))
             .expect_err("empty msgKey should fail");
+        let whitespace =
+            RobotMessage::custom("sample Text", serde_json::json!({"content": "hello"}))
+                .expect_err("msgKey should be a machine identifier");
 
         assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(whitespace.kind(), crate::ErrorKind::InvalidInput);
     }
 
     #[test]
     fn rejects_empty_private_user_ids() {
         let error =
             normalize_user_ids::<[&str; 0], &str>([]).expect_err("empty user list should fail");
+        let whitespace =
+            normalize_user_ids(["user 1"]).expect_err("user id must not contain whitespace");
+        let surrounding_whitespace = normalize_user_ids([" user-1 "])
+            .expect_err("user id must not contain surrounding whitespace");
+        let control =
+            normalize_user_ids(["user\n1"]).expect_err("user id must not contain control chars");
+        let surrounding_control =
+            normalize_user_ids(["\nuser-1"]).expect_err("user id must not contain control chars");
 
         assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(whitespace.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(
+            surrounding_whitespace.kind(),
+            crate::ErrorKind::InvalidInput
+        );
+        assert_eq!(control.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(surrounding_control.kind(), crate::ErrorKind::InvalidInput);
     }
 
     #[test]
-    fn private_user_ids_are_trimmed_and_deduplicated() {
-        let values =
-            normalize_user_ids([" user-1 ", "user-2", "user-1"]).expect("normalized user ids");
+    fn private_user_ids_are_deduplicated_without_rewriting_values() {
+        let values = normalize_user_ids(["user-1", "user-2", "user-1"]).expect("user ids");
 
         assert_eq!(values, ["user-1".to_string(), "user-2".to_string()]);
     }

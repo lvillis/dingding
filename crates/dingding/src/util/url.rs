@@ -3,7 +3,18 @@ use url::Url;
 use crate::{Error, Result};
 
 pub(crate) fn normalize_base_url(value: impl AsRef<str>) -> Result<Url> {
-    let raw = value.as_ref().trim();
+    let raw = value.as_ref();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(Error::InvalidConfig(
+            "base_url must not be empty".to_string(),
+        ));
+    }
+    if trimmed != raw {
+        return Err(Error::InvalidConfig(
+            "base_url must not contain leading or trailing whitespace".to_string(),
+        ));
+    }
     let mut url = Url::parse(raw).map_err(|source| Error::InvalidConfig(source.to_string()))?;
 
     if !matches!(url.scheme(), "http" | "https") {

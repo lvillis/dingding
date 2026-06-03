@@ -18,11 +18,9 @@ impl AppCredentials {
     /// Creates credentials from app key and app secret.
     #[must_use]
     pub fn new(app_key: impl Into<String>, app_secret: impl Into<String>) -> Self {
-        let app_key = app_key.into();
-        let app_secret = app_secret.into();
         Self {
-            app_key: app_key.trim().to_string(),
-            app_secret: app_secret.trim().to_string(),
+            app_key: app_key.into(),
+            app_secret: app_secret.into(),
         }
     }
 
@@ -58,38 +56,132 @@ impl AppCredentials {
         fallback_app_key_var: &'static str,
         fallback_app_secret_var: &'static str,
     ) -> crate::Result<Self> {
-        Ok(Self::new(
-            env_value(app_key_var, fallback_app_key_var)?,
-            env_value(app_secret_var, fallback_app_secret_var)?,
-        ))
+        let primary = EnvCredentialNames {
+            app_key: app_key_var,
+            app_secret: app_secret_var,
+        };
+        let fallback = EnvCredentialNames {
+            app_key: fallback_app_key_var,
+            app_secret: fallback_app_secret_var,
+        };
+        let credentials = select_env_credentials(
+            primary,
+            fallback,
+            read_env_credentials(primary)?,
+            read_env_credentials(fallback)?,
+        );
+        let credentials = credentials?;
+        credentials.validate()?;
+        Ok(credentials)
     }
 
     /// Validates that both credential fields are present.
     pub fn validate(&self) -> crate::Result<()> {
-        if self.app_key.trim().is_empty() {
-            return Err(crate::Error::invalid_input(
-                "app_key",
-                "value must not be empty",
-            ));
-        }
-
-        if self.app_secret.trim().is_empty() {
-            return Err(crate::Error::invalid_input(
-                "app_secret",
-                "value must not be empty",
-            ));
-        }
-
+        validate_credential_token(&self.app_key, "app_key")?;
+        validate_credential_token(&self.app_secret, "app_secret")?;
         Ok(())
     }
 }
 
-fn env_value(primary: &'static str, fallback: &'static str) -> crate::Result<String> {
-    env::var(primary)
-        .or_else(|_| env::var(fallback))
-        .map_err(|_error| {
-            crate::Error::InvalidConfig(format!("set {primary} or {fallback} environment variable"))
-        })
+fn validate_credential_token(value: &str, field: &'static str) -> crate::Result<()> {
+    if value.chars().any(char::is_control) {
+        return Err(crate::Error::invalid_input(
+            field,
+            "value must not contain control characters",
+        ));
+    }
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(crate::Error::invalid_input(
+            field,
+            "value must not be empty",
+        ));
+    }
+    if trimmed != value {
+        return Err(crate::Error::invalid_input(
+            field,
+            "value must not contain leading or trailing whitespace",
+        ));
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Err(crate::Error::invalid_input(
+            field,
+            "value must not contain whitespace",
+        ));
+    }
+    Ok(())
+}
+
+fn env_value(name: &'static str) -> crate::Result<Option<String>> {
+    match env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_value)) => Err(crate::Error::InvalidConfig(format!(
+            "{name} environment variable must be valid unicode"
+        ))),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EnvCredentialNames {
+    app_key: &'static str,
+    app_secret: &'static str,
+}
+
+#[derive(Debug)]
+struct EnvCredentialValues {
+    app_key: Option<String>,
+    app_secret: Option<String>,
+}
+
+fn read_env_credentials(names: EnvCredentialNames) -> crate::Result<EnvCredentialValues> {
+    Ok(EnvCredentialValues {
+        app_key: env_value(names.app_key)?,
+        app_secret: env_value(names.app_secret)?,
+    })
+}
+
+fn select_env_credentials(
+    primary_names: EnvCredentialNames,
+    fallback_names: EnvCredentialNames,
+    primary_values: EnvCredentialValues,
+    fallback_values: EnvCredentialValues,
+) -> crate::Result<AppCredentials> {
+    if primary_values.app_key.is_some() || primary_values.app_secret.is_some() {
+        return complete_env_credentials(primary_names, primary_values);
+    }
+    if fallback_values.app_key.is_some() || fallback_values.app_secret.is_some() {
+        return complete_env_credentials(fallback_names, fallback_values);
+    }
+
+    Err(crate::Error::InvalidConfig(format!(
+        "set {} and {}, or {} and {} environment variables",
+        primary_names.app_key,
+        primary_names.app_secret,
+        fallback_names.app_key,
+        fallback_names.app_secret,
+    )))
+}
+
+fn complete_env_credentials(
+    names: EnvCredentialNames,
+    values: EnvCredentialValues,
+) -> crate::Result<AppCredentials> {
+    match (values.app_key, values.app_secret) {
+        (Some(app_key), Some(app_secret)) => Ok(AppCredentials::new(app_key, app_secret)),
+        (Some(_app_key), None) => Err(crate::Error::InvalidConfig(format!(
+            "set {} environment variable to pair with {}",
+            names.app_secret, names.app_key
+        ))),
+        (None, Some(_app_secret)) => Err(crate::Error::InvalidConfig(format!(
+            "set {} environment variable to pair with {}",
+            names.app_key, names.app_secret
+        ))),
+        (None, None) => Err(crate::Error::InvalidConfig(format!(
+            "set {} and {} environment variables",
+            names.app_key, names.app_secret
+        ))),
+    }
 }
 
 impl fmt::Debug for AppCredentials {
@@ -138,8 +230,8 @@ impl MemoryTokenCache {
         let now = Instant::now();
         let guard = self.inner.read().ok()?;
         let cached = guard.get(credentials)?;
-        let refresh_at = now.checked_add(self.refresh_margin)?;
-        if refresh_at < cached.expires_at {
+        let remaining = cached.expires_at.checked_duration_since(now)?;
+        if remaining > self.refresh_margin {
             Some(cached.token.clone())
         } else {
             None
@@ -223,12 +315,31 @@ mod tests {
     }
 
     #[test]
-    fn credentials_new_trims_values() {
+    fn credentials_new_preserves_values_for_validation() {
         let credentials = AppCredentials::new(" app-key ", " app-secret ");
 
-        assert_eq!(credentials.app_key(), "app-key");
-        assert_eq!(credentials.app_secret(), "app-secret");
-        credentials.validate().expect("credentials should be valid");
+        assert_eq!(credentials.app_key(), " app-key ");
+        assert_eq!(credentials.app_secret(), " app-secret ");
+        assert_eq!(
+            credentials
+                .validate()
+                .expect_err("credentials should not be rewritten")
+                .kind(),
+            crate::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn credentials_validate_rejects_internal_whitespace_and_control_chars() {
+        let whitespace = AppCredentials::new("app key", "secret")
+            .validate()
+            .expect_err("internal whitespace should fail");
+        let control = AppCredentials::new("app-key", "secret\n")
+            .validate()
+            .expect_err("control characters should fail");
+
+        assert_eq!(whitespace.kind(), crate::ErrorKind::InvalidInput);
+        assert_eq!(control.kind(), crate::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -247,5 +358,63 @@ mod tests {
                 .to_string()
                 .contains("DINGDING_TEST_MISSING_CLIENT_ID")
         );
+    }
+
+    #[test]
+    fn credentials_from_env_values_selects_whole_pairs() {
+        let primary_names = EnvCredentialNames {
+            app_key: "CLIENT_ID",
+            app_secret: "CLIENT_SECRET",
+        };
+        let fallback_names = EnvCredentialNames {
+            app_key: "APP_KEY",
+            app_secret: "APP_SECRET",
+        };
+        let primary = select_env_credentials(
+            primary_names,
+            fallback_names,
+            EnvCredentialValues {
+                app_key: Some("client-id".to_string()),
+                app_secret: Some("client-secret".to_string()),
+            },
+            EnvCredentialValues {
+                app_key: Some("app-key".to_string()),
+                app_secret: Some("app-secret".to_string()),
+            },
+        )
+        .expect("primary pair should win");
+        let fallback = select_env_credentials(
+            primary_names,
+            fallback_names,
+            EnvCredentialValues {
+                app_key: None,
+                app_secret: None,
+            },
+            EnvCredentialValues {
+                app_key: Some("app-key".to_string()),
+                app_secret: Some("app-secret".to_string()),
+            },
+        )
+        .expect("fallback pair should be used");
+        let partial = select_env_credentials(
+            primary_names,
+            fallback_names,
+            EnvCredentialValues {
+                app_key: Some("client-id".to_string()),
+                app_secret: None,
+            },
+            EnvCredentialValues {
+                app_key: Some("app-key".to_string()),
+                app_secret: Some("app-secret".to_string()),
+            },
+        )
+        .expect_err("primary credentials must not be mixed with fallback credentials");
+
+        assert_eq!(primary.app_key(), "client-id");
+        assert_eq!(primary.app_secret(), "client-secret");
+        assert_eq!(fallback.app_key(), "app-key");
+        assert_eq!(fallback.app_secret(), "app-secret");
+        assert_eq!(partial.kind(), crate::ErrorKind::InvalidConfig);
+        assert!(partial.to_string().contains("CLIENT_SECRET"));
     }
 }

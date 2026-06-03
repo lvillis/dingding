@@ -44,15 +44,13 @@ impl DingTalk {
 
     /// Creates a custom robot webhook sender.
     #[cfg(feature = "webhook")]
-    #[must_use]
-    pub fn webhook(&self, access_token: impl Into<String>) -> crate::webhook::Webhook {
+    pub fn webhook(&self, access_token: impl Into<String>) -> Result<crate::webhook::Webhook> {
         crate::webhook::Webhook::robot(self.clone(), access_token)
     }
 
     /// Creates a sender from a full session webhook URL.
     #[cfg(feature = "webhook")]
-    #[must_use]
-    pub fn session_webhook(&self, url: impl Into<String>) -> crate::webhook::Webhook {
+    pub fn session_webhook(&self, url: impl Into<String>) -> Result<crate::webhook::Webhook> {
         crate::webhook::Webhook::session(self.clone(), url)
     }
 
@@ -65,9 +63,15 @@ impl DingTalk {
 
     /// Creates an OpenAPI service with explicit app credentials.
     #[cfg(feature = "openapi")]
-    #[must_use]
-    pub fn openapi_with_credentials(&self, credentials: AppCredentials) -> crate::openapi::OpenApi {
-        crate::openapi::OpenApi::new(self.clone(), Some(credentials))
+    pub fn openapi_with_credentials(
+        &self,
+        credentials: AppCredentials,
+    ) -> Result<crate::openapi::OpenApi> {
+        credentials.validate()?;
+        Ok(crate::openapi::OpenApi::new(
+            self.clone(),
+            Some(credentials),
+        ))
     }
 
     pub(crate) fn webhook_endpoint(&self, segments: &[&str]) -> Result<Url> {
@@ -213,21 +217,21 @@ impl DingTalkBuilder {
     /// Sets per-request timeout.
     #[must_use]
     pub fn request_timeout(mut self, value: Duration) -> Self {
-        self.transport.request_timeout = Some(value.max(Duration::from_millis(1)));
+        self.transport.request_timeout = Some(value);
         self
     }
 
     /// Sets total request deadline.
     #[must_use]
     pub fn total_timeout(mut self, value: Duration) -> Self {
-        self.transport.total_timeout = Some(value.max(Duration::from_millis(1)));
+        self.transport.total_timeout = Some(value);
         self
     }
 
     /// Sets TCP connect timeout.
     #[must_use]
     pub fn connect_timeout(mut self, value: Duration) -> Self {
-        self.transport.connect_timeout = value.max(Duration::from_millis(1));
+        self.transport.connect_timeout = value;
         self
     }
 
@@ -309,8 +313,9 @@ mod tests {
             .app_key_and_secret("client-key", "client-secret")
             .build()
             .expect("client");
-        let openapi =
-            client.openapi_with_credentials(AppCredentials::new("override-key", "override-secret"));
+        let openapi = client
+            .openapi_with_credentials(AppCredentials::new("override-key", "override-secret"))
+            .expect("openapi");
 
         assert_eq!(
             openapi
@@ -318,6 +323,17 @@ mod tests {
                 .map(|credentials| credentials.app_key()),
             Some("override-key")
         );
+    }
+
+    #[cfg(feature = "openapi")]
+    #[test]
+    fn openapi_with_credentials_rejects_invalid_credentials() {
+        let client = DingTalk::builder().build().expect("client");
+        let error = client
+            .openapi_with_credentials(AppCredentials::new(" override-key ", "override-secret"))
+            .expect_err("explicit credentials should be validated immediately");
+
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -340,5 +356,45 @@ mod tests {
             .expect("userinfo should fail");
 
         assert_eq!(error.kind(), crate::ErrorKind::InvalidConfig);
+    }
+
+    #[test]
+    fn builder_rejects_untrimmed_base_url() {
+        let error = DingTalk::builder()
+            .webhook_base_url(" https://oapi.dingtalk.com ")
+            .build()
+            .err()
+            .expect("base URL should not be rewritten");
+
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidConfig);
+    }
+
+    #[test]
+    fn builder_rejects_invalid_transport_config() {
+        let request_timeout = DingTalk::builder()
+            .request_timeout(Duration::ZERO)
+            .build()
+            .err()
+            .expect("request timeout must not be silently clamped");
+        let total_timeout = DingTalk::builder()
+            .total_timeout(Duration::ZERO)
+            .build()
+            .err()
+            .expect("total timeout must not be silently clamped");
+        let connect_timeout = DingTalk::builder()
+            .connect_timeout(Duration::ZERO)
+            .build()
+            .err()
+            .expect("connect timeout must not be silently clamped");
+        let client_name = DingTalk::builder()
+            .client_name(" ")
+            .build()
+            .err()
+            .expect("client name must not be empty");
+
+        assert_eq!(request_timeout.kind(), crate::ErrorKind::InvalidConfig);
+        assert_eq!(total_timeout.kind(), crate::ErrorKind::InvalidConfig);
+        assert_eq!(connect_timeout.kind(), crate::ErrorKind::InvalidConfig);
+        assert_eq!(client_name.kind(), crate::ErrorKind::InvalidConfig);
     }
 }

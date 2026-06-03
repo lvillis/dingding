@@ -29,7 +29,7 @@ async fn webhook_robot_posts_expected_query_and_json_body() -> TestResult<()> {
         .build()?;
 
     let response = client
-        .webhook("webhook-token")
+        .webhook("webhook-token")?
         .send_text_with_at("hello", At::new().user_id("user-1").mobile("13800000000"))
         .await?;
 
@@ -64,8 +64,8 @@ async fn signed_webhook_robot_encodes_signature_once() -> TestResult<()> {
         .build()?;
 
     client
-        .webhook("webhook-token")
-        .signing_secret("custom-secret")
+        .webhook("webhook-token")?
+        .signing_secret("custom-secret")?
         .send_text("hello")
         .await?;
 
@@ -93,7 +93,7 @@ async fn webhook_robot_rejects_response_without_errcode() -> TestResult<()> {
         .build()?;
 
     let error = client
-        .webhook("webhook-token")
+        .webhook("webhook-token")?
         .send_text("hello")
         .await
         .err()
@@ -121,7 +121,7 @@ async fn webhook_robot_rejects_invalid_json_response_with_body_snippet() -> Test
         .build()?;
 
     let error = client
-        .webhook("webhook-token")
+        .webhook("webhook-token")?
         .send_text("hello")
         .await
         .err()
@@ -152,7 +152,7 @@ async fn webhook_robot_rejects_modern_code_error_even_with_zero_errcode() -> Tes
         .build()?;
 
     let error = client
-        .webhook("webhook-token")
+        .webhook("webhook-token")?
         .send_text("hello")
         .await
         .err()
@@ -181,7 +181,7 @@ async fn openapi_group_message_fetches_token_and_posts_with_access_token_header(
 
     let response = client
         .openapi()
-        .robot("robot-code")
+        .robot("robot-code")?
         .send_group_text("open-cid", "hello from openapi")
         .await?;
 
@@ -234,7 +234,7 @@ async fn openapi_robot_message_rejects_missing_process_query_key() -> TestResult
 
     let error = client
         .openapi()
-        .robot("robot-code")
+        .robot("robot-code")?
         .send_group_text("open-cid", "hello")
         .await
         .err()
@@ -381,7 +381,7 @@ async fn openapi_raw_send_rejects_empty_standard_response() -> TestResult<()> {
 
     let error = client
         .openapi()
-        .robot("robot-code")
+        .robot("robot-code")?
         .send_group_text("open-cid", "hello")
         .await
         .err()
@@ -416,7 +416,7 @@ async fn openapi_raw_send_rejects_non_json_standard_response() -> TestResult<()>
 
     let error = client
         .openapi()
-        .robot("robot-code")
+        .robot("robot-code")?
         .send_group_text("open-cid", "hello")
         .await
         .err()
@@ -453,7 +453,7 @@ async fn openapi_raw_send_preserves_modern_code_error_response() -> TestResult<(
 
     let error = client
         .openapi()
-        .robot("robot-code")
+        .robot("robot-code")?
         .send_group_text("open-cid", "hello")
         .await
         .err()
@@ -533,7 +533,7 @@ async fn openapi_business_error_preserves_request_id_and_body_snippet() -> TestR
 
     let error = client
         .openapi()
-        .robot("robot-code")
+        .robot("robot-code")?
         .send_group_text("open-cid", "hello")
         .await
         .err()
@@ -572,7 +572,7 @@ async fn openapi_http_error_uses_body_request_id_when_header_is_missing() -> Tes
 
     let error = client
         .openapi()
-        .robot("robot-code")
+        .robot("robot-code")?
         .send_group_text("open-cid", "hello")
         .await
         .err()

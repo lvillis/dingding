@@ -104,10 +104,24 @@ fn expand_handler(
     let fn_ident = &input.sig.ident;
     let vis = &input.vis;
     let arg_count = input.sig.inputs.len();
-    let call = match arg_count {
-        0 => quote! { #fn_ident().await },
-        1 => quote! { #fn_ident(ctx).await },
-        2 => quote! { #fn_ident(ctx, event).await },
+    let handler_tokens = match arg_count {
+        0 => quote! {
+            .handle(|_ctx, _event| async move {
+                #fn_ident().await
+            })
+        },
+        1 => quote! {
+            .handle(|ctx, _event| async move {
+                let ctx = #ctx_tokens;
+                #fn_ident(ctx).await
+            })
+        },
+        2 => quote! {
+            .handle(|ctx, event| async move {
+                let ctx = #ctx_tokens;
+                #fn_ident(ctx, event).await
+            })
+        },
         _ => {
             return Err(syn::Error::new_spanned(
                 &input.sig.inputs,
@@ -137,10 +151,7 @@ fn expand_handler(
             #crate_path::bot::Route::new(#scope_tokens)
                 .message_type(#message_tokens)
                 #command_tokens
-                .handle(|ctx, event| async move {
-                    let ctx = #ctx_tokens;
-                    #call
-                })
+                #handler_tokens
         }
     })
 }
@@ -243,32 +254,40 @@ fn set_command_config(
 }
 
 fn scope_filter(expr: &Expr) -> syn::Result<&'static str> {
-    match value_name(expr)?.as_str() {
-        "any" | "Any" => Ok("any"),
-        "group" | "Group" => Ok("group"),
-        "private" | "Private" | "single" | "Single" | "oto" | "Oto" => Ok("private"),
+    match normalized_filter_value(&value_name(expr)?).as_str() {
+        "any" => Ok("any"),
+        "group" => Ok("group"),
+        "private" | "single" | "oto" => Ok("private"),
         _ => Err(syn::Error::new_spanned(
             expr,
-            "scope must be one of: Scope::Any, Scope::Group, Scope::Private",
+            "scope must be one of: any, group, private",
         )),
     }
 }
 
 fn message_filter(expr: &Expr) -> syn::Result<&'static str> {
-    match value_name(expr)?.as_str() {
-        "any" | "Any" => Ok("any"),
-        "text" | "Text" => Ok("text"),
-        "markdown" | "Markdown" => Ok("markdown"),
-        "audio" | "Audio" => Ok("audio"),
-        "picture" | "Picture" => Ok("picture"),
-        "video" | "Video" => Ok("video"),
-        "file" | "File" => Ok("file"),
-        "richText" | "rich_text" | "RichText" => Ok("richText"),
+    match normalized_filter_value(&value_name(expr)?).as_str() {
+        "any" => Ok("any"),
+        "text" => Ok("text"),
+        "markdown" => Ok("markdown"),
+        "audio" | "voice" => Ok("audio"),
+        "picture" | "image" => Ok("picture"),
+        "video" => Ok("video"),
+        "file" => Ok("file"),
+        "richtext" => Ok("richText"),
         _ => Err(syn::Error::new_spanned(
             expr,
-            "msg must be one of: Msg::Any, Msg::Text, Msg::Markdown, Msg::Audio, Msg::Picture, Msg::Video, Msg::File, Msg::RichText",
+            "msg must be one of: any, text, markdown, audio, picture, video, file, richText",
         )),
     }
+}
+
+fn normalized_filter_value(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !matches!(ch, '-' | '_'))
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn dingding_crate_path() -> proc_macro2::TokenStream {

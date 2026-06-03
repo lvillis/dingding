@@ -20,9 +20,9 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "hello from dingding webhook robot".to_string());
 
     let ding = DingTalk::new()?;
-    let mut webhook = ding.webhook(access_token);
+    let mut webhook = ding.webhook(access_token)?;
     if let Some(secret) = optional_env(SECRET_ENV) {
-        webhook = webhook.signing_secret(secret);
+        webhook = webhook.signing_secret(secret)?;
     }
 
     let response = if let Some(title) = optional_env(MARKDOWN_TITLE_ENV) {

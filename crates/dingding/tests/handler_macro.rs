@@ -19,6 +19,8 @@ static STRING_HIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static PASCAL_IDENT_HIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static ALIASES_HIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static ALIASES_PATH_HIT_COUNT: AtomicUsize = AtomicUsize::new(0);
+static ZERO_ARG_HIT_COUNT: AtomicUsize = AtomicUsize::new(0);
+static MESSAGE_ALIAS_HIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[dingding::handler(scope = Scope::Any, msg = Msg::Text, command = PING)]
 async fn ping_path(_ctx: AnyContext) -> Result<()> {
@@ -57,6 +59,24 @@ async fn ping_aliases_path(ctx: AnyContext) -> Result<()> {
     assert_eq!(ctx.command(), Some("/ping"));
     assert_eq!(ctx.args(), Some("api"));
     ALIASES_PATH_HIT_COUNT.fetch_add(1, Ordering::SeqCst);
+    Ok(())
+}
+
+#[dingding::handler(scope = any, msg = text, command = "/ping")]
+async fn ping_zero_arg() -> Result<()> {
+    ZERO_ARG_HIT_COUNT.fetch_add(1, Ordering::SeqCst);
+    Ok(())
+}
+
+#[dingding::handler(scope = any, msg = image)]
+async fn image_alias(_ctx: AnyContext) -> Result<()> {
+    MESSAGE_ALIAS_HIT_COUNT.fetch_add(1, Ordering::SeqCst);
+    Ok(())
+}
+
+#[dingding::handler(scope = any, msg = voice)]
+async fn voice_alias(_ctx: AnyContext) -> Result<()> {
+    MESSAGE_ALIAS_HIT_COUNT.fetch_add(1, Ordering::SeqCst);
     Ok(())
 }
 
@@ -148,4 +168,49 @@ async fn handler_macro_accepts_command_alias_path() {
 
     assert_eq!(outcome, HandleOutcome::Matched);
     assert_eq!(ALIASES_PATH_HIT_COUNT.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn handler_macro_accepts_zero_arg_handlers() {
+    ZERO_ARG_HIT_COUNT.store(0, Ordering::SeqCst);
+
+    let client = DingTalk::builder().build().expect("client");
+    let bot = Bot::new(client).route(ping_zero_arg_route());
+    let outcome = bot
+        .handle_event(BotEvent::text(ConversationScope::Private, "/ping"))
+        .await
+        .expect("handler should run");
+
+    assert_eq!(outcome, HandleOutcome::Matched);
+    assert_eq!(ZERO_ARG_HIT_COUNT.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn handler_macro_accepts_dingtalk_message_aliases() {
+    MESSAGE_ALIAS_HIT_COUNT.store(0, Ordering::SeqCst);
+
+    let client = DingTalk::builder().build().expect("client");
+    let bot = Bot::new(client)
+        .route(image_alias_route())
+        .route(voice_alias_route());
+    let image = bot
+        .handle_event(BotEvent::from_value(serde_json::json!({
+            "conversationType": "2",
+            "msgtype": "image",
+            "content": { "downloadCode": "image-code" }
+        })))
+        .await
+        .expect("image alias handler should run");
+    let voice = bot
+        .handle_event(BotEvent::from_value(serde_json::json!({
+            "conversationType": "2",
+            "msgtype": "voice",
+            "content": { "downloadCode": "voice-code" }
+        })))
+        .await
+        .expect("voice alias handler should run");
+
+    assert_eq!(image, HandleOutcome::Matched);
+    assert_eq!(voice, HandleOutcome::Matched);
+    assert_eq!(MESSAGE_ALIAS_HIT_COUNT.load(Ordering::SeqCst), 2);
 }
