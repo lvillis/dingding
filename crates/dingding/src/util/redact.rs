@@ -8,11 +8,48 @@ const SENSITIVE_KEYS: &[&str] = &[
     "authorization",
     "clientSecret",
     "client_secret",
+    "conversationId",
+    "conversation_id",
     "cookie",
+    "corpId",
+    "corp_id",
+    "dingtalkId",
+    "dingtalk_id",
+    "downloadCode",
+    "download_code",
+    "fileId",
+    "file_id",
+    "mediaId",
+    "media_id",
+    "msgId",
+    "msg_id",
+    "openConversationId",
+    "open_conversation_id",
+    "operatorUnionId",
+    "operatorUserId",
     "passwd",
     "password",
+    "pictureDownloadCode",
+    "picture_download_code",
     "secret",
+    "senderId",
+    "senderStaffId",
+    "sender_id",
+    "sender_staff_id",
+    "sessionWebhook",
+    "session_webhook",
+    "sign",
+    "signature",
+    "spaceId",
+    "space_id",
+    "staffId",
+    "staff_id",
+    "ticket",
     "token",
+    "unionId",
+    "union_id",
+    "userId",
+    "user_id",
     "x-acs-dingtalk-access-token",
 ];
 
@@ -236,6 +273,54 @@ mod tests {
         assert!(!redacted.contains("abc"));
         assert!(!redacted.contains("def"));
         assert!(!redacted.contains("ghi"));
+    }
+
+    #[test]
+    fn redact_text_redacts_temporary_stream_and_webhook_credentials() {
+        let redacted = redact_text(
+            r#"{"ticket":"stream-ticket","downloadCode":"file-code","pictureDownloadCode":"picture-code","media_id":"media-secret","fileId":"file-secret","spaceId":"space-secret","sessionWebhook":"https://example.test/webhook?token=session-token","sign":"webhook-sign","signature":"callback-sign","corpId":"corp-secret","userId":"user-secret","unionId":"union-secret","operatorUserId":"operator-user-secret","operatorUnionId":"operator-union-secret","senderId":"sender-secret","senderStaffId":"sender-staff-secret","staffId":"staff-secret","dingtalkId":"dingtalk-secret","openConversationId":"conversation-secret","msgId":"message-secret"}"#,
+        );
+
+        assert!(redacted.contains(r#""ticket":"<redacted>""#));
+        assert!(redacted.contains(r#""downloadCode":"<redacted>""#));
+        assert!(redacted.contains(r#""pictureDownloadCode":"<redacted>""#));
+        assert!(redacted.contains(r#""media_id":"<redacted>""#));
+        assert!(redacted.contains(r#""fileId":"<redacted>""#));
+        assert!(redacted.contains(r#""spaceId":"<redacted>""#));
+        assert!(redacted.contains(r#""sessionWebhook":"<redacted>""#));
+        assert!(redacted.contains(r#""sign":"<redacted>""#));
+        assert!(redacted.contains(r#""signature":"<redacted>""#));
+        assert!(redacted.contains(r#""corpId":"<redacted>""#));
+        assert!(redacted.contains(r#""userId":"<redacted>""#));
+        assert!(redacted.contains(r#""unionId":"<redacted>""#));
+        assert!(redacted.contains(r#""operatorUserId":"<redacted>""#));
+        assert!(redacted.contains(r#""operatorUnionId":"<redacted>""#));
+        assert!(redacted.contains(r#""senderId":"<redacted>""#));
+        assert!(redacted.contains(r#""senderStaffId":"<redacted>""#));
+        assert!(redacted.contains(r#""staffId":"<redacted>""#));
+        assert!(redacted.contains(r#""dingtalkId":"<redacted>""#));
+        assert!(redacted.contains(r#""openConversationId":"<redacted>""#));
+        assert!(redacted.contains(r#""msgId":"<redacted>""#));
+        assert!(!redacted.contains("stream-ticket"));
+        assert!(!redacted.contains("file-code"));
+        assert!(!redacted.contains("picture-code"));
+        assert!(!redacted.contains("media-secret"));
+        assert!(!redacted.contains("file-secret"));
+        assert!(!redacted.contains("space-secret"));
+        assert!(!redacted.contains("session-token"));
+        assert!(!redacted.contains("webhook-sign"));
+        assert!(!redacted.contains("callback-sign"));
+        assert!(!redacted.contains("corp-secret"));
+        assert!(!redacted.contains("user-secret"));
+        assert!(!redacted.contains("union-secret"));
+        assert!(!redacted.contains("operator-user-secret"));
+        assert!(!redacted.contains("operator-union-secret"));
+        assert!(!redacted.contains("sender-secret"));
+        assert!(!redacted.contains("sender-staff-secret"));
+        assert!(!redacted.contains("staff-secret"));
+        assert!(!redacted.contains("dingtalk-secret"));
+        assert!(!redacted.contains("conversation-secret"));
+        assert!(!redacted.contains("message-secret"));
     }
 
     #[test]

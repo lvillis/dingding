@@ -14,7 +14,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use serde_json::Value;
 use sha2::Sha256;
 
-use crate::{DingTalk, Error, Result};
+use crate::{DingTalk, Error, Result, util::redact::redact_text};
 
 type BoxFuture = Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
 type BoxedHandler = Arc<dyn Fn(BotContext, BotEvent) -> BoxFuture + Send + Sync + 'static>;
@@ -239,14 +239,34 @@ pub use ConversationScope as Scope;
 pub use MessageType as Msg;
 
 /// Incoming text message.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TextMessage {
     /// Message content.
     pub content: String,
 }
 
+impl fmt::Debug for TextMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TextMessage")
+            .field("content", &redact_text(&self.content))
+            .finish()
+    }
+}
+
+fn redacted_optional_value(value: &Option<String>) -> Option<&'static str> {
+    value.as_ref().map(|_value| "<redacted>")
+}
+
+fn redacted_optional_text(value: &Option<String>) -> Option<String> {
+    value.as_deref().map(redact_text)
+}
+
+fn redacted_json_value(value: &Value) -> String {
+    redact_text(&value.to_string())
+}
+
 /// Normalized incoming message payload.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum IncomingMessage {
     /// Text message.
     Text(TextMessage),
@@ -269,6 +289,33 @@ pub enum IncomingMessage {
         /// Raw message content when supplied.
         content: Option<Value>,
     },
+}
+
+impl fmt::Debug for IncomingMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text(message) => f.debug_tuple("Text").field(message).finish(),
+            Self::Markdown(content) => f
+                .debug_tuple("Markdown")
+                .field(&redacted_json_value(content))
+                .finish(),
+            Self::Audio(message) => f.debug_tuple("Audio").field(message).finish(),
+            Self::Picture(message) => f.debug_tuple("Picture").field(message).finish(),
+            Self::Video(message) => f.debug_tuple("Video").field(message).finish(),
+            Self::File(message) => f.debug_tuple("File").field(message).finish(),
+            Self::RichText(message) => f.debug_tuple("RichText").field(message).finish(),
+            Self::Unknown {
+                message_type,
+                content,
+            } => {
+                let content = content.as_ref().map(redacted_json_value);
+                f.debug_struct("Unknown")
+                    .field("message_type", message_type)
+                    .field("content", &content)
+                    .finish()
+            }
+        }
+    }
 }
 
 impl IncomingMessage {
@@ -384,7 +431,7 @@ impl IncomingMessage {
 }
 
 /// Incoming audio message.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AudioMessage {
     /// Download code for fetching the audio file.
     pub download_code: Option<String>,
@@ -392,6 +439,19 @@ pub struct AudioMessage {
     pub recognition: Option<String>,
     /// Audio duration in milliseconds when supplied.
     pub duration_millis: Option<u64>,
+}
+
+impl fmt::Debug for AudioMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AudioMessage")
+            .field(
+                "download_code",
+                &redacted_optional_value(&self.download_code),
+            )
+            .field("recognition", &redacted_optional_text(&self.recognition))
+            .field("duration_millis", &self.duration_millis)
+            .finish()
+    }
 }
 
 impl AudioMessage {
@@ -405,12 +465,27 @@ impl AudioMessage {
 }
 
 /// Incoming picture message.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PictureMessage {
     /// Download code for fetching the picture.
     pub download_code: Option<String>,
     /// Picture-specific download code when supplied.
     pub picture_download_code: Option<String>,
+}
+
+impl fmt::Debug for PictureMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PictureMessage")
+            .field(
+                "download_code",
+                &redacted_optional_value(&self.download_code),
+            )
+            .field(
+                "picture_download_code",
+                &redacted_optional_value(&self.picture_download_code),
+            )
+            .finish()
+    }
 }
 
 impl PictureMessage {
@@ -423,7 +498,7 @@ impl PictureMessage {
 }
 
 /// Incoming video message.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct VideoMessage {
     /// Download code for fetching the video.
     pub download_code: Option<String>,
@@ -431,6 +506,19 @@ pub struct VideoMessage {
     pub video_type: Option<String>,
     /// Video duration in milliseconds when supplied.
     pub duration_millis: Option<u64>,
+}
+
+impl fmt::Debug for VideoMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VideoMessage")
+            .field(
+                "download_code",
+                &redacted_optional_value(&self.download_code),
+            )
+            .field("video_type", &self.video_type)
+            .field("duration_millis", &self.duration_millis)
+            .finish()
+    }
 }
 
 impl VideoMessage {
@@ -444,7 +532,7 @@ impl VideoMessage {
 }
 
 /// Incoming file message.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct FileMessage {
     /// Download code for fetching the file.
     pub download_code: Option<String>,
@@ -454,6 +542,20 @@ pub struct FileMessage {
     pub file_id: Option<String>,
     /// DingTalk space id when supplied.
     pub space_id: Option<String>,
+}
+
+impl fmt::Debug for FileMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FileMessage")
+            .field(
+                "download_code",
+                &redacted_optional_value(&self.download_code),
+            )
+            .field("file_name", &redacted_optional_text(&self.file_name))
+            .field("file_id", &redacted_optional_value(&self.file_id))
+            .field("space_id", &redacted_optional_value(&self.space_id))
+            .finish()
+    }
 }
 
 impl FileMessage {
@@ -487,7 +589,7 @@ impl RichTextMessage {
 }
 
 /// Rich-text item.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum RichTextItem {
     /// Text part.
     Text {
@@ -506,6 +608,32 @@ pub enum RichTextItem {
         /// Item type when supplied.
         item_type: Option<String>,
     },
+}
+
+impl fmt::Debug for RichTextItem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text { text } => f
+                .debug_struct("Text")
+                .field("text", &redact_text(text))
+                .finish(),
+            Self::Picture {
+                download_code,
+                picture_download_code,
+            } => f
+                .debug_struct("Picture")
+                .field("download_code", &redacted_optional_value(download_code))
+                .field(
+                    "picture_download_code",
+                    &redacted_optional_value(picture_download_code),
+                )
+                .finish(),
+            Self::Unknown { item_type } => f
+                .debug_struct("Unknown")
+                .field("item_type", item_type)
+                .finish(),
+        }
+    }
 }
 
 impl RichTextItem {
@@ -689,7 +817,7 @@ fn string_or_stringified_text_content(value: &str) -> Option<String> {
 }
 
 /// Normalized incoming robot event.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BotEvent {
     /// DingTalk message id when supplied.
     pub message_id: Option<String>,
@@ -725,6 +853,42 @@ pub struct BotEvent {
     pub at_users: Vec<AtUser>,
     /// Original JSON payload.
     pub raw: Value,
+}
+
+impl fmt::Debug for BotEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let session_webhook = self.session_webhook.as_deref().map(redact_text);
+        let open_conversation_id = redacted_optional_value(&self.open_conversation_id);
+        let sender_id = redacted_optional_value(&self.sender_id);
+        let sender_staff_id = redacted_optional_value(&self.sender_staff_id);
+        let sender_nick = self.sender_nick.as_deref().map(redact_text);
+        let conversation_title = self.conversation_title.as_deref().map(redact_text);
+        let content = self.content.as_ref().map(redacted_json_value);
+        let raw = redacted_json_value(&self.raw);
+
+        f.debug_struct("BotEvent")
+            .field("message_id", &self.message_id)
+            .field("conversation_scope", &self.conversation_scope)
+            .field("message_type", &self.message_type)
+            .field("text", &self.text)
+            .field("content", &content)
+            .field("message", &self.message)
+            .field("session_webhook", &session_webhook)
+            .field("open_conversation_id", &open_conversation_id)
+            .field("sender_id", &sender_id)
+            .field("sender_staff_id", &sender_staff_id)
+            .field("sender_nick", &sender_nick)
+            .field("conversation_title", &conversation_title)
+            .field("is_admin", &self.is_admin)
+            .field("is_in_at_list", &self.is_in_at_list)
+            .field(
+                "session_webhook_expires_at_millis",
+                &self.session_webhook_expires_at_millis,
+            )
+            .field("at_users", &self.at_users)
+            .field("raw", &raw)
+            .finish()
+    }
 }
 
 impl BotEvent {
@@ -814,12 +978,21 @@ impl BotEvent {
 }
 
 /// User mentioned in an incoming bot message.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AtUser {
     /// DingTalk id when supplied.
     pub dingtalk_id: Option<String>,
     /// Staff user id when supplied.
     pub staff_id: Option<String>,
+}
+
+impl fmt::Debug for AtUser {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AtUser")
+            .field("has_dingtalk_id", &self.dingtalk_id.is_some())
+            .field("has_staff_id", &self.staff_id.is_some())
+            .finish()
+    }
 }
 
 impl AtUser {
@@ -835,10 +1008,19 @@ impl AtUser {
 }
 
 /// Verifies DingTalk robot callback signatures.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CallbackVerifier {
     app_secret: String,
     max_clock_skew: Duration,
+}
+
+impl fmt::Debug for CallbackVerifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CallbackVerifier")
+            .field("app_secret", &"<redacted>")
+            .field("max_clock_skew", &self.max_clock_skew)
+            .finish()
+    }
 }
 
 impl CallbackVerifier {
@@ -933,12 +1115,21 @@ fn validate_callback_secret(value: &str) -> Result<()> {
 }
 
 /// DingTalk callback header values.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct CallbackHeaders {
     /// DingTalk `timestamp` header.
     pub timestamp: Option<String>,
     /// DingTalk `sign` header.
     pub sign: Option<String>,
+}
+
+impl fmt::Debug for CallbackHeaders {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CallbackHeaders")
+            .field("timestamp", &self.timestamp)
+            .field("sign", &redacted_optional_value(&self.sign))
+            .finish()
+    }
 }
 
 impl CallbackHeaders {
@@ -961,12 +1152,21 @@ impl CallbackHeaders {
 }
 
 /// DingTalk callback request parts independent of any HTTP framework.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CallbackRequest<B> {
     /// Callback headers.
     pub headers: CallbackHeaders,
     /// Raw request body.
     pub body: B,
+}
+
+impl<B> fmt::Debug for CallbackRequest<B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CallbackRequest")
+            .field("headers", &self.headers)
+            .field("body", &"<redacted>")
+            .finish()
+    }
 }
 
 impl<B> CallbackRequest<B> {
@@ -1350,12 +1550,13 @@ impl<S> BotContext<S> {
     #[cfg(feature = "webhook")]
     #[must_use]
     pub fn sender_mention(&self) -> crate::webhook::At {
-        if let Some(staff_id) = self
-            .sender_staff_id()
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-        {
-            crate::webhook::At::new().user_id(staff_id)
+        let Some(staff_id) = self.sender_staff_id() else {
+            return crate::webhook::At::new();
+        };
+
+        let at = crate::webhook::At::new().user_id(staff_id);
+        if at.validate().is_ok() {
+            at
         } else {
             crate::webhook::At::new()
         }
@@ -2229,6 +2430,72 @@ mod tests {
         assert!(BotAck::Ok.is_ok());
     }
 
+    #[test]
+    fn callback_verifier_debug_redacts_app_secret() {
+        let verifier = CallbackVerifier::new("callback-secret").expect("verifier");
+        let debug = format!("{verifier:?}");
+
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("callback-secret"));
+    }
+
+    #[test]
+    fn bot_event_debug_redacts_temporary_credentials() {
+        let event = BotEvent::from_value(serde_json::json!({
+            "msgId": "message-secret",
+            "conversationType": "2",
+            "msgtype": "file",
+            "openConversationId": "conversation-secret",
+            "senderId": "sender-secret",
+            "senderStaffId": "staff-secret",
+            "senderNick": "Alice token=nick-secret",
+            "conversationTitle": "Ops token=title-secret",
+            "sessionWebhook": "https://oapi.dingtalk.com/robot/sendBySession?token=session-token",
+            "atUsers": [
+                {
+                    "dingtalkId": "dingtalk-secret",
+                    "staffId": "at-staff-secret"
+                }
+            ],
+            "content": {
+                "downloadCode": "download-code",
+                "fileId": "file-secret"
+            }
+        }));
+        let debug = format!("{event:?}");
+
+        assert!(debug.contains("sessionWebhook"));
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("has_dingtalk_id"));
+        assert!(debug.contains("has_staff_id"));
+        assert!(debug.contains("message-secret"));
+        assert!(!debug.contains("session-token"));
+        assert!(!debug.contains("download-code"));
+        assert!(!debug.contains("conversation-secret"));
+        assert!(!debug.contains("sender-secret"));
+        assert!(!debug.contains("staff-secret"));
+        assert!(!debug.contains("nick-secret"));
+        assert!(!debug.contains("title-secret"));
+        assert!(!debug.contains("dingtalk-secret"));
+        assert!(!debug.contains("at-staff-secret"));
+        assert!(!debug.contains("file-secret"));
+    }
+
+    #[test]
+    fn callback_request_debug_redacts_sign_and_body() {
+        let request = CallbackRequest::new(
+            CallbackHeaders::new(Some("1700000000000"), Some("callback-sign")),
+            r#"{"sessionWebhook":"https://example.test/hook?token=body-token"}"#,
+        );
+        let debug = format!("{request:?}");
+
+        assert!(debug.contains("1700000000000"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("callback-sign"));
+        assert!(!debug.contains("body-token"));
+        assert!(!debug.contains("sessionWebhook"));
+    }
+
     #[tokio::test]
     async fn routes_group_text_command() {
         let client = DingTalk::builder().build().expect("client");
@@ -2774,6 +3041,17 @@ mod tests {
             seen.lock().expect("mention lock").as_ref(),
             Some(&(vec!["sender-1".to_string()], vec!["staff-1".to_string()]))
         );
+    }
+
+    #[test]
+    fn sender_mention_skips_invalid_staff_id() {
+        let client = DingTalk::builder().build().expect("client");
+        let event = BotEvent::from_value(serde_json::json!({
+            "senderStaffId": "sender 1"
+        }));
+        let ctx: BotContext = BotContext::new(client, event, None, None);
+
+        assert!(ctx.sender_mention().is_empty());
     }
 
     #[tokio::test]

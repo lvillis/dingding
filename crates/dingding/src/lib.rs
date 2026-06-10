@@ -11,6 +11,8 @@
 //! - `bot` routes incoming robot events when the `bot` feature is enabled.
 //! - `stream` runs enterprise application robots over DingTalk Stream when the `stream` feature is enabled.
 
+extern crate self as dingding;
+
 #[cfg(not(any(
     feature = "async-tls-rustls-ring",
     feature = "async-tls-rustls-aws-lc-rs",

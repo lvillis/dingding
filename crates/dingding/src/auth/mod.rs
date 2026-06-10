@@ -128,7 +128,6 @@ struct EnvCredentialNames {
     app_secret: &'static str,
 }
 
-#[derive(Debug)]
 struct EnvCredentialValues {
     app_key: Option<String>,
     app_secret: Option<String>,
@@ -195,10 +194,21 @@ impl fmt::Debug for AppCredentials {
 
 /// In-memory access token cache.
 #[cfg(feature = "openapi")]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MemoryTokenCache {
     inner: Arc<RwLock<HashMap<AppCredentials, CachedToken>>>,
     refresh_margin: Duration,
+}
+
+#[cfg(feature = "openapi")]
+impl fmt::Debug for MemoryTokenCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let entry_count = self.inner.read().map(|guard| guard.len()).ok();
+        f.debug_struct("MemoryTokenCache")
+            .field("entry_count", &entry_count)
+            .field("refresh_margin", &self.refresh_margin)
+            .finish()
+    }
 }
 
 #[cfg(feature = "openapi")]
@@ -253,7 +263,7 @@ impl MemoryTokenCache {
 }
 
 #[cfg(feature = "openapi")]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct CachedToken {
     token: String,
     expires_at: Instant,
@@ -303,6 +313,20 @@ mod tests {
         cache.store(credentials.clone(), "token".to_string(), Some(0));
 
         assert_eq!(cache.get(&credentials), None);
+    }
+
+    #[cfg(feature = "openapi")]
+    #[test]
+    fn token_cache_debug_does_not_dump_credentials_or_tokens() {
+        let credentials = AppCredentials::new("app-key", "app-secret");
+        let cache = MemoryTokenCache::new();
+
+        cache.store(credentials, "access-token".to_string(), Some(7200));
+
+        let debug = format!("{cache:?}");
+        assert!(debug.contains("entry_count"));
+        assert!(!debug.contains("app-secret"));
+        assert!(!debug.contains("access-token"));
     }
 
     #[test]

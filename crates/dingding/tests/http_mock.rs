@@ -171,6 +171,34 @@ async fn webhook_robot_rejects_modern_code_error_even_with_zero_errcode() -> Tes
 }
 
 #[tokio::test]
+async fn webhook_robot_rejects_success_false_response() -> TestResult<()> {
+    let server = MockServer::spawn([MockResponse::json(
+        r#"{"errcode":0,"success":false,"errmsg":"denied","requestId":"req-webhook"}"#,
+    )])?;
+    let client = DingTalk::builder()
+        .webhook_base_url(server.base_url())
+        .system_proxy(false)
+        .build()?;
+
+    let error = client
+        .webhook("webhook-token")?
+        .send_text("hello")
+        .await
+        .err()
+        .ok_or("success=false response should fail")?;
+
+    assert_eq!(error.kind(), ErrorKind::Api);
+    assert_eq!(error.errcode(), Some(-1));
+    assert_eq!(error.request_id(), Some("req-webhook"));
+    assert!(error.to_string().contains("denied"));
+
+    let request = server.next_request()?;
+    assert_eq!(request.path(), "/robot/send");
+
+    server.finish()
+}
+
+#[tokio::test]
 async fn openapi_group_message_fetches_token_and_posts_with_access_token_header() -> TestResult<()>
 {
     let server = MockServer::spawn([
@@ -258,6 +286,40 @@ async fn openapi_robot_message_rejects_missing_process_query_key() -> TestResult
 }
 
 #[tokio::test]
+async fn openapi_raw_send_rejects_success_false_response() -> TestResult<()> {
+    let server = MockServer::spawn([
+        MockResponse::json(
+            r#"{"errcode":0,"errmsg":"ok","access_token":"token-123","expires_in":7200}"#,
+        ),
+        MockResponse::json(
+            r#"{"success":false,"errorMessage":"denied","requestId":"req-success-false","result":{"processQueryKey":"pq-123"}}"#,
+        ),
+    ])?;
+    let client = dingtalk_for_mock(&server)?;
+
+    let error = client
+        .openapi()
+        .robot("robot-code")?
+        .send_group_text("open-cid", "hello")
+        .await
+        .err()
+        .ok_or("success=false standard response should fail")?;
+
+    assert_eq!(error.kind(), ErrorKind::Api);
+    assert_eq!(error.errcode(), Some(-1));
+    assert_eq!(error.request_id(), Some("req-success-false"));
+    assert!(error.to_string().contains("denied"));
+
+    let token_request = server.next_request()?;
+    assert_eq!(token_request.path(), "/gettoken");
+
+    let send_request = server.next_request()?;
+    assert_eq!(send_request.path(), "/v1.0/robot/groupMessages/send");
+
+    server.finish()
+}
+
+#[tokio::test]
 async fn openapi_rejects_blank_access_token() -> TestResult<()> {
     let server = MockServer::spawn([MockResponse::json(
         r#"{"errcode":0,"access_token":"  ","expires_in":7200,"requestId":"req-token"}"#,
@@ -278,6 +340,31 @@ async fn openapi_rejects_blank_access_token() -> TestResult<()> {
             .error_body_snippet()
             .is_some_and(|snippet| snippet.contains("access_token"))
     );
+
+    let token_request = server.next_request()?;
+    assert_eq!(token_request.path(), "/gettoken");
+
+    server.finish()
+}
+
+#[tokio::test]
+async fn openapi_access_token_rejects_success_false_response() -> TestResult<()> {
+    let server = MockServer::spawn([MockResponse::json(
+        r#"{"errcode":0,"success":false,"errorMessage":"denied","access_token":"token-123","expires_in":7200,"requestId":"req-token-false"}"#,
+    )])?;
+    let client = dingtalk_for_mock(&server)?;
+
+    let error = client
+        .openapi()
+        .access_token()
+        .await
+        .err()
+        .ok_or("success=false token response should fail")?;
+
+    assert_eq!(error.kind(), ErrorKind::Api);
+    assert_eq!(error.errcode(), Some(-1));
+    assert_eq!(error.request_id(), Some("req-token-false"));
+    assert!(error.to_string().contains("denied"));
 
     let token_request = server.next_request()?;
     assert_eq!(token_request.path(), "/gettoken");
@@ -328,6 +415,40 @@ async fn openapi_result_allows_result_without_errcode() -> TestResult<()> {
         .await?;
 
     assert_eq!(result, json!({ "accepted": true }));
+
+    let token_request = server.next_request()?;
+    assert_eq!(token_request.path(), "/gettoken");
+
+    let api_request = server.next_request()?;
+    assert_eq!(api_request.method, "POST");
+    assert_eq!(api_request.path(), "/v1.0/custom/endpoint");
+
+    server.finish()
+}
+
+#[tokio::test]
+async fn openapi_result_rejects_success_false_response() -> TestResult<()> {
+    let server = MockServer::spawn([
+        MockResponse::json(
+            r#"{"errcode":0,"errmsg":"ok","access_token":"token-123","expires_in":7200}"#,
+        ),
+        MockResponse::json(
+            r#"{"success":false,"message":"denied","requestId":"req-result-false","result":{"accepted":true}}"#,
+        ),
+    ])?;
+    let client = dingtalk_for_mock(&server)?;
+
+    let error = client
+        .openapi()
+        .post_json_result::<Value, _>(&["v1.0", "custom", "endpoint"], &json!({ "ping": true }))
+        .await
+        .err()
+        .ok_or("success=false result response should fail")?;
+
+    assert_eq!(error.kind(), ErrorKind::Api);
+    assert_eq!(error.errcode(), Some(-1));
+    assert_eq!(error.request_id(), Some("req-result-false"));
+    assert!(error.to_string().contains("denied"));
 
     let token_request = server.next_request()?;
     assert_eq!(token_request.path(), "/gettoken");
@@ -557,6 +678,100 @@ async fn openapi_business_error_preserves_request_id_and_body_snippet() -> TestR
 }
 
 #[tokio::test]
+async fn openapi_upload_media_rejects_success_false_response() -> TestResult<()> {
+    let server = MockServer::spawn([
+        MockResponse::json(
+            r#"{"errcode":0,"errmsg":"ok","access_token":"token-123","expires_in":7200}"#,
+        ),
+        MockResponse::json(
+            r#"{"success":false,"error_message":"denied","requestId":"req-media-false","media_id":"media-123","type":"image"}"#,
+        ),
+    ])?;
+    let client = dingtalk_for_mock(&server)?;
+
+    let error = client
+        .openapi()
+        .upload_media(MediaUpload::image("demo.png", b"image-bytes"))
+        .await
+        .err()
+        .ok_or("success=false media upload should fail")?;
+
+    assert_eq!(error.kind(), ErrorKind::Api);
+    assert_eq!(error.errcode(), Some(-1));
+    assert_eq!(error.request_id(), Some("req-media-false"));
+    assert!(error.to_string().contains("denied"));
+
+    let token_request = server.next_request()?;
+    assert_eq!(token_request.path(), "/gettoken");
+
+    let upload_request = server.next_request()?;
+    assert_eq!(upload_request.path(), "/media/upload");
+
+    server.finish()
+}
+
+#[tokio::test]
+async fn openapi_download_message_file_fetches_temporary_url_bytes() -> TestResult<()> {
+    let download_server = MockServer::spawn([MockResponse::bytes(
+        "application/octet-stream",
+        b"downloaded-file-bytes",
+    )])?;
+    let download_url = format!(
+        "{}/files/report.bin?ticket=temporary",
+        download_server.base_url()
+    );
+    let download_response = json!({
+        "errcode": 0,
+        "result": {
+            "downloadUrl": download_url,
+        },
+        "requestId": "req-download-url",
+    })
+    .to_string();
+    let api_server = MockServer::spawn([
+        MockResponse::json(
+            r#"{"errcode":0,"errmsg":"ok","access_token":"token-123","expires_in":7200}"#,
+        ),
+        MockResponse::json(&download_response),
+    ])?;
+    let client = dingtalk_for_mock(&api_server)?;
+
+    let downloaded = client
+        .openapi()
+        .robot("robot-code")?
+        .download_message_file("download-code")
+        .await?;
+
+    assert_eq!(downloaded.download_url(), download_url);
+    assert_eq!(downloaded.content_type(), Some("application/octet-stream"));
+    assert_eq!(downloaded.bytes(), b"downloaded-file-bytes");
+
+    let token_request = api_server.next_request()?;
+    assert_eq!(token_request.path(), "/gettoken");
+
+    let download_url_request = api_server.next_request()?;
+    assert_eq!(download_url_request.method, "POST");
+    assert_eq!(
+        download_url_request.path(),
+        "/v1.0/robot/messageFiles/download"
+    );
+    let body = download_url_request.json_body()?;
+    assert_eq!(body["robotCode"], "robot-code");
+    assert_eq!(body["downloadCode"], "download-code");
+
+    let file_request = download_server.next_request()?;
+    assert_eq!(file_request.method, "GET");
+    assert_eq!(file_request.path(), "/files/report.bin");
+    assert_eq!(
+        file_request.query_value("ticket").as_deref(),
+        Some("temporary")
+    );
+
+    api_server.finish()?;
+    download_server.finish()
+}
+
+#[tokio::test]
 async fn openapi_http_error_uses_body_request_id_when_header_is_missing() -> TestResult<()> {
     let server = MockServer::spawn([
         MockResponse::json(
@@ -692,6 +907,15 @@ impl MockResponse {
             reason,
             content_type: "application/json",
             body: body.as_bytes().to_vec(),
+        }
+    }
+
+    fn bytes(content_type: &'static str, body: &[u8]) -> Self {
+        Self {
+            status: 200,
+            reason: "OK",
+            content_type,
+            body: body.to_vec(),
         }
     }
 }

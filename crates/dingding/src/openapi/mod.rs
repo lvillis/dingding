@@ -11,7 +11,7 @@ use crate::{
         decode_json_response, is_success_api_code, parse_binary_response, parse_dingtalk_result,
         parse_standard_text_response, response_error_message,
     },
-    util::non_empty_trimmed,
+    util::{non_empty_trimmed, redact::redact_text},
 };
 
 /// Minimal OpenAPI service.
@@ -83,6 +83,16 @@ impl OpenApi {
                 self.client.transport().error_body_snippet(),
             ));
         }
+        if response.success == Some(false) {
+            return Err(api_error_from_body_with_code(
+                -1,
+                response.api_code.clone(),
+                response_error_message(response.errmsg, "DingTalk response success=false"),
+                response.request_id,
+                &body,
+                self.client.transport().error_body_snippet(),
+            ));
+        }
         if let Some(api_code) = response.api_code.as_deref()
             && !is_success_api_code(api_code)
         {
@@ -122,8 +132,8 @@ impl OpenApi {
         T: DeserializeOwned,
         B: Serialize + ?Sized,
     {
-        let access_token = self.access_token().await?;
         let url = self.client.openapi_endpoint(segments)?;
+        let access_token = self.access_token().await?;
         parse_dingtalk_result(
             self.client
                 .transport()
@@ -758,12 +768,23 @@ impl fmt::Display for MediaType {
 }
 
 /// Media upload request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MediaUpload {
     media_type: MediaType,
     file_name: String,
     content_type: Option<String>,
     bytes: Vec<u8>,
+}
+
+impl fmt::Debug for MediaUpload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MediaUpload")
+            .field("media_type", &self.media_type)
+            .field("file_name", &self.file_name)
+            .field("content_type", &self.content_type)
+            .field("byte_len", &self.bytes.len())
+            .finish()
+    }
 }
 
 impl MediaUpload {
@@ -854,12 +875,23 @@ impl MediaUpload {
 }
 
 /// Uploaded DingTalk media resource.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct UploadedMedia {
     media_type: MediaType,
     media_id: String,
     created_at_millis: Option<u64>,
     raw: Value,
+}
+
+impl fmt::Debug for UploadedMedia {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UploadedMedia")
+            .field("media_type", &self.media_type)
+            .field("media_id", &"<redacted>")
+            .field("created_at_millis", &self.created_at_millis)
+            .field("raw", &redacted_json_value(&self.raw))
+            .finish()
+    }
 }
 
 impl UploadedMedia {
@@ -888,10 +920,19 @@ impl UploadedMedia {
 }
 
 /// Temporary download URL for a file received by a robot.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct MessageFileDownload {
     download_url: String,
     raw: Value,
+}
+
+impl fmt::Debug for MessageFileDownload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MessageFileDownload")
+            .field("download_url", &redact_text(&self.download_url))
+            .field("raw", &redacted_json_value(&self.raw))
+            .finish()
+    }
 }
 
 impl MessageFileDownload {
@@ -915,11 +956,21 @@ impl MessageFileDownload {
 }
 
 /// Downloaded bytes for a file received by a robot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DownloadedFile {
     download_url: String,
     content_type: Option<String>,
     bytes: Vec<u8>,
+}
+
+impl fmt::Debug for DownloadedFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DownloadedFile")
+            .field("download_url", &redact_text(&self.download_url))
+            .field("content_type", &self.content_type)
+            .field("byte_len", &self.bytes.len())
+            .finish()
+    }
 }
 
 impl DownloadedFile {
@@ -976,7 +1027,7 @@ impl RobotMessageResponse {
 }
 
 /// Standard interactive card message sent by an application robot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct InteractiveCard {
     card_template_id: String,
     card_biz_id: String,
@@ -988,6 +1039,42 @@ pub struct InteractiveCard {
     union_id_private_data_map_json: Option<String>,
     send_options: InteractiveCardSendOptions,
     pull_strategy: Option<bool>,
+}
+
+impl fmt::Debug for InteractiveCard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let card_data_json = redact_text(&self.card_data_json);
+        let single_chat_receiver = self.single_chat_receiver.as_deref().map(redact_text);
+        let callback_url = self.callback_url.as_deref().map(redact_text);
+        let user_id_private_data_map_json = self
+            .user_id_private_data_map_json
+            .as_deref()
+            .map(redact_text);
+        let union_id_private_data_map_json = self
+            .union_id_private_data_map_json
+            .as_deref()
+            .map(redact_text);
+        let send_options = redact_text(&format!("{:?}", self.send_options));
+
+        f.debug_struct("InteractiveCard")
+            .field("card_template_id", &self.card_template_id)
+            .field("card_biz_id", &self.card_biz_id)
+            .field("card_data_json", &card_data_json)
+            .field("open_conversation_id", &self.open_conversation_id)
+            .field("single_chat_receiver", &single_chat_receiver)
+            .field("callback_url", &callback_url)
+            .field(
+                "user_id_private_data_map_json",
+                &user_id_private_data_map_json,
+            )
+            .field(
+                "union_id_private_data_map_json",
+                &union_id_private_data_map_json,
+            )
+            .field("send_options", &send_options)
+            .field("pull_strategy", &self.pull_strategy)
+            .finish()
+    }
 }
 
 impl InteractiveCard {
@@ -1257,7 +1344,7 @@ impl InteractiveCard {
 }
 
 /// Send options for a standard interactive card.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize)]
 pub struct InteractiveCardSendOptions {
     #[serde(rename = "atUserListJson", skip_serializing_if = "Option::is_none")]
     at_user_list_json: Option<String>,
@@ -1267,6 +1354,20 @@ pub struct InteractiveCardSendOptions {
     receiver_list_json: Option<String>,
     #[serde(rename = "cardPropertyJson", skip_serializing_if = "Option::is_none")]
     card_property_json: Option<String>,
+}
+
+impl fmt::Debug for InteractiveCardSendOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InteractiveCardSendOptions")
+            .field("has_at_user_list", &self.at_user_list_json.is_some())
+            .field("at_all", &self.at_all)
+            .field("has_receiver_list", &self.receiver_list_json.is_some())
+            .field(
+                "card_property_json",
+                &self.card_property_json.as_deref().map(redact_text),
+            )
+            .finish()
+    }
 }
 
 impl InteractiveCardSendOptions {
@@ -1366,13 +1467,41 @@ impl InteractiveCardSendOptions {
 }
 
 /// Standard interactive card update request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct InteractiveCardUpdate {
     card_biz_id: String,
     card_data_json: Option<String>,
     user_id_private_data_map_json: Option<String>,
     union_id_private_data_map_json: Option<String>,
     update_options: InteractiveCardUpdateOptions,
+}
+
+impl fmt::Debug for InteractiveCardUpdate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let card_data_json = self.card_data_json.as_deref().map(redact_text);
+        let user_id_private_data_map_json = self
+            .user_id_private_data_map_json
+            .as_deref()
+            .map(redact_text);
+        let union_id_private_data_map_json = self
+            .union_id_private_data_map_json
+            .as_deref()
+            .map(redact_text);
+
+        f.debug_struct("InteractiveCardUpdate")
+            .field("card_biz_id", &self.card_biz_id)
+            .field("card_data_json", &card_data_json)
+            .field(
+                "user_id_private_data_map_json",
+                &user_id_private_data_map_json,
+            )
+            .field(
+                "union_id_private_data_map_json",
+                &union_id_private_data_map_json,
+            )
+            .field("update_options", &self.update_options)
+            .finish()
+    }
 }
 
 impl InteractiveCardUpdate {
@@ -1576,10 +1705,19 @@ impl InteractiveCardResponse {
 }
 
 /// Button used by robot action-card messages.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RobotActionButton {
     title: String,
     url: String,
+}
+
+impl fmt::Debug for RobotActionButton {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RobotActionButton")
+            .field("title", &redact_text(&self.title))
+            .field("url", &redact_text(&self.url))
+            .finish()
+    }
 }
 
 impl RobotActionButton {
@@ -1621,12 +1759,23 @@ pub enum RobotActionCardLayout {
 }
 
 /// Robot action-card message content.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RobotActionCard {
     title: String,
     text: String,
     buttons: Vec<RobotActionButton>,
     layout: RobotActionCardLayout,
+}
+
+impl fmt::Debug for RobotActionCard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RobotActionCard")
+            .field("title", &redact_text(&self.title))
+            .field("text", &redact_text(&self.text))
+            .field("buttons", &self.buttons)
+            .field("layout", &self.layout)
+            .finish()
+    }
 }
 
 impl RobotActionCard {
@@ -1797,7 +1946,7 @@ impl RobotActionCard {
 }
 
 /// Robot video message content.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RobotVideo {
     video_media_id: String,
     duration_seconds: u64,
@@ -1805,6 +1954,22 @@ pub struct RobotVideo {
     pic_media_id: Option<String>,
     height: Option<u32>,
     width: Option<u32>,
+}
+
+impl fmt::Debug for RobotVideo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RobotVideo")
+            .field("video_media_id", &"<redacted>")
+            .field("duration_seconds", &self.duration_seconds)
+            .field("video_type", &self.video_type)
+            .field(
+                "pic_media_id",
+                &self.pic_media_id.as_ref().map(|_value| "<redacted>"),
+            )
+            .field("height", &self.height)
+            .field("width", &self.width)
+            .finish()
+    }
 }
 
 impl RobotVideo {
@@ -1886,7 +2051,7 @@ impl RobotVideo {
 }
 
 /// Application robot message payload.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum RobotMessage {
     /// Text message.
     Text {
@@ -1949,6 +2114,66 @@ pub enum RobotMessage {
         /// JSON-encoded `msgParam` object.
         msg_param_json: String,
     },
+}
+
+impl fmt::Debug for RobotMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text { content } => f
+                .debug_struct("Text")
+                .field("content", &redact_text(content))
+                .finish(),
+            Self::Markdown { title, text } => f
+                .debug_struct("Markdown")
+                .field("title", &redact_text(title))
+                .field("text", &redact_text(text))
+                .finish(),
+            Self::Link {
+                title,
+                text,
+                message_url,
+                pic_url,
+            } => f
+                .debug_struct("Link")
+                .field("title", &redact_text(title))
+                .field("text", &redact_text(text))
+                .field("message_url", &redact_text(message_url))
+                .field("pic_url", &pic_url.as_deref().map(redact_text))
+                .finish(),
+            Self::Image { photo_url } => f
+                .debug_struct("Image")
+                .field("photo_url", &redact_text(photo_url))
+                .finish(),
+            Self::ActionCard { card } => f.debug_struct("ActionCard").field("card", card).finish(),
+            Self::Audio {
+                media_id,
+                duration_millis,
+            } => f
+                .debug_struct("Audio")
+                .field("media_id", &redact_secret(media_id))
+                .field("duration_millis", duration_millis)
+                .finish(),
+            Self::File {
+                media_id,
+                file_name,
+                file_type,
+            } => f
+                .debug_struct("File")
+                .field("media_id", &redact_secret(media_id))
+                .field("file_name", &file_name)
+                .field("file_type", &file_type)
+                .finish(),
+            Self::Video { video } => f.debug_struct("Video").field("video", video).finish(),
+            Self::Custom {
+                msg_key,
+                msg_param_json,
+            } => f
+                .debug_struct("Custom")
+                .field("msg_key", msg_key)
+                .field("msg_param_json", &redact_text(msg_param_json))
+                .finish(),
+        }
+    }
 }
 
 impl RobotMessage {
@@ -2300,8 +2525,14 @@ fn normalize_private_data_map(field: &'static str, value: Value) -> Result<Strin
         ));
     };
 
-    for key in object.keys() {
+    for (key, value) in object.iter() {
         validate_machine_identifier(key, field)?;
+        if !value.is_object() {
+            return Err(Error::invalid_input(
+                field,
+                "private data values must be JSON objects",
+            ));
+        }
     }
 
     Ok(serde_json::to_string(&Value::Object(object))?)
@@ -2635,6 +2866,16 @@ fn parse_media_upload_response(
             error_body_snippet,
         ));
     }
+    if parsed.success == Some(false) {
+        return Err(api_error_from_body_with_code(
+            -1,
+            parsed.api_code.clone(),
+            response_error_message(parsed.errmsg, "DingTalk response success=false"),
+            parsed.request_id,
+            &body,
+            error_body_snippet,
+        ));
+    }
     if let Some(api_code) = parsed.api_code.as_deref()
         && !is_success_api_code(api_code)
     {
@@ -2795,6 +3036,14 @@ fn response_request_id(value: &Value) -> Option<String> {
         })
 }
 
+fn redacted_json_value(value: &Value) -> String {
+    redact_text(&value.to_string())
+}
+
+fn redact_secret(_value: &str) -> &'static str {
+    "<redacted>"
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -2804,8 +3053,8 @@ impl OpenApi {
     where
         B: Serialize + ?Sized,
     {
-        let access_token = self.access_token().await?;
         let url = self.client.openapi_endpoint(segments)?;
+        let access_token = self.access_token().await?;
         let response = self
             .client
             .transport()
@@ -2818,8 +3067,8 @@ impl OpenApi {
     where
         B: Serialize + ?Sized,
     {
-        let access_token = self.access_token().await?;
         let url = self.client.openapi_endpoint(segments)?;
+        let access_token = self.access_token().await?;
         let response = self
             .client
             .transport()
@@ -2829,7 +3078,7 @@ impl OpenApi {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct AccessTokenResponse {
     #[serde(
         default,
@@ -2846,9 +3095,17 @@ struct AccessTokenResponse {
     #[serde(
         default,
         alias = "message",
+        alias = "errorMessage",
+        alias = "ErrorMessage",
+        alias = "error_message",
         deserialize_with = "crate::transport::deserialize_optional_string"
     )]
     errmsg: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "crate::transport::deserialize_optional_bool"
+    )]
+    success: Option<bool>,
     #[serde(alias = "accessToken")]
     access_token: Option<String>,
     #[serde(alias = "expiresIn", alias = "expireIn")]
@@ -2867,7 +3124,7 @@ struct AccessTokenResponse {
     request_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct RawMediaUploadResponse {
     #[serde(
         default,
@@ -2884,9 +3141,17 @@ struct RawMediaUploadResponse {
     #[serde(
         default,
         alias = "message",
+        alias = "errorMessage",
+        alias = "ErrorMessage",
+        alias = "error_message",
         deserialize_with = "crate::transport::deserialize_optional_string"
     )]
     errmsg: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "crate::transport::deserialize_optional_bool"
+    )]
+    success: Option<bool>,
     #[serde(
         default,
         alias = "requestId",
@@ -3368,6 +3633,33 @@ mod tests {
     }
 
     #[test]
+    fn media_upload_debug_does_not_dump_file_bytes() {
+        let upload = MediaUpload::image("demo.png", b"secret-image-bytes".to_vec())
+            .content_type("image/png");
+        let debug = format!("{upload:?}");
+
+        assert!(debug.contains("byte_len"));
+        assert!(!debug.contains("secret-image-bytes"));
+    }
+
+    #[test]
+    fn uploaded_media_debug_redacts_media_id() {
+        let uploaded = UploadedMedia {
+            media_type: MediaType::Image,
+            media_id: "media-secret".to_string(),
+            created_at_millis: Some(1_700_000_000_000),
+            raw: serde_json::json!({
+                "media_id": "media-secret",
+                "type": "image"
+            }),
+        };
+        let debug = format!("{uploaded:?}");
+
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("media-secret"));
+    }
+
+    #[test]
     fn media_upload_normalizes_custom_media_type_wire_value() {
         let upload = MediaUpload::new(
             MediaType::from_raw(" custom ").expect("media type"),
@@ -3443,16 +3735,44 @@ mod tests {
     #[test]
     fn parses_message_file_download_response() {
         let download = parse_message_file_download_response(
-            r#"{"errcode":0,"result":{"downloadUrl":" https://example.com/file.bin "}}"#,
+            r#"{"errcode":0,"result":{"downloadUrl":" https://example.com/file.bin?ticket=download-ticket "}}"#,
             BodySnippetConfig::default(),
         )
         .expect("download");
 
-        assert_eq!(download.download_url(), "https://example.com/file.bin");
+        assert_eq!(
+            download.download_url(),
+            "https://example.com/file.bin?ticket=download-ticket"
+        );
         assert_eq!(
             download.raw()["result"]["downloadUrl"],
-            " https://example.com/file.bin "
+            " https://example.com/file.bin?ticket=download-ticket "
         );
+    }
+
+    #[test]
+    fn download_types_debug_redacts_temporary_url_and_bytes() {
+        let download = MessageFileDownload {
+            download_url: "https://example.com/file.bin?ticket=download-ticket".to_string(),
+            raw: serde_json::json!({
+                "result": {
+                    "downloadUrl": "https://example.com/file.bin?ticket=download-ticket"
+                }
+            }),
+        };
+        let file = DownloadedFile {
+            download_url: download.download_url().to_string(),
+            content_type: Some("application/octet-stream".to_string()),
+            bytes: b"secret-file-bytes".to_vec(),
+        };
+        let download_debug = format!("{download:?}");
+        let file_debug = format!("{file:?}");
+
+        assert!(download_debug.contains("ticket=<redacted>"));
+        assert!(file_debug.contains("byte_len"));
+        assert!(!download_debug.contains("download-ticket"));
+        assert!(!file_debug.contains("download-ticket"));
+        assert!(!file_debug.contains("secret-file-bytes"));
     }
 
     #[test]
@@ -3515,6 +3835,79 @@ mod tests {
     }
 
     #[test]
+    fn interactive_card_debug_redacts_callback_and_private_data() {
+        let card = InteractiveCard::group(
+            "open-cid",
+            "template-id",
+            "card-biz-id",
+            serde_json::json!({ "title": "Deploy", "token": "card-token" }),
+        )
+        .expect("card")
+        .callback_url("https://example.com/card/callback?token=callback-token")
+        .expect("callback url")
+        .user_private_data(serde_json::json!({
+            "user-1": { "token": "private-token" }
+        }))
+        .expect("private data");
+
+        let debug = format!("{card:?}");
+
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("card-token"));
+        assert!(!debug.contains("callback-token"));
+        assert!(!debug.contains("private-token"));
+    }
+
+    #[test]
+    fn interactive_card_update_debug_redacts_card_and_private_data() {
+        let update = InteractiveCardUpdate::card_data(
+            "card-biz-id",
+            serde_json::json!({ "token": "card-token" }),
+        )
+        .expect("update")
+        .user_private_data(serde_json::json!({
+            "user-1": { "token": "private-token" }
+        }))
+        .expect("private data");
+        let debug = format!("{update:?}");
+
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("card-token"));
+        assert!(!debug.contains("private-token"));
+    }
+
+    #[test]
+    fn robot_message_debug_redacts_urls_media_ids_and_custom_params() {
+        let link = RobotMessage::link_with_image(
+            "docs",
+            "read token=body-token",
+            "https://example.com/docs?token=link-token",
+            "https://example.com/pic.png?token=pic-token",
+        );
+        let action = RobotMessage::single_action_card(
+            "title",
+            "body",
+            "open",
+            "https://example.com/open?token=button-token",
+        );
+        let audio = RobotMessage::audio("media-secret", 1_000);
+        let custom = RobotMessage::custom(
+            "sampleText",
+            serde_json::json!({ "content": "hello", "token": "param-token" }),
+        )
+        .expect("custom");
+        let debug = format!("{link:?} {action:?} {audio:?} {custom:?}");
+
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("body-token"));
+        assert!(!debug.contains("link-token"));
+        assert!(!debug.contains("pic-token"));
+        assert!(!debug.contains("button-token"));
+        assert!(!debug.contains("media-secret"));
+        assert!(!debug.contains("param-token"));
+    }
+
+    #[test]
     fn interactive_card_user_lists_reject_empty_inputs() {
         let card = InteractiveCard::group(
             "open-cid",
@@ -3552,6 +3945,25 @@ mod tests {
 
         assert_eq!(value["atUserListJson"], r#"["user-1","user-2"]"#);
         assert_eq!(value["receiverListJson"], r#"["user-1"]"#);
+    }
+
+    #[test]
+    fn interactive_card_send_options_debug_redacts_receivers_and_properties() {
+        let options = InteractiveCardSendOptions::new()
+            .at_users(["at-user-secret"])
+            .expect("at users")
+            .receiver_users(["receiver-secret"])
+            .expect("receivers")
+            .card_property(serde_json::json!({ "token": "property-token" }))
+            .expect("property");
+        let debug = format!("{options:?}");
+
+        assert!(debug.contains("has_at_user_list"));
+        assert!(debug.contains("has_receiver_list"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("at-user-secret"));
+        assert!(!debug.contains("receiver-secret"));
+        assert!(!debug.contains("property-token"));
     }
 
     #[test]
@@ -3691,6 +4103,19 @@ mod tests {
                     " user-1 ": { "status": "ok" }
                 }))
                 .expect_err("private data keys should be strict user ids");
+        let invalid_private_data_value =
+            InteractiveCard::group("cid", "template", "biz", serde_json::json!({}))
+                .expect("card")
+                .user_private_data(serde_json::json!({
+                    "user-1": "ok"
+                }))
+                .expect_err("private data values should be JSON objects");
+        let invalid_update_private_data_value = InteractiveCardUpdate::private_data("biz")
+            .expect("update")
+            .user_private_data(serde_json::json!({
+                "user-1": true
+            }))
+            .expect_err("update private data values should be JSON objects");
 
         assert_eq!(invalid_data.kind(), crate::ErrorKind::InvalidInput);
         assert_eq!(missing_target.kind(), crate::ErrorKind::InvalidInput);
@@ -3721,6 +4146,14 @@ mod tests {
             invalid_private_data_key.kind(),
             crate::ErrorKind::InvalidInput
         );
+        assert_eq!(
+            invalid_private_data_value.kind(),
+            crate::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            invalid_update_private_data_value.kind(),
+            crate::ErrorKind::InvalidInput
+        );
     }
 
     #[test]
@@ -3744,6 +4177,19 @@ mod tests {
             Some("app-key")
         );
         assert_eq!(robot.robot_code(), "robot-b");
+    }
+
+    #[tokio::test]
+    async fn custom_openapi_endpoint_segments_are_validated_before_credentials() {
+        let client = DingTalk::builder().build().expect("client");
+
+        let error = client
+            .openapi()
+            .post_json_result::<Value, _>(&[".."], &serde_json::json!({ "ping": true }))
+            .await
+            .expect_err("relative endpoint segments should fail before credentials");
+
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidInput);
     }
 
     #[test]

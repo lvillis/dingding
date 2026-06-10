@@ -48,4 +48,4 @@ workspace = true
 
 [package.metadata.docs.rs]
 no-default-features = true
-features = ["async-tls-rustls-ring", "webhook", "openapi", "bot", "macros"]
+features = ["async-tls-rustls-ring", "webhook", "openapi", "bot", "stream", "macros"]

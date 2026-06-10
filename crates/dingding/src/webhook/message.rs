@@ -3,10 +3,10 @@ use std::{fmt, str::FromStr};
 use serde::Serialize;
 use url::Url;
 
-use crate::{Error, Result};
+use crate::{Error, Result, util::redact::redact_text};
 
 /// DingTalk webhook message.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(tag = "msgtype")]
 pub enum WebhookMessage {
     /// Plain text message.
@@ -47,6 +47,32 @@ pub enum WebhookMessage {
         #[serde(rename = "feedCard")]
         feed_card: FeedCardContent,
     },
+}
+
+impl fmt::Debug for WebhookMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text { text, at } => f
+                .debug_struct("Text")
+                .field("text", text)
+                .field("at", at)
+                .finish(),
+            Self::Markdown { markdown, at } => f
+                .debug_struct("Markdown")
+                .field("markdown", markdown)
+                .field("at", at)
+                .finish(),
+            Self::Link { link } => f.debug_struct("Link").field("link", link).finish(),
+            Self::ActionCard { action_card } => f
+                .debug_struct("ActionCard")
+                .field("action_card", action_card)
+                .finish(),
+            Self::FeedCard { feed_card } => f
+                .debug_struct("FeedCard")
+                .field("feed_card", feed_card)
+                .finish(),
+        }
+    }
 }
 
 impl WebhookMessage {
@@ -345,14 +371,22 @@ impl fmt::Display for ButtonOrientation {
 }
 
 /// Text body.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct TextContent {
     /// Text content.
     pub content: String,
 }
 
+impl fmt::Debug for TextContent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TextContent")
+            .field("content", &redact_text(&self.content))
+            .finish()
+    }
+}
+
 /// Markdown body.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct MarkdownContent {
     /// Title shown in notification surfaces.
     pub title: String,
@@ -360,8 +394,17 @@ pub struct MarkdownContent {
     pub text: String,
 }
 
+impl fmt::Debug for MarkdownContent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MarkdownContent")
+            .field("title", &redact_text(&self.title))
+            .field("text", &redact_text(&self.text))
+            .finish()
+    }
+}
+
 /// Link body.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct LinkContent {
     /// Link title.
     pub title: String,
@@ -375,8 +418,19 @@ pub struct LinkContent {
     pub pic_url: Option<String>,
 }
 
+impl fmt::Debug for LinkContent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LinkContent")
+            .field("title", &redact_text(&self.title))
+            .field("text", &redact_text(&self.text))
+            .field("message_url", &redact_text(&self.message_url))
+            .field("pic_url", &self.pic_url.as_deref().map(redact_text))
+            .finish()
+    }
+}
+
 /// Action card body.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct ActionCardContent {
     /// Card title.
     pub title: String,
@@ -394,6 +448,22 @@ pub struct ActionCardContent {
     /// Multiple buttons.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub btns: Option<Vec<ActionCardButton>>,
+}
+
+impl fmt::Debug for ActionCardContent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ActionCardContent")
+            .field("title", &redact_text(&self.title))
+            .field("text", &redact_text(&self.text))
+            .field("btn_orientation", &self.btn_orientation)
+            .field(
+                "single_title",
+                &self.single_title.as_deref().map(redact_text),
+            )
+            .field("single_url", &self.single_url.as_deref().map(redact_text))
+            .field("btns", &self.btns)
+            .finish()
+    }
 }
 
 impl ActionCardContent {
@@ -429,20 +499,37 @@ impl ActionCardContent {
 }
 
 /// Feed card body.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct FeedCardContent {
     /// Feed links.
     pub links: Vec<FeedCardLink>,
 }
 
+impl fmt::Debug for FeedCardContent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FeedCardContent")
+            .field("links", &self.links)
+            .finish()
+    }
+}
+
 /// Action card button.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct ActionCardButton {
     /// Button title.
     pub title: String,
     /// Button URL.
     #[serde(rename = "actionURL")]
     pub action_url: String,
+}
+
+impl fmt::Debug for ActionCardButton {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ActionCardButton")
+            .field("title", &redact_text(&self.title))
+            .field("action_url", &redact_text(&self.action_url))
+            .finish()
+    }
 }
 
 impl ActionCardButton {
@@ -462,7 +549,7 @@ impl ActionCardButton {
 }
 
 /// Feed card link item.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct FeedCardLink {
     /// Link title.
     pub title: String,
@@ -472,6 +559,16 @@ pub struct FeedCardLink {
     /// Image URL.
     #[serde(rename = "picURL")]
     pub pic_url: String,
+}
+
+impl fmt::Debug for FeedCardLink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FeedCardLink")
+            .field("title", &redact_text(&self.title))
+            .field("message_url", &redact_text(&self.message_url))
+            .field("pic_url", &redact_text(&self.pic_url))
+            .finish()
+    }
 }
 
 impl FeedCardLink {
@@ -497,7 +594,7 @@ impl FeedCardLink {
 }
 
 /// Mention metadata.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Clone, Default, Serialize)]
 pub struct At {
     /// Mentioned mobile numbers.
     #[serde(rename = "atMobiles", skip_serializing_if = "Vec::is_empty")]
@@ -508,6 +605,16 @@ pub struct At {
     /// Mentions everyone.
     #[serde(rename = "isAtAll")]
     pub is_at_all: bool,
+}
+
+impl fmt::Debug for At {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("At")
+            .field("mobile_count", &self.mobiles.len())
+            .field("user_id_count", &self.user_ids.len())
+            .field("is_at_all", &self.is_at_all)
+            .finish()
+    }
 }
 
 impl At {
@@ -763,6 +870,41 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn webhook_message_debug_redacts_urls_mentions_and_text_secrets() {
+        let text = WebhookMessage::text("access_token=text-token")
+            .at(At::new().mobile("13800000000").user_id("user-secret"))
+            .expect("mentions");
+        let link =
+            WebhookMessage::link("title", "body", "https://example.com/open?token=link-token")
+                .image_url("https://example.com/pic.png?token=pic-token")
+                .expect("image url");
+        let action = WebhookMessage::action_card(
+            "title",
+            "body",
+            "open",
+            "https://example.com/action?token=action-token",
+        );
+        let feed = WebhookMessage::feed_card(vec![FeedCardLink::new(
+            "feed",
+            "https://example.com/feed?token=feed-token",
+            "https://example.com/feed.png?token=feed-pic-token",
+        )]);
+
+        let debug = format!("{text:?} {link:?} {action:?} {feed:?}");
+
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("mobile_count"));
+        assert!(!debug.contains("text-token"));
+        assert!(!debug.contains("link-token"));
+        assert!(!debug.contains("pic-token"));
+        assert!(!debug.contains("action-token"));
+        assert!(!debug.contains("feed-token"));
+        assert!(!debug.contains("feed-pic-token"));
+        assert!(!debug.contains("13800000000"));
+        assert!(!debug.contains("user-secret"));
     }
 
     #[test]

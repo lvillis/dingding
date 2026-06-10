@@ -22,7 +22,7 @@ use crate::{
         BodySnippetConfig, api_error_from_body, api_error_from_body_with_code,
         decode_json_response, is_success_api_code, response_error_message,
     },
-    util::non_empty_trimmed,
+    util::{non_empty_trimmed, redact::redact_text},
 };
 
 /// Stream topic for robot message callbacks.
@@ -571,12 +571,12 @@ impl StreamClient {
         let url = websocket_url(&ticket)?;
         let (mut socket, _response) = connect_async(url.as_str())
             .await
-            .map_err(|source| Error::Stream(format!("websocket connect failed: {source}")))?;
+            .map_err(|source| Error::stream(format!("websocket connect failed: {source}")))?;
         self.emit_event(StreamRunEvent::ConnectionOpened { attempt });
 
         while let Some(message) = socket.next().await {
             let message = message
-                .map_err(|source| Error::Stream(format!("websocket receive failed: {source}")))?;
+                .map_err(|source| Error::stream(format!("websocket receive failed: {source}")))?;
 
             match message {
                 Message::Text(text) => {
@@ -590,7 +590,7 @@ impl StreamClient {
                 }
                 Message::Binary(bytes) => {
                     let text = String::from_utf8(bytes.to_vec()).map_err(|source| {
-                        Error::Stream(format!("invalid utf-8 frame: {source}"))
+                        Error::stream(format!("invalid utf-8 frame: {source}"))
                     })?;
                     if self.handle_frame_and_ack(&mut socket, &text).await? {
                         self.emit_event(StreamRunEvent::ConnectionClosed {
@@ -602,7 +602,7 @@ impl StreamClient {
                 }
                 Message::Ping(bytes) => {
                     socket.send(Message::Pong(bytes)).await.map_err(|source| {
-                        Error::Stream(format!("websocket pong failed: {source}"))
+                        Error::stream(format!("websocket pong failed: {source}"))
                     })?;
                 }
                 Message::Pong(_) => {}
@@ -638,7 +638,7 @@ impl StreamClient {
         socket
             .send(Message::Text(payload.into()))
             .await
-            .map_err(|source| Error::Stream(format!("websocket send failed: {source}")))?;
+            .map_err(|source| Error::stream(format!("websocket send failed: {source}")))?;
 
         Ok(exit_after_ack)
     }
@@ -1411,6 +1411,14 @@ fn push_subscription_once(
     }
 }
 
+fn redacted_json_value(value: &Value) -> String {
+    redact_text(&value.to_string())
+}
+
+fn redacted_debug_value(value: &impl fmt::Debug) -> String {
+    redact_text(&format!("{value:?}"))
+}
+
 /// Stream subscription type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum StreamSubscriptionType {
@@ -1557,7 +1565,7 @@ pub enum StreamRunEvent {
     Shutdown,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct OpenConnectionRequest<'a> {
     #[serde(rename = "clientId")]
     client_id: &'a str,
@@ -1574,19 +1582,19 @@ fn websocket_url(ticket: &OpenConnectionResponse) -> Result<Url> {
     let endpoint = non_empty_trimmed(&ticket.endpoint, "stream.endpoint")?;
     let ticket_value = normalize_protocol_token(&ticket.ticket, "stream.ticket")?;
     let mut url = Url::parse(&endpoint)
-        .map_err(|source| Error::Stream(format!("invalid stream endpoint: {source}")))?;
+        .map_err(|source| Error::stream(format!("invalid stream endpoint: {source}")))?;
     if !matches!(url.scheme(), "ws" | "wss") {
-        return Err(Error::Stream(
+        return Err(Error::stream(
             "stream endpoint scheme must be ws or wss".to_string(),
         ));
     }
     if !url.username().is_empty() || url.password().is_some() {
-        return Err(Error::Stream(
+        return Err(Error::stream(
             "stream endpoint must not contain username or password".to_string(),
         ));
     }
     if url.fragment().is_some() {
-        return Err(Error::Stream(
+        return Err(Error::stream(
             "stream endpoint must not contain a fragment".to_string(),
         ));
     }
@@ -1607,13 +1615,21 @@ fn websocket_url(ticket: &OpenConnectionResponse) -> Result<Url> {
     Ok(url)
 }
 
-#[derive(Debug)]
 struct OpenConnectionResponse {
     endpoint: String,
     ticket: String,
 }
 
-#[derive(Debug, Deserialize)]
+impl fmt::Debug for OpenConnectionResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenConnectionResponse")
+            .field("endpoint", &redact_text(&self.endpoint))
+            .field("ticket", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
 struct RawOpenConnectionResponse {
     endpoint: Option<String>,
     ticket: Option<String>,
@@ -1632,9 +1648,17 @@ struct RawOpenConnectionResponse {
     #[serde(
         default,
         alias = "message",
+        alias = "errorMessage",
+        alias = "ErrorMessage",
+        alias = "error_message",
         deserialize_with = "crate::transport::deserialize_optional_string"
     )]
     errmsg: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "crate::transport::deserialize_optional_bool"
+    )]
+    success: Option<bool>,
     #[serde(
         default,
         alias = "requestId",
@@ -1658,6 +1682,16 @@ impl RawOpenConnectionResponse {
                 code,
                 self.api_code.clone(),
                 response_error_message(self.errmsg, "unknown dingtalk api error"),
+                self.request_id,
+                body,
+                error_body_snippet,
+            ));
+        }
+        if self.success == Some(false) {
+            return Err(api_error_from_body_with_code(
+                -1,
+                self.api_code.clone(),
+                response_error_message(self.errmsg, "DingTalk response success=false"),
                 self.request_id,
                 body,
                 error_body_snippet,
@@ -1708,11 +1742,21 @@ impl RawOpenConnectionResponse {
 }
 
 /// Incoming DingTalk Stream frame.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct StreamFrame {
     frame_type: StreamFrameType,
     headers: StreamHeaders,
     data: Value,
+}
+
+impl fmt::Debug for StreamFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StreamFrame")
+            .field("frame_type", &self.frame_type)
+            .field("headers", &self.headers)
+            .field("data", &redacted_json_value(&self.data))
+            .finish()
+    }
 }
 
 impl StreamFrame {
@@ -1837,9 +1881,17 @@ impl StreamFrame {
 }
 
 /// Interactive card callback event delivered by DingTalk Stream.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct CardCallbackEvent {
     raw: Value,
+}
+
+impl fmt::Debug for CardCallbackEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CardCallbackEvent")
+            .field("raw", &redacted_json_value(&self.raw))
+            .finish()
+    }
 }
 
 impl CardCallbackEvent {
@@ -1931,7 +1983,7 @@ impl CardCallbackEvent {
 }
 
 /// Strongly typed view of an interactive card callback.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct CardCallbackPayload {
     raw: Value,
     callback_type: Option<String>,
@@ -1943,6 +1995,26 @@ pub struct CardCallbackPayload {
     action: Option<String>,
     action_ids: Vec<String>,
     action_value: CardCallbackActionValue,
+}
+
+impl fmt::Debug for CardCallbackPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CardCallbackPayload")
+            .field("raw", &redacted_json_value(&self.raw))
+            .field("callback_type", &self.callback_type)
+            .field("card_biz_id", &self.card_biz_id)
+            .field("card_instance_id", &self.card_instance_id)
+            .field(
+                "has_open_conversation_id",
+                &self.open_conversation_id.is_some(),
+            )
+            .field("operator", &self.operator)
+            .field("content", &self.content)
+            .field("action", &self.action)
+            .field("action_ids", &self.action_ids)
+            .field("action_value", &self.action_value)
+            .finish()
+    }
 }
 
 impl CardCallbackPayload {
@@ -2048,11 +2120,21 @@ impl CardCallbackPayload {
 }
 
 /// User metadata for an interactive card callback.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct CardCallbackOperator {
     user_id: Option<String>,
     union_id: Option<String>,
     corp_id: Option<String>,
+}
+
+impl fmt::Debug for CardCallbackOperator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CardCallbackOperator")
+            .field("has_user_id", &self.user_id.is_some())
+            .field("has_union_id", &self.union_id.is_some())
+            .field("has_corp_id", &self.corp_id.is_some())
+            .finish()
+    }
 }
 
 impl CardCallbackOperator {
@@ -2084,10 +2166,19 @@ impl CardCallbackOperator {
 }
 
 /// Parsed interactive card callback `content`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct CardCallbackContent {
     raw: Value,
     private_data: Option<CardCallbackPrivateData>,
+}
+
+impl fmt::Debug for CardCallbackContent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CardCallbackContent")
+            .field("raw", &redacted_json_value(&self.raw))
+            .field("private_data", &self.private_data)
+            .finish()
+    }
 }
 
 impl CardCallbackContent {
@@ -2145,11 +2236,21 @@ impl CardCallbackContent {
 }
 
 /// Parsed private data inside an interactive card callback.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct CardCallbackPrivateData {
     raw: Value,
     action_ids: Vec<String>,
     params: CardCallbackActionValue,
+}
+
+impl fmt::Debug for CardCallbackPrivateData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CardCallbackPrivateData")
+            .field("raw", &redacted_json_value(&self.raw))
+            .field("action_ids", &self.action_ids)
+            .field("params", &self.params)
+            .finish()
+    }
 }
 
 impl CardCallbackPrivateData {
@@ -2189,9 +2290,17 @@ impl CardCallbackPrivateData {
 }
 
 /// Action value or form parameters from an interactive card callback.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 pub struct CardCallbackActionValue {
     value: Option<Value>,
+}
+
+impl fmt::Debug for CardCallbackActionValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CardCallbackActionValue")
+            .field("value", &self.value.as_ref().map(redacted_json_value))
+            .finish()
+    }
 }
 
 impl CardCallbackActionValue {
@@ -2268,12 +2377,21 @@ fn normalize_action_value(value: Value) -> Value {
 }
 
 /// Response payload for interactive card callbacks.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize)]
 pub struct CardCallbackResponse {
     #[serde(rename = "cardData", skip_serializing_if = "Option::is_none")]
     card_data: Option<CardCallbackResponseData>,
     #[serde(rename = "userPrivateData", skip_serializing_if = "Option::is_none")]
     user_private_data: Option<CardCallbackResponseData>,
+}
+
+impl fmt::Debug for CardCallbackResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CardCallbackResponse")
+            .field("card_data", &self.card_data)
+            .field("user_private_data", &self.user_private_data)
+            .finish()
+    }
 }
 
 impl CardCallbackResponse {
@@ -2328,10 +2446,23 @@ impl CardCallbackResponse {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize)]
 struct CardCallbackResponseData {
     #[serde(rename = "cardParamMap")]
     card_param_map: BTreeMap<String, String>,
+}
+
+impl fmt::Debug for CardCallbackResponseData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let card_param_map = self
+            .card_param_map
+            .keys()
+            .map(|key| (key.as_str(), "<redacted>"))
+            .collect::<BTreeMap<_, _>>();
+        f.debug_struct("CardCallbackResponseData")
+            .field("card_param_map", &card_param_map)
+            .finish()
+    }
 }
 
 impl CardCallbackResponseData {
@@ -2507,7 +2638,7 @@ fn field_name_matches(left: &str, right: &str) -> bool {
     normalized(left).eq(normalized(right))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct RawStreamFrame {
     #[serde(
         rename = "type",
@@ -2519,7 +2650,7 @@ struct RawStreamFrame {
 }
 
 /// DingTalk Stream frame headers.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct StreamHeaders {
     #[serde(
         alias = "Topic",
@@ -2535,6 +2666,16 @@ pub struct StreamHeaders {
     message_id: String,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
+}
+
+impl fmt::Debug for StreamHeaders {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StreamHeaders")
+            .field("topic", &self.topic)
+            .field("message_id", &self.message_id)
+            .field("extra", &redacted_debug_value(&self.extra))
+            .finish()
+    }
 }
 
 impl StreamHeaders {
@@ -2873,6 +3014,7 @@ mod tests {
             errcode: Some(0),
             api_code: None,
             errmsg: None,
+            success: None,
             request_id: Some(" request-1 ".to_string()),
         }
         .into_connection(
@@ -2886,6 +3028,19 @@ mod tests {
     }
 
     #[test]
+    fn open_connection_response_debug_redacts_ticket() {
+        let response = OpenConnectionResponse {
+            endpoint: "wss://example.com/connect?ticket=endpoint-ticket".to_string(),
+            ticket: "ticket-secret".to_string(),
+        };
+        let debug = format!("{response:?}");
+
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("endpoint-ticket"));
+        assert!(!debug.contains("ticket-secret"));
+    }
+
+    #[test]
     fn open_connection_response_preserves_api_errors() {
         let error = RawOpenConnectionResponse {
             endpoint: None,
@@ -2893,6 +3048,7 @@ mod tests {
             errcode: Some(40001),
             api_code: None,
             errmsg: Some("invalid client".to_string()),
+            success: None,
             request_id: Some(" request-1 ".to_string()),
         }
         .into_connection(
@@ -2911,6 +3067,19 @@ mod tests {
     }
 
     #[test]
+    fn open_connection_response_rejects_success_false() {
+        let body = r#"{"errcode":0,"success":false,"errorMessage":"denied","requestId":"request-1","endpoint":"wss://example.com/connect","ticket":"ticket-1"}"#;
+        let response = serde_json::from_str::<RawOpenConnectionResponse>(body).expect("response");
+        let error = response
+            .into_connection(body, BodySnippetConfig::default())
+            .expect_err("success=false should fail");
+
+        assert_eq!(error.kind(), crate::ErrorKind::Api);
+        assert_eq!(error.request_id(), Some("request-1"));
+        assert!(error.to_string().contains("denied"));
+    }
+
+    #[test]
     fn open_connection_response_rejects_missing_ticket() {
         let error = RawOpenConnectionResponse {
             endpoint: Some("wss://example.com/connect".to_string()),
@@ -2918,6 +3087,7 @@ mod tests {
             errcode: Some(0),
             api_code: None,
             errmsg: None,
+            success: None,
             request_id: Some("request-1".to_string()),
         }
         .into_connection(
@@ -3673,6 +3843,43 @@ mod tests {
     }
 
     #[test]
+    fn card_callback_debug_redacts_raw_operator_and_private_values() {
+        let event = CardCallbackEvent::from_value(serde_json::json!({
+            "type": "CALLBACK",
+            "outTrackId": "card-biz-id",
+            "corpId": "corp-secret",
+            "userId": "user-secret",
+            "unionId": "union-secret",
+            "actionValue": {
+                "token": "action-token"
+            },
+            "content": {
+                "cardPrivateData": {
+                    "actionIds": ["approve"],
+                    "params": {
+                        "token": "private-token"
+                    }
+                }
+            }
+        }));
+        let payload = event.payload();
+        let response = CardCallbackResponse::new()
+            .card_data([("token", "response-token")])
+            .expect("response");
+
+        let debug = format!("{event:?} {payload:?} {response:?}");
+
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("has_user_id"));
+        assert!(!debug.contains("corp-secret"));
+        assert!(!debug.contains("user-secret"));
+        assert!(!debug.contains("union-secret"));
+        assert!(!debug.contains("action-token"));
+        assert!(!debug.contains("private-token"));
+        assert!(!debug.contains("response-token"));
+    }
+
+    #[test]
     fn card_callback_payload_parses_json_string_content() {
         let event = CardCallbackEvent::from_value(serde_json::json!({
             "cardBizId": "card-biz-id",
@@ -3974,6 +4181,36 @@ mod tests {
             event.text.as_ref().map(|text| text.content.as_str()),
             Some("/ping")
         );
+    }
+
+    #[test]
+    fn stream_frame_debug_redacts_temporary_credentials() {
+        let frame = StreamFrame::from_text(
+            r#"{
+                "specVersion":"1.0",
+                "type":"CALLBACK",
+                "headers":{
+                    "topic":"/v1.0/im/bot/messages/get",
+                    "messageId":"message-1",
+                    "ticket":"header-ticket"
+                },
+                "data":{
+                    "conversationType":"2",
+                    "msgtype":"file",
+                    "sessionWebhook":"https://oapi.dingtalk.com/robot/sendBySession?token=session-token",
+                    "content":{
+                        "downloadCode":"download-code"
+                    }
+                }
+            }"#,
+        )
+        .expect("frame");
+        let debug = format!("{frame:?}");
+
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("header-ticket"));
+        assert!(!debug.contains("session-token"));
+        assert!(!debug.contains("download-code"));
     }
 
     #[test]

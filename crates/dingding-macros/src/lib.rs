@@ -292,12 +292,18 @@ fn normalized_filter_value(value: &str) -> String {
 
 fn dingding_crate_path() -> proc_macro2::TokenStream {
     match crate_name("dingding") {
-        Ok(FoundCrate::Itself) => quote!(::dingding),
-        Ok(FoundCrate::Name(name)) => {
+        Ok(found_crate) => found_crate_path(found_crate),
+        Err(_error) => quote!(::dingding),
+    }
+}
+
+fn found_crate_path(found_crate: FoundCrate) -> proc_macro2::TokenStream {
+    match found_crate {
+        FoundCrate::Itself => quote!(::dingding),
+        FoundCrate::Name(name) => {
             let ident = syn::Ident::new(&name, proc_macro2::Span::call_site());
             quote!(::#ident)
         }
-        Err(_error) => quote!(::dingding),
     }
 }
 
@@ -345,5 +351,24 @@ fn message_tokens(
             proc_macro2::Span::call_site(),
             "msg must be one of: any, text, markdown, audio, picture, video, file, richText",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crate_path_uses_self_alias_for_itself() {
+        let path = found_crate_path(FoundCrate::Itself);
+
+        assert_eq!(path.to_string(), ":: dingding");
+    }
+
+    #[test]
+    fn crate_path_uses_renamed_dependency() {
+        let path = found_crate_path(FoundCrate::Name("renamed_dingding".to_string()));
+
+        assert_eq!(path.to_string(), ":: renamed_dingding");
     }
 }

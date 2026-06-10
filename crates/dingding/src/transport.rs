@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
 
 use reqx::{
     advanced::{ClientProfile, PermissiveRetryEligibility},
@@ -38,7 +38,7 @@ impl Default for BodySnippetConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct TransportConfig {
     pub(crate) client_name: String,
     pub(crate) profile: ClientProfile,
@@ -50,6 +50,32 @@ pub(crate) struct TransportConfig {
     pub(crate) retry_non_idempotent_requests: bool,
     pub(crate) default_headers: Vec<(String, String)>,
     pub(crate) error_body_snippet: BodySnippetConfig,
+}
+
+impl fmt::Debug for TransportConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let default_headers = self
+            .default_headers
+            .iter()
+            .map(|(name, _value)| (name.as_str(), "<redacted>"))
+            .collect::<Vec<_>>();
+
+        f.debug_struct("TransportConfig")
+            .field("client_name", &self.client_name)
+            .field("profile", &self.profile)
+            .field("request_timeout", &self.request_timeout)
+            .field("total_timeout", &self.total_timeout)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("system_proxy", &self.system_proxy)
+            .field("retry_policy", &self.retry_policy)
+            .field(
+                "retry_non_idempotent_requests",
+                &self.retry_non_idempotent_requests,
+            )
+            .field("default_headers", &default_headers)
+            .field("error_body_snippet", &self.error_body_snippet)
+            .finish()
+    }
 }
 
 impl Default for TransportConfig {
@@ -79,6 +105,9 @@ impl TransportConfig {
         }
         if let Some(total_timeout) = self.total_timeout {
             validate_duration("total_timeout", total_timeout)?;
+        }
+        for (index, (name, value)) in self.default_headers.iter().enumerate() {
+            validate_default_header(index, name, value)?;
         }
         Ok(())
     }
@@ -258,6 +287,59 @@ fn validate_duration(field: &'static str, value: Duration) -> Result<()> {
     Ok(())
 }
 
+fn validate_default_header(index: usize, name: &str, value: &str) -> Result<()> {
+    validate_header_name(index, name)?;
+    validate_header_value(index, value)?;
+    Ok(())
+}
+
+fn validate_header_name(index: usize, value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(Error::InvalidConfig(format!(
+            "default_headers[{index}].name must not be empty"
+        )));
+    }
+    if !value.bytes().all(is_header_name_byte) {
+        return Err(Error::InvalidConfig(format!(
+            "default_headers[{index}].name must be a valid HTTP header name"
+        )));
+    }
+    Ok(())
+}
+
+fn is_header_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn validate_header_value(index: usize, value: &str) -> Result<()> {
+    if value
+        .bytes()
+        .any(|byte| byte.is_ascii_control() && byte != b'\t')
+    {
+        return Err(Error::InvalidConfig(format!(
+            "default_headers[{index}].value must not contain control characters"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct StandardApiResponse {
     #[serde(default, deserialize_with = "deserialize_optional_i64")]
@@ -272,9 +354,14 @@ pub(crate) struct StandardApiResponse {
     #[serde(
         default,
         alias = "message",
+        alias = "errorMessage",
+        alias = "ErrorMessage",
+        alias = "error_message",
         deserialize_with = "deserialize_optional_string"
     )]
     pub(crate) errmsg: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_bool")]
+    pub(crate) success: Option<bool>,
     #[serde(
         default,
         alias = "requestId",
@@ -311,6 +398,16 @@ pub(crate) fn parse_standard_response(
     error_body_snippet: BodySnippetConfig,
 ) -> Result<StandardApiResponse> {
     let (value, body) = decode_json_response::<StandardApiResponse>(response, error_body_snippet)?;
+    if value.success == Some(false) {
+        return Err(api_error_from_body_with_code(
+            value.errcode.filter(|code| *code != 0).unwrap_or(-1),
+            value.api_code.clone(),
+            response_error_message(value.errmsg.clone(), "DingTalk response success=false"),
+            value.request_id.clone(),
+            &body,
+            error_body_snippet,
+        ));
+    }
     match value.errcode {
         Some(0)
             if value
@@ -398,6 +495,16 @@ pub(crate) fn parse_standard_text_response(
             error_body_snippet,
         )
     })?;
+    if value.success == Some(false) {
+        return Err(api_error_from_body_with_code(
+            value.errcode.filter(|code| *code != 0).unwrap_or(-1),
+            value.api_code.clone(),
+            response_error_message(value.errmsg, "DingTalk response success=false"),
+            value.request_id,
+            &body,
+            error_body_snippet,
+        ));
+    }
     match value.errcode {
         Some(0) => {}
         Some(code) => {
@@ -453,6 +560,16 @@ where
     T: DeserializeOwned,
 {
     let (value, body) = decode_json_response::<DingTalkResult<T>>(response, error_body_snippet)?;
+    if value.success == Some(false) {
+        return Err(api_error_from_body_with_code(
+            value.errcode.filter(|code| *code != 0).unwrap_or(-1),
+            value.api_code.clone(),
+            response_error_message(value.errmsg, "DingTalk response success=false"),
+            value.request_id,
+            &body,
+            error_body_snippet,
+        ));
+    }
     if let Some(code) = value.errcode
         && code != 0
     {
@@ -519,7 +636,7 @@ pub(crate) fn parse_binary_response(
 }
 
 #[cfg(feature = "openapi")]
-#[derive(Debug, serde::Deserialize)]
+#[derive(serde::Deserialize)]
 struct DingTalkResult<T> {
     #[serde(default, deserialize_with = "deserialize_optional_i64")]
     errcode: Option<i64>,
@@ -533,9 +650,14 @@ struct DingTalkResult<T> {
     #[serde(
         default,
         alias = "message",
+        alias = "errorMessage",
+        alias = "ErrorMessage",
+        alias = "error_message",
         deserialize_with = "deserialize_optional_string"
     )]
     errmsg: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_bool")]
+    success: Option<bool>,
     result: Option<T>,
     #[serde(
         default,
@@ -608,7 +730,7 @@ fn normalize_error_message(message: impl Into<String>) -> String {
     if message.is_empty() {
         "unknown dingtalk api error".to_string()
     } else {
-        message.to_string()
+        redact_text(message)
     }
 }
 
@@ -694,6 +816,40 @@ where
     Ok(normalize_response_string(&value))
 }
 
+pub(crate) fn deserialize_optional_bool<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    match value {
+        Value::Null => Ok(None),
+        Value::Bool(value) => Ok(Some(value)),
+        Value::Number(value) => match value.as_i64() {
+            Some(0) => Ok(Some(false)),
+            Some(1) => Ok(Some(true)),
+            Some(_) | None => Err(DeError::custom("expected boolean or 0/1")),
+        },
+        Value::String(value) => {
+            let value = value.trim();
+            if value.is_empty() {
+                return Ok(None);
+            }
+            match value.to_ascii_lowercase().as_str() {
+                "false" | "0" => Ok(Some(false)),
+                "true" | "1" => Ok(Some(true)),
+                _ => Err(DeError::custom("expected boolean string")),
+            }
+        }
+        _ => Err(DeError::custom("expected boolean, 0/1, or string boolean")),
+    }
+}
+
 #[cfg(feature = "stream")]
 pub(crate) fn deserialize_string<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
 where
@@ -721,6 +877,48 @@ fn body_snippet_for_error(body: &str, config: BodySnippetConfig) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_config_rejects_invalid_default_headers() {
+        let mut invalid_name = TransportConfig::default();
+        invalid_name
+            .default_headers
+            .push(("bad header".to_string(), "value".to_string()));
+        let mut invalid_value = TransportConfig::default();
+        invalid_value
+            .default_headers
+            .push(("x-test".to_string(), "value\r\nx-injected: 1".to_string()));
+
+        assert_eq!(
+            invalid_name
+                .validate()
+                .expect_err("header name with space should fail")
+                .kind(),
+            crate::ErrorKind::InvalidConfig
+        );
+        assert_eq!(
+            invalid_value
+                .validate()
+                .expect_err("header value with CRLF should fail")
+                .kind(),
+            crate::ErrorKind::InvalidConfig
+        );
+    }
+
+    #[test]
+    fn transport_config_debug_redacts_default_header_values() {
+        let mut config = TransportConfig::default();
+        config.default_headers.push((
+            "authorization".to_string(),
+            "Bearer header-secret".to_string(),
+        ));
+
+        let debug = format!("{config:?}");
+
+        assert!(debug.contains("authorization"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("header-secret"));
+    }
 
     #[test]
     fn api_error_from_body_normalizes_message_and_request_id() {
@@ -759,6 +957,23 @@ mod tests {
     }
 
     #[test]
+    fn api_error_from_body_redacts_sensitive_error_message_values() {
+        let error = api_error_from_body(
+            40001,
+            "invalid access_token=secret-token, signature=callback-sign",
+            None,
+            r#"{"errcode":40001,"errmsg":"invalid"}"#,
+            BodySnippetConfig::default(),
+        );
+
+        let message = error.to_string();
+        assert!(message.contains("access_token=<redacted>"));
+        assert!(message.contains("signature=<redacted>"));
+        assert!(!message.contains("secret-token"));
+        assert!(!message.contains("callback-sign"));
+    }
+
+    #[test]
     fn standard_api_response_accepts_string_error_codes() {
         let parsed = serde_json::from_str::<StandardApiResponse>(
             r#"{"errcode":"40001","errmsg":"invalid","requestId":" request-1 "}"#,
@@ -791,6 +1006,21 @@ mod tests {
     }
 
     #[test]
+    fn standard_api_response_accepts_modern_error_message_aliases() {
+        let camel = serde_json::from_str::<StandardApiResponse>(
+            r#"{"code":"InvalidParameter","errorMessage":"bad request"}"#,
+        )
+        .expect("response");
+        let snake = serde_json::from_str::<StandardApiResponse>(
+            r#"{"code":"InvalidParameter","error_message":"bad request"}"#,
+        )
+        .expect("response");
+
+        assert_eq!(camel.errmsg.as_deref(), Some("bad request"));
+        assert_eq!(snake.errmsg.as_deref(), Some("bad request"));
+    }
+
+    #[test]
     fn standard_api_response_normalizes_numeric_message() {
         let parsed = serde_json::from_str::<StandardApiResponse>(
             r#"{"errcode":"40001","errmsg":12345,"requestId":"request-1"}"#,
@@ -798,6 +1028,19 @@ mod tests {
         .expect("response");
 
         assert_eq!(parsed.errmsg.as_deref(), Some("12345"));
+    }
+
+    #[test]
+    fn standard_api_response_accepts_boolean_success_values() {
+        let parsed =
+            serde_json::from_str::<StandardApiResponse>(r#"{"errcode":0,"success":"false"}"#)
+                .expect("response");
+        let parsed_bool =
+            serde_json::from_str::<StandardApiResponse>(r#"{"errcode":0,"success":true}"#)
+                .expect("response");
+
+        assert_eq!(parsed.success, Some(false));
+        assert_eq!(parsed_bool.success, Some(true));
     }
 
     #[test]

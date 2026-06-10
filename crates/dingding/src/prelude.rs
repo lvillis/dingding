@@ -22,11 +22,11 @@ pub use crate::openapi::{
 
 #[cfg(feature = "stream")]
 pub use crate::stream::{
-    CARD_CALLBACK_TOPIC, CardCallbackActionValue, CardCallbackContent, CardCallbackEvent,
-    CardCallbackOperator, CardCallbackPayload, CardCallbackPrivateData, CardCallbackResponse,
-    ReconnectPolicy, StreamBot, StreamBotBuilder, StreamClient, StreamClientBuilder, StreamExit,
-    StreamFrame, StreamFrameResponse, StreamFrameType, StreamHeaders, StreamRunEvent,
-    StreamSubscription, StreamSubscriptionType,
+    BOT_MESSAGE_TOPIC, CARD_CALLBACK_TOPIC, CardCallbackActionValue, CardCallbackContent,
+    CardCallbackEvent, CardCallbackOperator, CardCallbackPayload, CardCallbackPrivateData,
+    CardCallbackResponse, ReconnectPolicy, StreamBot, StreamBotBuilder, StreamClient,
+    StreamClientBuilder, StreamExit, StreamFrame, StreamFrameResponse, StreamFrameType,
+    StreamHeaders, StreamRunEvent, StreamSubscription, StreamSubscriptionType,
 };
 
 #[cfg(feature = "webhook")]

@@ -2,6 +2,8 @@ use std::{fmt, time::SystemTime, time::SystemTimeError};
 
 use thiserror::Error as ThisError;
 
+use crate::util::redact::redact_text;
+
 /// SDK result type.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -51,7 +53,7 @@ impl ErrorKind {
 }
 
 /// Unified SDK error.
-#[derive(Debug, ThisError)]
+#[derive(ThisError)]
 #[non_exhaustive]
 pub enum Error {
     /// DingTalk API business error, usually represented by `errcode != 0`
@@ -72,8 +74,14 @@ pub enum Error {
     },
 
     /// HTTP transport or request construction failure.
-    #[error("HTTP transport error: {0}")]
-    Transport(#[from] reqx::Error),
+    #[error("HTTP transport error: {message}")]
+    Transport {
+        /// Original transport error.
+        #[source]
+        source: Box<reqx::Error>,
+        /// Redacted transport error message.
+        message: String,
+    },
 
     /// Stream connection or protocol failure.
     #[error("stream error: {0}")]
@@ -128,7 +136,7 @@ impl Error {
     pub fn kind(&self) -> ErrorKind {
         match self {
             Self::Api { .. } => ErrorKind::Api,
-            Self::Transport(_) => ErrorKind::Transport,
+            Self::Transport { .. } => ErrorKind::Transport,
             Self::Stream(_) => ErrorKind::Stream,
             Self::Serialization(_) => ErrorKind::Serialization,
             Self::Signature | Self::InvalidSignature(_) => ErrorKind::Signature,
@@ -145,7 +153,7 @@ impl Error {
     pub fn request_id(&self) -> Option<&str> {
         match self {
             Self::Api { request_id, .. } => request_id.as_deref(),
-            Self::Transport(error) => error.request_id(),
+            Self::Transport { source, .. } => source.request_id(),
             _ => None,
         }
     }
@@ -187,7 +195,7 @@ impl Error {
     #[must_use]
     pub fn status(&self) -> Option<u16> {
         match self {
-            Self::Transport(error) => error.status_code(),
+            Self::Transport { source, .. } => source.status_code(),
             _ => None,
         }
     }
@@ -196,14 +204,14 @@ impl Error {
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Transport(error) => match error.code() {
+            Self::Transport { source, .. } => match source.code() {
                 reqx::ErrorCode::Timeout
                 | reqx::ErrorCode::DeadlineExceeded
                 | reqx::ErrorCode::Transport
                 | reqx::ErrorCode::RetryBudgetExhausted
                 | reqx::ErrorCode::CircuitOpen => true,
                 reqx::ErrorCode::HttpStatus => {
-                    matches!(error.status_code(), Some(429 | 500..=599))
+                    matches!(source.status_code(), Some(429 | 500..=599))
                 }
                 _ => false,
             },
@@ -221,7 +229,7 @@ impl Error {
     #[must_use]
     pub fn retry_after(&self) -> Option<std::time::Duration> {
         match self {
-            Self::Transport(error) => error.retry_after(SystemTime::now()),
+            Self::Transport { source, .. } => source.retry_after(SystemTime::now()),
             _ => None,
         }
     }
@@ -238,6 +246,11 @@ impl Error {
         Self::InvalidSignature(message.into())
     }
 
+    #[cfg(feature = "stream")]
+    pub(crate) fn stream(message: impl Into<String>) -> Self {
+        Self::Stream(redact_text(&message.into()))
+    }
+
     pub(crate) fn api_with_code(
         code: i64,
         api_code: Option<String>,
@@ -252,6 +265,69 @@ impl Error {
             request_id,
             error_body_snippet,
         }
+    }
+}
+
+impl From<reqx::Error> for Error {
+    fn from(source: reqx::Error) -> Self {
+        let message = normalize_transport_error_message(&source.to_string());
+        Self::Transport {
+            source: Box::new(source),
+            message,
+        }
+    }
+}
+
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Api {
+                code,
+                api_code,
+                message,
+                request_id,
+                error_body_snippet,
+            } => f
+                .debug_struct("Api")
+                .field("code", code)
+                .field("api_code", api_code)
+                .field("message", message)
+                .field("request_id", request_id)
+                .field("error_body_snippet", error_body_snippet)
+                .finish(),
+            Self::Transport { message, .. } => f
+                .debug_struct("Transport")
+                .field("message", message)
+                .finish(),
+            Self::Stream(message) => f.debug_tuple("Stream").field(message).finish(),
+            Self::Serialization(source) => f.debug_tuple("Serialization").field(source).finish(),
+            Self::Timestamp(source) => f.debug_tuple("Timestamp").field(source).finish(),
+            Self::Signature => f.write_str("Signature"),
+            Self::InvalidSignature(message) => {
+                f.debug_tuple("InvalidSignature").field(message).finish()
+            }
+            Self::InvalidConfig(message) => f.debug_tuple("InvalidConfig").field(message).finish(),
+            Self::InvalidInput { field, message } => f
+                .debug_struct("InvalidInput")
+                .field("field", field)
+                .field("message", message)
+                .finish(),
+            Self::MissingCredentials => f.write_str("MissingCredentials"),
+            Self::BotScope { expected, actual } => f
+                .debug_struct("BotScope")
+                .field("expected", expected)
+                .field("actual", actual)
+                .finish(),
+        }
+    }
+}
+
+fn normalize_transport_error_message(message: &str) -> String {
+    let message = message.trim();
+    if message.is_empty() {
+        "unknown transport error".to_string()
+    } else {
+        redact_text(message)
     }
 }
 
@@ -344,5 +420,32 @@ mod tests {
             Error::api_with_code(-1, Some("503".to_string()), "unavailable", None, None,)
                 .is_retryable()
         );
+    }
+
+    #[test]
+    fn transport_error_messages_are_redacted_before_display() {
+        let message = normalize_transport_error_message(
+            "request failed: https://oapi.dingtalk.com/robot/send?access_token=secret-token&sign=callback-sign",
+        );
+
+        assert!(message.contains("access_token=<redacted>"));
+        assert!(message.contains("sign=<redacted>"));
+        assert!(!message.contains("secret-token"));
+        assert!(!message.contains("callback-sign"));
+    }
+
+    #[cfg(feature = "stream")]
+    #[test]
+    fn stream_error_messages_are_redacted_before_display() {
+        let error = Error::stream(
+            "websocket connect failed: wss://example.test/connect?ticket=stream-ticket",
+        );
+        let message = error.to_string();
+        let debug = format!("{error:?}");
+
+        assert!(message.contains("ticket=<redacted>"));
+        assert!(debug.contains("ticket=<redacted>"));
+        assert!(!message.contains("stream-ticket"));
+        assert!(!debug.contains("stream-ticket"));
     }
 }
