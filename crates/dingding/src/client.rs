@@ -4,7 +4,7 @@ use reqx::{advanced::ClientProfile, prelude::RetryPolicy};
 use url::Url;
 
 #[cfg(feature = "openapi")]
-use crate::auth::{AppCredentials, MemoryTokenCache};
+use crate::auth::{AppCredentials, MemoryTokenCache, TokenRefreshLocks};
 #[cfg(feature = "openapi")]
 use crate::transport::DEFAULT_OPENAPI_BASE_URL;
 use crate::{
@@ -27,6 +27,10 @@ struct Inner {
     app_credentials: Option<AppCredentials>,
     #[cfg(feature = "openapi")]
     token_cache: MemoryTokenCache,
+    #[cfg(feature = "openapi")]
+    token_refresh_locks: TokenRefreshLocks,
+    #[cfg(feature = "stream")]
+    transport_config: TransportConfig,
     transport: Transport,
 }
 
@@ -98,6 +102,14 @@ impl DingTalk {
     }
 
     #[cfg(feature = "openapi")]
+    pub(crate) async fn access_token_refresh_guard(
+        &self,
+        credentials: &AppCredentials,
+    ) -> crate::auth::TokenRefreshGuard {
+        self.inner.token_refresh_locks.lock(credentials).await
+    }
+
+    #[cfg(feature = "openapi")]
     pub(crate) fn store_access_token(
         &self,
         credentials: AppCredentials,
@@ -107,6 +119,11 @@ impl DingTalk {
         self.inner
             .token_cache
             .store(credentials, token, expires_in_seconds);
+    }
+
+    #[cfg(feature = "stream")]
+    pub(crate) fn stream_connect_timeout(&self) -> Duration {
+        self.inner.transport_config.connect_timeout
     }
 }
 
@@ -281,6 +298,8 @@ impl DingTalkBuilder {
         if let Some(credentials) = &self.app_credentials {
             credentials.validate()?;
         }
+        #[cfg(feature = "stream")]
+        let transport_config = self.transport.clone();
         #[cfg(feature = "openapi")]
         let transport =
             Transport::new(&webhook_base_url, Some(&openapi_base_url), &self.transport)?;
@@ -296,6 +315,10 @@ impl DingTalkBuilder {
                 app_credentials: self.app_credentials,
                 #[cfg(feature = "openapi")]
                 token_cache: MemoryTokenCache::new().with_refresh_margin(self.token_refresh_margin),
+                #[cfg(feature = "openapi")]
+                token_refresh_locks: TokenRefreshLocks::new(),
+                #[cfg(feature = "stream")]
+                transport_config,
                 transport,
             }),
         })

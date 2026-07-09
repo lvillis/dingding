@@ -398,55 +398,20 @@ pub(crate) fn parse_standard_response(
     error_body_snippet: BodySnippetConfig,
 ) -> Result<StandardApiResponse> {
     let (value, body) = decode_json_response::<StandardApiResponse>(response, error_body_snippet)?;
-    if value.success == Some(false) {
-        return Err(api_error_from_body_with_code(
-            value.errcode.filter(|code| *code != 0).unwrap_or(-1),
-            value.api_code.clone(),
-            response_error_message(value.errmsg.clone(), "DingTalk response success=false"),
-            value.request_id.clone(),
-            &body,
-            error_body_snippet,
-        ));
+    if let Some(error) = response_envelope_error(
+        value.errcode,
+        value.api_code.as_deref(),
+        value.errmsg.as_deref(),
+        value.success,
+        value.request_id.as_deref(),
+        &body,
+        error_body_snippet,
+    ) {
+        return Err(error);
     }
     match value.errcode {
-        Some(0)
-            if value
-                .api_code
-                .as_deref()
-                .is_some_and(|api_code| !is_success_api_code(api_code)) =>
-        {
-            Err(api_error_from_body_with_code(
-                -1,
-                value.api_code.clone(),
-                response_error_message(value.errmsg.clone(), "unknown dingtalk api error"),
-                value.request_id.clone(),
-                &body,
-                error_body_snippet,
-            ))
-        }
         Some(0) => Ok(value),
-        Some(code) => Err(api_error_from_body_with_code(
-            code,
-            value.api_code.clone(),
-            response_error_message(value.errmsg.clone(), "unknown dingtalk api error"),
-            value.request_id.clone(),
-            &body,
-            error_body_snippet,
-        )),
-        None if value
-            .api_code
-            .as_deref()
-            .is_some_and(|api_code| !is_success_api_code(api_code)) =>
-        {
-            Err(api_error_from_body_with_code(
-                -1,
-                value.api_code.clone(),
-                response_error_message(value.errmsg.clone(), "unknown dingtalk api error"),
-                value.request_id.clone(),
-                &body,
-                error_body_snippet,
-            ))
-        }
+        Some(_) => unreachable!("non-zero errcode should be handled before this match"),
         None => Err(api_error_from_body(
             -1,
             response_error_message(
@@ -495,41 +460,16 @@ pub(crate) fn parse_standard_text_response(
             error_body_snippet,
         )
     })?;
-    if value.success == Some(false) {
-        return Err(api_error_from_body_with_code(
-            value.errcode.filter(|code| *code != 0).unwrap_or(-1),
-            value.api_code.clone(),
-            response_error_message(value.errmsg, "DingTalk response success=false"),
-            value.request_id,
-            &body,
-            error_body_snippet,
-        ));
-    }
-    match value.errcode {
-        Some(0) => {}
-        Some(code) => {
-            return Err(api_error_from_body_with_code(
-                code,
-                value.api_code.clone(),
-                response_error_message(value.errmsg, "unknown dingtalk api error"),
-                value.request_id,
-                &body,
-                error_body_snippet,
-            ));
-        }
-        None => {}
-    }
-    if let Some(api_code) = value.api_code.as_deref()
-        && !is_success_api_code(api_code)
-    {
-        return Err(api_error_from_body_with_code(
-            -1,
-            value.api_code.clone(),
-            response_error_message(value.errmsg, "unknown dingtalk api error"),
-            value.request_id,
-            &body,
-            error_body_snippet,
-        ));
+    if let Some(error) = response_envelope_error(
+        value.errcode,
+        value.api_code.as_deref(),
+        value.errmsg.as_deref(),
+        value.success,
+        value.request_id.as_deref(),
+        &body,
+        error_body_snippet,
+    ) {
+        return Err(error);
     }
     if value.errcode.is_none() && !has_success_payload {
         return Err(api_error_from_body(
@@ -560,39 +500,16 @@ where
     T: DeserializeOwned,
 {
     let (value, body) = decode_json_response::<DingTalkResult<T>>(response, error_body_snippet)?;
-    if value.success == Some(false) {
-        return Err(api_error_from_body_with_code(
-            value.errcode.filter(|code| *code != 0).unwrap_or(-1),
-            value.api_code.clone(),
-            response_error_message(value.errmsg, "DingTalk response success=false"),
-            value.request_id,
-            &body,
-            error_body_snippet,
-        ));
-    }
-    if let Some(code) = value.errcode
-        && code != 0
-    {
-        return Err(api_error_from_body_with_code(
-            code,
-            value.api_code.clone(),
-            response_error_message(value.errmsg, "unknown dingtalk api error"),
-            value.request_id,
-            &body,
-            error_body_snippet,
-        ));
-    }
-    if let Some(api_code) = value.api_code.as_deref()
-        && !is_success_api_code(api_code)
-    {
-        return Err(api_error_from_body_with_code(
-            -1,
-            value.api_code.clone(),
-            response_error_message(value.errmsg, "unknown dingtalk api error"),
-            value.request_id,
-            &body,
-            error_body_snippet,
-        ));
+    if let Some(error) = response_envelope_error(
+        value.errcode,
+        value.api_code.as_deref(),
+        value.errmsg.as_deref(),
+        value.success,
+        value.request_id.as_deref(),
+        &body,
+        error_body_snippet,
+    ) {
+        return Err(error);
     }
 
     value.result.ok_or_else(|| {
@@ -632,7 +549,77 @@ pub(crate) fn parse_binary_response(
         ));
     }
 
-    Ok(response.body().to_vec())
+    let content_type_is_json = response_content_type_is_json(&response);
+    let body = response.body().to_vec();
+    if let Some(error) = binary_success_body_error(&body, content_type_is_json, error_body_snippet)
+    {
+        return Err(error);
+    }
+
+    Ok(body)
+}
+
+pub(crate) fn response_envelope_error(
+    errcode: Option<i64>,
+    api_code: Option<&str>,
+    errmsg: Option<&str>,
+    success: Option<bool>,
+    request_id: Option<&str>,
+    body: &str,
+    error_body_snippet: BodySnippetConfig,
+) -> Option<Error> {
+    let (code, fallback) = if success == Some(false) {
+        (
+            errcode.filter(|code| *code != 0).unwrap_or(-1),
+            "DingTalk response success=false",
+        )
+    } else if let Some(code) = errcode.filter(|code| *code != 0) {
+        (code, "unknown dingtalk api error")
+    } else if api_code.is_some_and(|api_code| !is_success_api_code(api_code)) {
+        (-1, "unknown dingtalk api error")
+    } else {
+        return None;
+    };
+
+    Some(api_error_from_body_with_code(
+        code,
+        api_code.map(ToOwned::to_owned),
+        response_error_message(errmsg.map(ToOwned::to_owned), fallback),
+        request_id.map(ToOwned::to_owned),
+        body,
+        error_body_snippet,
+    ))
+}
+
+#[cfg(feature = "openapi")]
+fn response_content_type_is_json(response: &reqx::Response) -> bool {
+    response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("json"))
+}
+
+#[cfg(feature = "openapi")]
+fn binary_success_body_error(
+    body: &[u8],
+    content_type_is_json: bool,
+    error_body_snippet: BodySnippetConfig,
+) -> Option<Error> {
+    let text = std::str::from_utf8(body).ok()?;
+    if !content_type_is_json && !text.trim_start().starts_with('{') {
+        return None;
+    }
+    let parsed = serde_json::from_str::<StandardApiResponse>(text).ok()?;
+    response_envelope_error(
+        parsed.errcode,
+        parsed.api_code.as_deref(),
+        parsed.errmsg.as_deref(),
+        parsed.success,
+        parsed.request_id.as_deref(),
+        text,
+        error_body_snippet,
+    )
 }
 
 #[cfg(feature = "openapi")]
@@ -1041,6 +1028,32 @@ mod tests {
 
         assert_eq!(parsed.success, Some(false));
         assert_eq!(parsed_bool.success, Some(true));
+    }
+
+    #[cfg(feature = "openapi")]
+    #[test]
+    fn binary_success_body_detects_json_error_envelope() {
+        let body = br#"{"errcode":40001,"errmsg":"invalid token","requestId":"request-1"}"#;
+        let error = binary_success_body_error(body, true, BodySnippetConfig::default())
+            .expect("json error envelope should fail");
+
+        assert_eq!(error.kind(), crate::ErrorKind::Api);
+        assert_eq!(error.errcode(), Some(40001));
+        assert_eq!(error.request_id(), Some("request-1"));
+        assert!(error.to_string().contains("invalid token"));
+    }
+
+    #[cfg(feature = "openapi")]
+    #[test]
+    fn binary_success_body_ignores_non_json_binary_payload() {
+        assert!(
+            binary_success_body_error(
+                b"downloaded-file-bytes",
+                false,
+                BodySnippetConfig::default()
+            )
+            .is_none()
+        );
     }
 
     #[test]

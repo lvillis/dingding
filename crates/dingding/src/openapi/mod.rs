@@ -7,9 +7,8 @@ use crate::{
     DingTalk, Error, Result,
     auth::AppCredentials,
     transport::{
-        BodySnippetConfig, api_error_from_body, api_error_from_body_with_code,
-        decode_json_response, is_success_api_code, parse_binary_response, parse_dingtalk_result,
-        parse_standard_text_response, response_error_message,
+        BodySnippetConfig, api_error_from_body, decode_json_response, parse_binary_response,
+        parse_dingtalk_result, parse_standard_text_response, response_envelope_error,
     },
     util::{non_empty_trimmed, redact::redact_text},
 };
@@ -59,6 +58,11 @@ impl OpenApi {
             return Ok(token);
         }
 
+        let _refresh_guard = self.client.access_token_refresh_guard(credentials).await;
+        if let Some(token) = self.client.cached_access_token(credentials) {
+            return Ok(token);
+        }
+
         let mut url = self.client.webhook_endpoint(&["gettoken"])?;
         {
             let mut query = url.query_pairs_mut();
@@ -71,39 +75,16 @@ impl OpenApi {
             self.client.transport().error_body_snippet(),
         )?;
 
-        if let Some(code) = response.errcode
-            && code != 0
-        {
-            return Err(api_error_from_body_with_code(
-                code,
-                response.api_code.clone(),
-                response_error_message(response.errmsg, "unknown dingtalk api error"),
-                response.request_id,
-                &body,
-                self.client.transport().error_body_snippet(),
-            ));
-        }
-        if response.success == Some(false) {
-            return Err(api_error_from_body_with_code(
-                -1,
-                response.api_code.clone(),
-                response_error_message(response.errmsg, "DingTalk response success=false"),
-                response.request_id,
-                &body,
-                self.client.transport().error_body_snippet(),
-            ));
-        }
-        if let Some(api_code) = response.api_code.as_deref()
-            && !is_success_api_code(api_code)
-        {
-            return Err(api_error_from_body_with_code(
-                -1,
-                response.api_code.clone(),
-                response_error_message(response.errmsg, "unknown dingtalk api error"),
-                response.request_id,
-                &body,
-                self.client.transport().error_body_snippet(),
-            ));
+        if let Some(error) = response_envelope_error(
+            response.errcode,
+            response.api_code.as_deref(),
+            response.errmsg.as_deref(),
+            response.success,
+            response.request_id.as_deref(),
+            &body,
+            self.client.transport().error_body_snippet(),
+        ) {
+            return Err(error);
         }
 
         let token = response
@@ -2854,39 +2835,16 @@ fn parse_media_upload_response(
 ) -> Result<UploadedMedia> {
     let (parsed, body) =
         decode_json_response::<RawMediaUploadResponse>(response, error_body_snippet)?;
-    if let Some(code) = parsed.errcode
-        && code != 0
-    {
-        return Err(api_error_from_body_with_code(
-            code,
-            parsed.api_code.clone(),
-            response_error_message(parsed.errmsg, "unknown dingtalk api error"),
-            parsed.request_id,
-            &body,
-            error_body_snippet,
-        ));
-    }
-    if parsed.success == Some(false) {
-        return Err(api_error_from_body_with_code(
-            -1,
-            parsed.api_code.clone(),
-            response_error_message(parsed.errmsg, "DingTalk response success=false"),
-            parsed.request_id,
-            &body,
-            error_body_snippet,
-        ));
-    }
-    if let Some(api_code) = parsed.api_code.as_deref()
-        && !is_success_api_code(api_code)
-    {
-        return Err(api_error_from_body_with_code(
-            -1,
-            parsed.api_code.clone(),
-            response_error_message(parsed.errmsg, "unknown dingtalk api error"),
-            parsed.request_id,
-            &body,
-            error_body_snippet,
-        ));
+    if let Some(error) = response_envelope_error(
+        parsed.errcode,
+        parsed.api_code.as_deref(),
+        parsed.errmsg.as_deref(),
+        parsed.success,
+        parsed.request_id.as_deref(),
+        &body,
+        error_body_snippet,
+    ) {
+        return Err(error);
     }
 
     let raw = serde_json::from_str::<Value>(&body)?;

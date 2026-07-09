@@ -6,6 +6,8 @@ use std::{
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
+#[cfg(feature = "openapi")]
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 /// DingTalk application credentials.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -263,6 +265,38 @@ impl MemoryTokenCache {
 }
 
 #[cfg(feature = "openapi")]
+#[derive(Clone, Default)]
+pub(crate) struct TokenRefreshLocks {
+    inner: Arc<AsyncMutex<HashMap<AppCredentials, Arc<AsyncMutex<()>>>>>,
+}
+
+#[cfg(feature = "openapi")]
+impl TokenRefreshLocks {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) async fn lock(&self, credentials: &AppCredentials) -> TokenRefreshGuard {
+        let lock = {
+            let mut guard = self.inner.lock().await;
+            guard
+                .entry(credentials.clone())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone()
+        };
+
+        TokenRefreshGuard {
+            _guard: lock.lock_owned().await,
+        }
+    }
+}
+
+#[cfg(feature = "openapi")]
+pub(crate) struct TokenRefreshGuard {
+    _guard: OwnedMutexGuard<()>,
+}
+
+#[cfg(feature = "openapi")]
 #[derive(Clone)]
 struct CachedToken {
     token: String,
@@ -327,6 +361,27 @@ mod tests {
         assert!(debug.contains("entry_count"));
         assert!(!debug.contains("app-secret"));
         assert!(!debug.contains("access-token"));
+    }
+
+    #[cfg(feature = "openapi")]
+    #[tokio::test]
+    async fn token_refresh_locks_serialize_same_credentials() {
+        let credentials = AppCredentials::new("app-key", "app-secret");
+        let locks = TokenRefreshLocks::new();
+        let first = locks.lock(&credentials).await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), locks.lock(&credentials))
+                .await
+                .is_err()
+        );
+
+        drop(first);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), locks.lock(&credentials))
+                .await
+                .is_ok()
+        );
     }
 
     #[test]

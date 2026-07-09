@@ -2019,6 +2019,32 @@ fn dispatch_route(
     Some(handler(ctx, event))
 }
 
+#[derive(Clone)]
+enum BotValidationError {
+    InvalidConfig(String),
+    InvalidInput {
+        field: &'static str,
+        message: String,
+    },
+}
+
+impl BotValidationError {
+    fn from_error(error: Error) -> Self {
+        match error {
+            Error::InvalidConfig(message) => Self::InvalidConfig(message),
+            Error::InvalidInput { field, message } => Self::InvalidInput { field, message },
+            error => Self::InvalidConfig(error.to_string()),
+        }
+    }
+
+    fn to_error(&self) -> Error {
+        match self {
+            Self::InvalidConfig(message) => Error::InvalidConfig(message.clone()),
+            Self::InvalidInput { field, message } => Error::invalid_input(field, message.clone()),
+        }
+    }
+}
+
 /// Bot router and dispatcher.
 #[derive(Clone)]
 pub struct Bot {
@@ -2026,6 +2052,7 @@ pub struct Bot {
     routes: Vec<Route>,
     fallback: Option<Route>,
     state: Option<BotState>,
+    validation_error: Option<BotValidationError>,
 }
 
 impl Bot {
@@ -2037,6 +2064,7 @@ impl Bot {
             routes: Vec::new(),
             fallback: None,
             state: None,
+            validation_error: None,
         }
     }
 
@@ -2064,6 +2092,7 @@ impl Bot {
     /// Registers a route.
     #[must_use]
     pub fn route(mut self, route: Route) -> Self {
+        self.record_validation(route.validate());
         self.routes.push(route);
         self
     }
@@ -2182,6 +2211,7 @@ impl Bot {
     /// Registers a fallback route that runs when no normal route matches.
     #[must_use]
     pub fn fallback_route(mut self, route: Route) -> Self {
+        self.record_validation(route.validate());
         self.fallback = Some(route);
         self
     }
@@ -2236,13 +2266,18 @@ impl Bot {
 
     /// Validates all configured routes.
     pub fn validate(&self) -> Result<()> {
-        for route in &self.routes {
-            route.validate()?;
-        }
-        if let Some(route) = &self.fallback {
-            route.validate()?;
+        if let Some(error) = &self.validation_error {
+            return Err(error.to_error());
         }
         Ok(())
+    }
+
+    fn record_validation(&mut self, result: Result<()>) {
+        if self.validation_error.is_none()
+            && let Err(error) = result
+        {
+            self.validation_error = Some(BotValidationError::from_error(error));
+        }
     }
 
     /// Parses and dispatches an event from JSON.

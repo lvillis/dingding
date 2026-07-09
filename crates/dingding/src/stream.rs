@@ -19,8 +19,7 @@ use crate::{
         Bot, BotContext, BotEvent, BotState, ConversationScope, HandleOutcome, MessageType, Route,
     },
     transport::{
-        BodySnippetConfig, api_error_from_body, api_error_from_body_with_code,
-        decode_json_response, is_success_api_code, response_error_message,
+        BodySnippetConfig, api_error_from_body, decode_json_response, response_envelope_error,
     },
     util::{non_empty_trimmed, redact::redact_text},
 };
@@ -92,6 +91,7 @@ pub struct StreamBotBuilder {
     local_ip: Option<String>,
     user_agent: Option<String>,
     reconnect: ReconnectPolicy,
+    websocket_connect_timeout: Option<Duration>,
     event_handler: Option<StreamEventHandler>,
     frame_handler: Option<StreamFrameHandler>,
     card_callback_handler: Option<CardCallbackHandler>,
@@ -110,6 +110,7 @@ impl StreamBotBuilder {
             local_ip: None,
             user_agent: None,
             reconnect: ReconnectPolicy::default(),
+            websocket_connect_timeout: None,
             event_handler: None,
             frame_handler: None,
             card_callback_handler: None,
@@ -360,6 +361,13 @@ impl StreamBotBuilder {
         self
     }
 
+    /// Sets the WebSocket connect timeout.
+    #[must_use]
+    pub fn websocket_connect_timeout(mut self, value: Duration) -> Self {
+        self.websocket_connect_timeout = Some(value);
+        self
+    }
+
     /// Registers a synchronous runtime event handler.
     #[must_use]
     pub fn on_event<F>(mut self, handler: F) -> Self
@@ -455,6 +463,7 @@ impl StreamBotBuilder {
             local_ip,
             user_agent,
             reconnect,
+            websocket_connect_timeout,
             event_handler,
             frame_handler,
             card_callback_handler,
@@ -486,6 +495,9 @@ impl StreamBotBuilder {
                 card_callback_handler.is_some(),
             ))
             .reconnect_policy(reconnect);
+        if let Some(websocket_connect_timeout) = websocket_connect_timeout {
+            stream = stream.websocket_connect_timeout(websocket_connect_timeout);
+        }
 
         if has_bot_route {
             let mut bot = Bot::new(client.clone());
@@ -548,6 +560,7 @@ pub struct StreamClient {
     local_ip: Option<String>,
     user_agent: String,
     reconnect: ReconnectPolicy,
+    websocket_connect_timeout: Duration,
     bot: Option<Bot>,
     event_handler: Option<StreamEventHandler>,
     frame_handler: Option<StreamFrameHandler>,
@@ -569,9 +582,11 @@ impl StreamClient {
         self.emit_event(StreamRunEvent::ConnectionOpening { attempt });
         let ticket = self.open_connection().await?;
         let url = websocket_url(&ticket)?;
-        let (mut socket, _response) = connect_async(url.as_str())
-            .await
-            .map_err(|source| Error::stream(format!("websocket connect failed: {source}")))?;
+        let (mut socket, _response) =
+            tokio::time::timeout(self.websocket_connect_timeout, connect_async(url.as_str()))
+                .await
+                .map_err(|_elapsed| Error::stream("websocket connect timed out"))?
+                .map_err(|source| Error::stream(format!("websocket connect failed: {source}")))?;
         self.emit_event(StreamRunEvent::ConnectionOpened { attempt });
 
         while let Some(message) = socket.next().await {
@@ -945,6 +960,7 @@ pub struct StreamClientBuilder {
     local_ip: Option<String>,
     user_agent: String,
     reconnect: ReconnectPolicy,
+    websocket_connect_timeout: Duration,
     bot: Option<Bot>,
     event_handler: Option<StreamEventHandler>,
     frame_handler: Option<StreamFrameHandler>,
@@ -954,6 +970,7 @@ pub struct StreamClientBuilder {
 impl StreamClientBuilder {
     fn new(client: DingTalk) -> Result<Self> {
         let credentials = client.app_credentials();
+        let websocket_connect_timeout = client.stream_connect_timeout();
         Ok(Self {
             client,
             credentials,
@@ -962,6 +979,7 @@ impl StreamClientBuilder {
             local_ip: None,
             user_agent: concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")).to_string(),
             reconnect: ReconnectPolicy::default(),
+            websocket_connect_timeout,
             bot: None,
             event_handler: None,
             frame_handler: None,
@@ -1030,6 +1048,13 @@ impl StreamClientBuilder {
     #[must_use]
     pub fn reconnect_policy(mut self, value: ReconnectPolicy) -> Self {
         self.reconnect = value;
+        self
+    }
+
+    /// Sets the WebSocket connect timeout.
+    #[must_use]
+    pub fn websocket_connect_timeout(mut self, value: Duration) -> Self {
+        self.websocket_connect_timeout = value;
         self
     }
 
@@ -1159,6 +1184,7 @@ impl StreamClientBuilder {
         );
         let subscriptions = normalize_subscriptions(subscriptions)?;
         self.reconnect.validate()?;
+        validate_stream_duration("websocket_connect_timeout", self.websocket_connect_timeout)?;
         validate_user_agent(&self.user_agent)?;
         let user_agent = self.user_agent;
         let local_ip = self
@@ -1176,6 +1202,7 @@ impl StreamClientBuilder {
             local_ip,
             user_agent,
             reconnect: self.reconnect,
+            websocket_connect_timeout: self.websocket_connect_timeout,
             bot: self.bot,
             event_handler: self.event_handler,
             frame_handler: self.frame_handler,
@@ -1272,6 +1299,16 @@ impl ReconnectPolicy {
             .saturating_mul(multiplier)
             .min(self.max_delay)
     }
+}
+
+fn validate_stream_duration(field: &'static str, value: Duration) -> Result<()> {
+    if value.is_zero() {
+        return Err(Error::invalid_input(
+            field,
+            "value must be greater than zero",
+        ));
+    }
+    Ok(())
 }
 
 /// Stream subscription.
@@ -1675,39 +1712,16 @@ impl RawOpenConnectionResponse {
         body: &str,
         error_body_snippet: BodySnippetConfig,
     ) -> Result<OpenConnectionResponse> {
-        if let Some(code) = self.errcode
-            && code != 0
-        {
-            return Err(api_error_from_body_with_code(
-                code,
-                self.api_code.clone(),
-                response_error_message(self.errmsg, "unknown dingtalk api error"),
-                self.request_id,
-                body,
-                error_body_snippet,
-            ));
-        }
-        if self.success == Some(false) {
-            return Err(api_error_from_body_with_code(
-                -1,
-                self.api_code.clone(),
-                response_error_message(self.errmsg, "DingTalk response success=false"),
-                self.request_id,
-                body,
-                error_body_snippet,
-            ));
-        }
-        if let Some(api_code) = self.api_code.as_deref()
-            && !is_success_api_code(api_code)
-        {
-            return Err(api_error_from_body_with_code(
-                -1,
-                self.api_code.clone(),
-                response_error_message(self.errmsg, "unknown dingtalk api error"),
-                self.request_id,
-                body,
-                error_body_snippet,
-            ));
+        if let Some(error) = response_envelope_error(
+            self.errcode,
+            self.api_code.as_deref(),
+            self.errmsg.as_deref(),
+            self.success,
+            self.request_id.as_deref(),
+            body,
+            error_body_snippet,
+        ) {
+            return Err(error);
         }
 
         let endpoint = self
@@ -3331,6 +3345,63 @@ mod tests {
 
         assert_eq!(stream.subscriptions.len(), 1);
         assert_eq!(stream.subscriptions[0].topic(), CARD_CALLBACK_TOPIC);
+    }
+
+    #[test]
+    fn stream_builder_inherits_client_connect_timeout_for_websocket() {
+        let client = DingTalk::builder()
+            .app_key_and_secret("client-id", "client-secret")
+            .connect_timeout(Duration::from_secs(7))
+            .build()
+            .expect("client");
+
+        let stream = StreamClient::builder(client)
+            .expect("builder")
+            .on_frame(|_frame| async { Ok(()) })
+            .build()
+            .expect("stream");
+
+        assert_eq!(stream.websocket_connect_timeout, Duration::from_secs(7));
+    }
+
+    #[test]
+    fn stream_builder_overrides_and_validates_websocket_connect_timeout() {
+        let client = DingTalk::builder()
+            .app_key_and_secret("client-id", "client-secret")
+            .connect_timeout(Duration::from_secs(7))
+            .build()
+            .expect("client");
+        let stream = StreamClient::builder(client.clone())
+            .expect("builder")
+            .websocket_connect_timeout(Duration::from_secs(9))
+            .on_frame(|_frame| async { Ok(()) })
+            .build()
+            .expect("stream");
+        let invalid = StreamClient::builder(client)
+            .expect("builder")
+            .websocket_connect_timeout(Duration::ZERO)
+            .on_frame(|_frame| async { Ok(()) })
+            .build()
+            .err()
+            .expect("zero websocket timeout should fail");
+
+        assert_eq!(stream.websocket_connect_timeout, Duration::from_secs(9));
+        assert_eq!(invalid.kind(), crate::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn stream_bot_builder_forwards_websocket_connect_timeout() {
+        let stream = StreamBot::builder()
+            .client_id_and_secret("client-id", "client-secret")
+            .websocket_connect_timeout(Duration::from_secs(9))
+            .on_frame(|_frame| async { Ok(()) })
+            .build()
+            .expect("stream bot");
+
+        assert_eq!(
+            stream.client.websocket_connect_timeout,
+            Duration::from_secs(9)
+        );
     }
 
     #[test]

@@ -641,6 +641,49 @@ async fn openapi_upload_media_posts_legacy_multipart_body() -> TestResult<()> {
 }
 
 #[tokio::test]
+async fn openapi_concurrent_requests_share_token_refresh() -> TestResult<()> {
+    let server = MockServer::spawn([
+        MockResponse::json(
+            r#"{"errcode":0,"errmsg":"ok","access_token":"token-123","expires_in":7200}"#,
+        ),
+        MockResponse::json(r#"{"errcode":0,"errmsg":"ok","processQueryKey":"pq-1"}"#),
+        MockResponse::json(r#"{"errcode":0,"errmsg":"ok","processQueryKey":"pq-2"}"#),
+    ])?;
+    let client = dingtalk_for_mock(&server)?;
+    let robot = client.openapi().robot("robot-code")?;
+
+    let (first, second) = tokio::join!(
+        robot.send_group_text("open-cid-1", "first"),
+        robot.send_group_text("open-cid-2", "second")
+    );
+    let mut keys = [
+        first?.process_query_key().to_string(),
+        second?.process_query_key().to_string(),
+    ];
+    keys.sort();
+
+    assert_eq!(keys, ["pq-1".to_string(), "pq-2".to_string()]);
+
+    let token_request = server.next_request()?;
+    assert_eq!(token_request.path(), "/gettoken");
+
+    let first_send = server.next_request()?;
+    let second_send = server.next_request()?;
+    assert_eq!(first_send.path(), "/v1.0/robot/groupMessages/send");
+    assert_eq!(second_send.path(), "/v1.0/robot/groupMessages/send");
+    assert_eq!(
+        first_send.header("x-acs-dingtalk-access-token"),
+        Some("token-123")
+    );
+    assert_eq!(
+        second_send.header("x-acs-dingtalk-access-token"),
+        Some("token-123")
+    );
+
+    server.finish()
+}
+
+#[tokio::test]
 async fn openapi_business_error_preserves_request_id_and_body_snippet() -> TestResult<()> {
     let server = MockServer::spawn([
         MockResponse::json(
@@ -766,6 +809,58 @@ async fn openapi_download_message_file_fetches_temporary_url_bytes() -> TestResu
         file_request.query_value("ticket").as_deref(),
         Some("temporary")
     );
+
+    api_server.finish()?;
+    download_server.finish()
+}
+
+#[tokio::test]
+async fn openapi_download_message_file_rejects_json_error_body() -> TestResult<()> {
+    let download_server = MockServer::spawn([MockResponse::json(
+        r#"{"errcode":40001,"errmsg":"download denied","requestId":"req-file"}"#,
+    )])?;
+    let download_url = format!(
+        "{}/files/report.bin?ticket=temporary",
+        download_server.base_url()
+    );
+    let download_response = json!({
+        "errcode": 0,
+        "result": {
+            "downloadUrl": download_url,
+        },
+        "requestId": "req-download-url",
+    })
+    .to_string();
+    let api_server = MockServer::spawn([
+        MockResponse::json(
+            r#"{"errcode":0,"errmsg":"ok","access_token":"token-123","expires_in":7200}"#,
+        ),
+        MockResponse::json(&download_response),
+    ])?;
+    let client = dingtalk_for_mock(&api_server)?;
+
+    let error = client
+        .openapi()
+        .robot("robot-code")?
+        .download_message_file("download-code")
+        .await
+        .err()
+        .ok_or("json file error should fail")?;
+
+    assert_eq!(error.kind(), ErrorKind::Api);
+    assert_eq!(error.errcode(), Some(40001));
+    assert_eq!(error.request_id(), Some("req-file"));
+    assert!(error.to_string().contains("download denied"));
+
+    let token_request = api_server.next_request()?;
+    assert_eq!(token_request.path(), "/gettoken");
+    let download_url_request = api_server.next_request()?;
+    assert_eq!(
+        download_url_request.path(),
+        "/v1.0/robot/messageFiles/download"
+    );
+    let file_request = download_server.next_request()?;
+    assert_eq!(file_request.path(), "/files/report.bin");
 
     api_server.finish()?;
     download_server.finish()

@@ -17,7 +17,7 @@ async-tls-rustls-ring = ["reqx/async-tls-rustls-ring"]
 async-tls-rustls-aws-lc-rs = ["reqx/async-tls-rustls-aws-lc-rs"]
 async-tls-native = ["reqx/async-tls-native"]
 webhook = []
-openapi = []
+openapi = ["dep:tokio"]
 bot = ["webhook"]
 stream = ["openapi", "bot", "dep:futures-util", "dep:tokio", "dep:tokio-tungstenite"]
 macros = ["bot", "dep:dingding-macros"]
@@ -31,7 +31,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, optional = true, features = ["time"] }
+tokio = { workspace = true, optional = true, features = ["sync", "time"] }
 tokio-tungstenite = { workspace = true, optional = true }
 url = { workspace = true }
 urlencoding = { workspace = true }
