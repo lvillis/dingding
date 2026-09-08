@@ -3,13 +3,12 @@ use std::{
 };
 
 use futures_util::{
-    Sink, SinkExt, StreamExt,
     future::{Either, FutureExt, pending, select},
     pin_mut,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::connect_async;
 use url::Url;
 
 use crate::{
@@ -23,6 +22,10 @@ use crate::{
     },
     util::{non_empty_trimmed, redact::redact_text},
 };
+
+mod runtime;
+use crate::bot::dedup::{EventDeduplicator, MemoryEventDeduplicator};
+pub use runtime::StreamProcessingPolicy;
 
 /// Stream topic for robot message callbacks.
 pub const BOT_MESSAGE_TOPIC: &str = "/v1.0/im/bot/messages/get";
@@ -92,6 +95,8 @@ pub struct StreamBotBuilder {
     user_agent: Option<String>,
     reconnect: ReconnectPolicy,
     websocket_connect_timeout: Option<Duration>,
+    processing: StreamProcessingPolicy,
+    deduplicator: Arc<dyn EventDeduplicator>,
     event_handler: Option<StreamEventHandler>,
     frame_handler: Option<StreamFrameHandler>,
     card_callback_handler: Option<CardCallbackHandler>,
@@ -111,6 +116,8 @@ impl StreamBotBuilder {
             user_agent: None,
             reconnect: ReconnectPolicy::default(),
             websocket_connect_timeout: None,
+            processing: StreamProcessingPolicy::default(),
+            deduplicator: Arc::new(MemoryEventDeduplicator::default()),
             event_handler: None,
             frame_handler: None,
             card_callback_handler: None,
@@ -368,6 +375,20 @@ impl StreamBotBuilder {
         self
     }
 
+    /// Configures bounded business processing and graceful shutdown.
+    #[must_use]
+    pub fn processing_policy(mut self, value: StreamProcessingPolicy) -> Self {
+        self.processing = value;
+        self
+    }
+
+    /// Uses a shared deduplication backend for Stream frames and bot callbacks.
+    #[must_use]
+    pub fn deduplicator(mut self, store: Arc<dyn EventDeduplicator>) -> Self {
+        self.deduplicator = store;
+        self
+    }
+
     /// Registers a synchronous runtime event handler.
     #[must_use]
     pub fn on_event<F>(mut self, handler: F) -> Self
@@ -464,6 +485,8 @@ impl StreamBotBuilder {
             user_agent,
             reconnect,
             websocket_connect_timeout,
+            processing,
+            deduplicator,
             event_handler,
             frame_handler,
             card_callback_handler,
@@ -494,13 +517,15 @@ impl StreamBotBuilder {
                 frame_handler.is_some(),
                 card_callback_handler.is_some(),
             ))
-            .reconnect_policy(reconnect);
+            .reconnect_policy(reconnect)
+            .processing_policy(processing)
+            .deduplicator(Arc::clone(&deduplicator));
         if let Some(websocket_connect_timeout) = websocket_connect_timeout {
             stream = stream.websocket_connect_timeout(websocket_connect_timeout);
         }
 
         if has_bot_route {
-            let mut bot = Bot::new(client.clone());
+            let mut bot = Bot::new(client.clone()).deduplicator(deduplicator);
             for route in routes {
                 bot = bot.route(route);
             }
@@ -561,6 +586,8 @@ pub struct StreamClient {
     user_agent: String,
     reconnect: ReconnectPolicy,
     websocket_connect_timeout: Duration,
+    processing: StreamProcessingPolicy,
+    deduplicator: Arc<dyn EventDeduplicator>,
     bot: Option<Bot>,
     event_handler: Option<StreamEventHandler>,
     frame_handler: Option<StreamFrameHandler>,
@@ -575,87 +602,40 @@ impl StreamClient {
 
     /// Opens one Stream WebSocket connection and runs until the connection closes.
     pub async fn run_once(&self) -> Result<StreamExit> {
-        self.run_once_with_attempt(1).await
+        let mut shutdown = Box::pin(pending());
+        self.run_once_with_shutdown(1, shutdown.as_mut())
+            .await?
+            .ok_or_else(|| Error::stream("unexpected shutdown"))
     }
 
-    async fn run_once_with_attempt(&self, attempt: u32) -> Result<StreamExit> {
+    async fn run_once_with_shutdown<F>(
+        &self,
+        attempt: u32,
+        mut shutdown: Pin<&mut F>,
+    ) -> Result<Option<StreamExit>>
+    where
+        F: Future<Output = ()> + ?Sized,
+    {
         self.emit_event(StreamRunEvent::ConnectionOpening { attempt });
-        let ticket = self.open_connection().await?;
-        let url = websocket_url(&ticket)?;
-        let (mut socket, _response) =
+        let connect = async {
+            let ticket = self.open_connection().await?;
+            let url = websocket_url(&ticket)?;
             tokio::time::timeout(self.websocket_connect_timeout, connect_async(url.as_str()))
                 .await
-                .map_err(|_elapsed| Error::stream("websocket connect timed out"))?
-                .map_err(|source| Error::stream(format!("websocket connect failed: {source}")))?;
+                .map_err(|_| Error::stream("websocket connect timed out"))?
+                .map_err(|source| Error::stream(format!("websocket connect failed: {source}")))
+        };
+        let (socket, _response) = tokio::select! {
+            biased;
+            () = shutdown.as_mut() => return Ok(None),
+            result = connect => result?,
+        };
         self.emit_event(StreamRunEvent::ConnectionOpened { attempt });
-
-        while let Some(message) = socket.next().await {
-            let message = message
-                .map_err(|source| Error::stream(format!("websocket receive failed: {source}")))?;
-
-            match message {
-                Message::Text(text) => {
-                    if self.handle_frame_and_ack(&mut socket, &text).await? {
-                        self.emit_event(StreamRunEvent::ConnectionClosed {
-                            attempt,
-                            exit: StreamExit::Disconnect,
-                        });
-                        return Ok(StreamExit::Disconnect);
-                    }
-                }
-                Message::Binary(bytes) => {
-                    let text = String::from_utf8(bytes.to_vec()).map_err(|source| {
-                        Error::stream(format!("invalid utf-8 frame: {source}"))
-                    })?;
-                    if self.handle_frame_and_ack(&mut socket, &text).await? {
-                        self.emit_event(StreamRunEvent::ConnectionClosed {
-                            attempt,
-                            exit: StreamExit::Disconnect,
-                        });
-                        return Ok(StreamExit::Disconnect);
-                    }
-                }
-                Message::Ping(bytes) => {
-                    socket.send(Message::Pong(bytes)).await.map_err(|source| {
-                        Error::stream(format!("websocket pong failed: {source}"))
-                    })?;
-                }
-                Message::Pong(_) => {}
-                Message::Close(_) => {
-                    self.emit_event(StreamRunEvent::ConnectionClosed {
-                        attempt,
-                        exit: StreamExit::Closed,
-                    });
-                    return Ok(StreamExit::Closed);
-                }
-                Message::Frame(_) => {}
-            }
+        let exit = self.run_socket(socket, shutdown).await?;
+        if let Some(exit) = exit {
+            self.emit_event(StreamRunEvent::ConnectionClosed { attempt, exit });
         }
-
-        self.emit_event(StreamRunEvent::ConnectionClosed {
-            attempt,
-            exit: StreamExit::Closed,
-        });
-        Ok(StreamExit::Closed)
-    }
-
-    async fn handle_frame_and_ack<S>(&self, socket: &mut S, text: &str) -> Result<bool>
-    where
-        S: Sink<Message> + Unpin,
-        S::Error: std::fmt::Display,
-    {
-        let response = self.handle_text_frame(text).await;
-        let handled = response.unwrap_or_else(StreamHandleResult::internal_error);
-        self.emit_frame_error(&handled);
-
-        let exit_after_ack = handled.exit_after_ack;
-        let payload = serde_json::to_string(&handled.ack)?;
-        socket
-            .send(Message::Text(payload.into()))
-            .await
-            .map_err(|source| Error::stream(format!("websocket send failed: {source}")))?;
-
-        Ok(exit_after_ack)
+        Ok(exit)
     }
 
     /// Runs the Stream client forever with reconnect backoff.
@@ -673,20 +653,20 @@ impl StreamClient {
         let mut attempt = 1_u32;
 
         loop {
-            let run_once = self.run_once_with_attempt(attempt).fuse();
-            pin_mut!(run_once);
-
-            let run_result = match select(run_once, shutdown.as_mut()).await {
-                Either::Left((result, _shutdown)) => result,
-                Either::Right(((), _run_once)) => {
+            let run_result = self
+                .run_once_with_shutdown(attempt, shutdown.as_mut())
+                .await;
+            match run_result {
+                Ok(None) => {
                     self.emit_event(StreamRunEvent::Shutdown);
                     return Ok(());
                 }
-            };
-
-            match run_result {
-                Ok(StreamExit::Disconnect | StreamExit::Closed) => {}
+                Ok(Some(StreamExit::Disconnect | StreamExit::Closed)) => {}
                 Err(error) => {
+                    if futures_util::future::FusedFuture::is_terminated(&shutdown) {
+                        self.emit_event(StreamRunEvent::Shutdown);
+                        return Err(error);
+                    }
                     let retrying = self.reconnect.retry_on_error;
                     self.emit_event(StreamRunEvent::ConnectionError {
                         attempt,
@@ -741,6 +721,7 @@ impl StreamClient {
         value.into_connection(&body, error_body_snippet)
     }
 
+    #[cfg(test)]
     async fn handle_text_frame(&self, text: &str) -> Result<StreamHandleResult> {
         let frame = match StreamFrame::from_text(text) {
             Ok(frame) => frame,
@@ -754,6 +735,10 @@ impl StreamClient {
             }
         };
 
+        self.handle_parsed_frame(frame).await
+    }
+
+    async fn handle_parsed_frame(&self, frame: StreamFrame) -> Result<StreamHandleResult> {
         if frame.frame_type == StreamFrameType::Callback
             && frame.headers.topic == BOT_MESSAGE_TOPIC
             && let Some(bot) = &self.bot
@@ -938,10 +923,6 @@ impl StreamHandleResult {
         }
     }
 
-    fn internal_error(error: Error) -> Self {
-        Self::frame_error(None, StreamAck::internal_error(String::new()), error)
-    }
-
     fn frame_error(message_id: Option<String>, ack: StreamAck, error: Error) -> Self {
         Self {
             ack,
@@ -961,6 +942,8 @@ pub struct StreamClientBuilder {
     user_agent: String,
     reconnect: ReconnectPolicy,
     websocket_connect_timeout: Duration,
+    processing: StreamProcessingPolicy,
+    deduplicator: Arc<dyn EventDeduplicator>,
     bot: Option<Bot>,
     event_handler: Option<StreamEventHandler>,
     frame_handler: Option<StreamFrameHandler>,
@@ -980,6 +963,8 @@ impl StreamClientBuilder {
             user_agent: concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")).to_string(),
             reconnect: ReconnectPolicy::default(),
             websocket_connect_timeout,
+            processing: StreamProcessingPolicy::default(),
+            deduplicator: Arc::new(MemoryEventDeduplicator::default()),
             bot: None,
             event_handler: None,
             frame_handler: None,
@@ -1055,6 +1040,20 @@ impl StreamClientBuilder {
     #[must_use]
     pub fn websocket_connect_timeout(mut self, value: Duration) -> Self {
         self.websocket_connect_timeout = value;
+        self
+    }
+
+    /// Configures bounded business processing and graceful shutdown.
+    #[must_use]
+    pub fn processing_policy(mut self, value: StreamProcessingPolicy) -> Self {
+        self.processing = value;
+        self
+    }
+
+    /// Uses a shared Stream frame deduplication backend.
+    #[must_use]
+    pub fn deduplicator(mut self, store: Arc<dyn EventDeduplicator>) -> Self {
+        self.deduplicator = store;
         self
     }
 
@@ -1184,6 +1183,7 @@ impl StreamClientBuilder {
         );
         let subscriptions = normalize_subscriptions(subscriptions)?;
         self.reconnect.validate()?;
+        self.processing.validate()?;
         validate_stream_duration("websocket_connect_timeout", self.websocket_connect_timeout)?;
         validate_user_agent(&self.user_agent)?;
         let user_agent = self.user_agent;
@@ -1203,6 +1203,8 @@ impl StreamClientBuilder {
             user_agent,
             reconnect: self.reconnect,
             websocket_connect_timeout: self.websocket_connect_timeout,
+            processing: self.processing,
+            deduplicator: self.deduplicator,
             bot: self.bot,
             event_handler: self.event_handler,
             frame_handler: self.frame_handler,
@@ -1302,10 +1304,10 @@ impl ReconnectPolicy {
 }
 
 fn validate_stream_duration(field: &'static str, value: Duration) -> Result<()> {
-    if value.is_zero() {
+    if value.is_zero() || std::time::Instant::now().checked_add(value).is_none() {
         return Err(Error::invalid_input(
             field,
-            "value must be greater than zero",
+            "value must be positive and fit a monotonic deadline",
         ));
     }
     Ok(())

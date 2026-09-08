@@ -16,6 +16,11 @@ use sha2::Sha256;
 
 use crate::{DingTalk, Error, Result, util::redact::redact_text};
 
+/// Event deduplication backends and reservation contracts.
+pub mod dedup;
+
+use dedup::{Deduplication, EventDeduplicator, MemoryEventDeduplicator};
+
 type BoxFuture = Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
 type BoxedHandler = Arc<dyn Fn(BotContext, BotEvent) -> BoxFuture + Send + Sync + 'static>;
 pub(crate) type BotState = Arc<dyn Any + Send + Sync + 'static>;
@@ -2053,6 +2058,7 @@ pub struct Bot {
     fallback: Option<Route>,
     state: Option<BotState>,
     validation_error: Option<BotValidationError>,
+    deduplicator: Arc<dyn EventDeduplicator>,
 }
 
 impl Bot {
@@ -2065,7 +2071,15 @@ impl Bot {
             fallback: None,
             state: None,
             validation_error: None,
+            deduplicator: Arc::new(MemoryEventDeduplicator::default()),
         }
+    }
+
+    /// Uses a shared event deduplication backend for callbacks with a message id.
+    #[must_use]
+    pub fn deduplicator(mut self, store: Arc<dyn EventDeduplicator>) -> Self {
+        self.deduplicator = store;
+        self
     }
 
     /// Configures shared application state available from [`BotContext::state`].
@@ -2240,6 +2254,38 @@ impl Bot {
     pub async fn handle_event(&self, event: BotEvent) -> Result<HandleOutcome> {
         self.validate()?;
 
+        let Some(message_id) = event.message_id.as_deref().filter(|id| !id.is_empty()) else {
+            return self.dispatch_event(event).await;
+        };
+        let key = serde_json::to_string(&(
+            "bot",
+            &event.raw.get("robotCode"),
+            &event.open_conversation_id,
+            &event.sender_id,
+            message_id,
+        ))?;
+        match self.deduplicator.claim(&key).await? {
+            Deduplication::Acquired(lease) => {
+                let outcome = self.dispatch_event(event).await?;
+                lease
+                    .complete(Value::String(outcome.as_str().to_owned()))
+                    .await?;
+                Ok(outcome)
+            }
+            Deduplication::Completed(value) => match value.as_str() {
+                Some("matched") => Ok(HandleOutcome::Matched),
+                Some("fallback") => Ok(HandleOutcome::Fallback),
+                Some("ignored") => Ok(HandleOutcome::Ignored),
+                _ => Err(Error::InvalidConfig("invalid cached bot outcome".into())),
+            },
+            Deduplication::InFlight => Err(Error::invalid_input(
+                "message_id",
+                "event is already being processed",
+            )),
+        }
+    }
+
+    async fn dispatch_event(&self, event: BotEvent) -> Result<HandleOutcome> {
         for route in &self.routes {
             if !route.matches(&event) {
                 continue;

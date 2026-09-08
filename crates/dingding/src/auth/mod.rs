@@ -262,6 +262,16 @@ impl MemoryTokenCache {
             guard.insert(credentials, CachedToken { token, expires_at });
         }
     }
+
+    pub(crate) fn invalidate(&self, credentials: &AppCredentials, rejected_token: &str) {
+        if let Ok(mut guard) = self.inner.write()
+            && guard
+                .get(credentials)
+                .is_some_and(|cached| cached.token == rejected_token)
+        {
+            guard.remove(credentials);
+        }
+    }
 }
 
 #[cfg(feature = "openapi")]
@@ -315,6 +325,18 @@ fn normalize_token_ttl(expires_in_seconds: Option<i64>) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "openapi")]
+    #[test]
+    fn rejected_old_token_does_not_evict_new_token() {
+        let credentials = AppCredentials::new("app-key", "app-secret");
+        let cache = MemoryTokenCache::new();
+        cache.store(credentials.clone(), "new-token".into(), Some(7200));
+        cache.invalidate(&credentials, "old-token");
+        assert_eq!(cache.get(&credentials).as_deref(), Some("new-token"));
+        cache.invalidate(&credentials, "new-token");
+        assert!(cache.get(&credentials).is_none());
+    }
 
     #[cfg(feature = "openapi")]
     #[test]

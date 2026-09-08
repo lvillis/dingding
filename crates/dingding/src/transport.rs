@@ -203,6 +203,20 @@ impl Transport {
     }
 
     #[cfg(feature = "openapi")]
+    pub(crate) async fn get_openapi(
+        &self,
+        url: &Url,
+        access_token: &str,
+    ) -> Result<reqx::Response> {
+        Ok(self
+            .openapi_http
+            .get(url.as_str())
+            .try_header("x-acs-dingtalk-access-token", access_token)?
+            .send_response()
+            .await?)
+    }
+
+    #[cfg(feature = "openapi")]
     pub(crate) async fn put_openapi_json<T>(
         &self,
         url: &Url,
@@ -524,6 +538,34 @@ where
 }
 
 #[cfg(feature = "openapi")]
+pub(crate) fn parse_openapi_response<T: DeserializeOwned>(
+    response: reqx::Response,
+    config: BodySnippetConfig,
+) -> Result<T> {
+    let (envelope, body) = decode_json_response::<StandardApiResponse>(response, config)?;
+    if let Some(error) = response_envelope_error(
+        envelope.errcode,
+        envelope.api_code.as_deref(),
+        envelope.errmsg.as_deref(),
+        envelope.success,
+        envelope.request_id.as_deref(),
+        &body,
+        config,
+    ) {
+        return Err(error);
+    }
+    serde_json::from_str(&body).map_err(|error| {
+        api_error_from_body(
+            -1,
+            format!("invalid DingTalk response payload: {error}"),
+            envelope.request_id,
+            &body,
+            config,
+        )
+    })
+}
+
+#[cfg(feature = "openapi")]
 pub(crate) fn parse_binary_response(
     response: reqx::Response,
     error_body_snippet: BodySnippetConfig,
@@ -672,7 +714,11 @@ fn successful_body(
         let request_id =
             request_id.or_else(|| parsed.as_ref().and_then(|parsed| parsed.request_id.clone()));
         return Err(api_error_from_body_with_code(
-            status.into(),
+            parsed
+                .as_ref()
+                .and_then(|parsed| parsed.errcode)
+                .filter(|code| *code != 0)
+                .unwrap_or(status.into()),
             parsed.as_ref().and_then(|parsed| parsed.api_code.clone()),
             message.unwrap_or_else(|| format!("HTTP {status}")),
             request_id,

@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, future::Future};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -11,6 +11,12 @@ use crate::{
         parse_dingtalk_result, parse_standard_text_response, response_envelope_error,
     },
     util::{non_empty_trimmed, redact::redact_text},
+};
+
+mod lifecycle;
+pub use lifecycle::{
+    GroupMessageQuery, GroupMessageReader, GroupMessageStatus, MessageReadInfo,
+    MessageRecallResponse, PrivateMessageStatus,
 };
 
 /// Minimal OpenAPI service.
@@ -114,41 +120,43 @@ impl OpenApi {
         B: Serialize + ?Sized,
     {
         let url = self.client.openapi_endpoint(segments)?;
-        let access_token = self.access_token().await?;
-        parse_dingtalk_result(
-            self.client
-                .transport()
-                .post_openapi_json(&url, Some(&access_token), body)
-                .await?,
-            self.client.transport().error_body_snippet(),
-        )
+        let url = &url;
+        self.with_access_token(|access_token| async move {
+            parse_dingtalk_result(
+                self.client
+                    .transport()
+                    .post_openapi_json(url, Some(&access_token), body)
+                    .await?,
+                self.client.transport().error_body_snippet(),
+            )
+        })
+        .await
     }
 
     /// Uploads a DingTalk media resource for robot image, voice, video, or file messages.
     pub async fn upload_media(&self, upload: MediaUpload) -> Result<UploadedMedia> {
         upload.validate()?;
+        let upload = &upload;
         let media_type = upload.media_type().as_str();
 
-        let access_token = self.access_token().await?;
-        let mut url = self.client.webhook_endpoint(&["media", "upload"])?;
-        {
-            let mut query = url.query_pairs_mut();
-            query.append_pair("access_token", &access_token);
-            query.append_pair("type", media_type);
-        }
-
-        let (content_type, body) = media_upload_multipart_body(&upload)?;
-        let response = self
-            .client
-            .transport()
-            .post_webhook_body(&url, &content_type, body)
-            .await?;
-
-        parse_media_upload_response(
-            response,
-            self.client.transport().error_body_snippet(),
-            upload.media_type(),
-        )
+        self.with_access_token(|access_token| async move {
+            let mut url = self.client.webhook_endpoint(&["media", "upload"])?;
+            url.query_pairs_mut()
+                .append_pair("access_token", &access_token)
+                .append_pair("type", media_type);
+            let (content_type, body) = media_upload_multipart_body(upload)?;
+            let response = self
+                .client
+                .transport()
+                .post_webhook_body(&url, &content_type, body)
+                .await?;
+            parse_media_upload_response(
+                response,
+                self.client.transport().error_body_snippet(),
+                upload.media_type(),
+            )
+        })
+        .await
     }
 
     /// Creates a robot message helper for an app robot code.
@@ -3007,18 +3015,43 @@ fn is_false(value: &bool) -> bool {
 }
 
 impl OpenApi {
+    async fn with_access_token<T, F, Fut>(&self, mut request: F) -> Result<T>
+    where
+        F: FnMut(String) -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let token = self.access_token().await?;
+        match request(token.clone()).await {
+            Err(error) if is_rejected_access_token(&error) => {
+                let credentials = self.credentials.as_ref().ok_or(Error::MissingCredentials)?;
+                // A late rejection must not evict a token refreshed by another request.
+                self.client.invalidate_access_token(credentials, &token);
+                let token = self.access_token().await?;
+                let result = request(token.clone()).await;
+                if result.as_ref().is_err_and(is_rejected_access_token) {
+                    self.client.invalidate_access_token(credentials, &token);
+                }
+                result
+            }
+            result => result,
+        }
+    }
+
     async fn post_raw_text<B>(&self, segments: &[&str], body: &B) -> Result<String>
     where
         B: Serialize + ?Sized,
     {
         let url = self.client.openapi_endpoint(segments)?;
-        let access_token = self.access_token().await?;
-        let response = self
-            .client
-            .transport()
-            .post_openapi_json(&url, Some(&access_token), body)
-            .await?;
-        parse_standard_text_response(response, self.client.transport().error_body_snippet())
+        let url = &url;
+        self.with_access_token(|access_token| async move {
+            let response = self
+                .client
+                .transport()
+                .post_openapi_json(url, Some(&access_token), body)
+                .await?;
+            parse_standard_text_response(response, self.client.transport().error_body_snippet())
+        })
+        .await
     }
 
     async fn put_raw_text<B>(&self, segments: &[&str], body: &B) -> Result<String>
@@ -3026,14 +3059,29 @@ impl OpenApi {
         B: Serialize + ?Sized,
     {
         let url = self.client.openapi_endpoint(segments)?;
-        let access_token = self.access_token().await?;
-        let response = self
-            .client
-            .transport()
-            .put_openapi_json(&url, Some(&access_token), body)
-            .await?;
-        parse_standard_text_response(response, self.client.transport().error_body_snippet())
+        let url = &url;
+        self.with_access_token(|access_token| async move {
+            let response = self
+                .client
+                .transport()
+                .put_openapi_json(url, Some(&access_token), body)
+                .await?;
+            parse_standard_text_response(response, self.client.transport().error_body_snippet())
+        })
+        .await
     }
+}
+
+fn is_rejected_access_token(error: &Error) -> bool {
+    matches!(error.errcode(), Some(40014 | 42001))
+        || matches!(
+            error.api_code(),
+            Some(
+                "InvalidAuthentication"
+                    | "InvalidAuthentication.AccessTokenInvalid"
+                    | "InvalidAuthentication.AccessTokenExpired"
+            )
+        )
 }
 
 #[derive(Deserialize)]

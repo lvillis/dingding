@@ -102,6 +102,11 @@ impl DingTalk {
     }
 
     #[cfg(feature = "openapi")]
+    pub(crate) fn invalidate_access_token(&self, credentials: &AppCredentials, token: &str) {
+        self.inner.token_cache.invalidate(credentials, token);
+    }
+
+    #[cfg(feature = "openapi")]
     pub(crate) async fn access_token_refresh_guard(
         &self,
         credentials: &AppCredentials,

@@ -905,6 +905,261 @@ async fn openapi_http_error_uses_body_request_id_when_header_is_missing() -> Tes
     server.finish()
 }
 
+#[tokio::test]
+async fn rejected_tokens_are_refreshed_once_before_replaying_the_same_request() -> TestResult<()> {
+    for rejection in [
+        MockResponse::json(r#"{"errcode":40014,"errmsg":"invalid access token"}"#),
+        MockResponse::json_status(
+            401,
+            "Unauthorized",
+            r#"{"errcode":40014,"errmsg":"invalid access token"}"#,
+        ),
+        MockResponse::json_status(
+            401,
+            "Unauthorized",
+            r#"{"code":"InvalidAuthentication","message":"invalid access token"}"#,
+        ),
+    ] {
+        let server = MockServer::spawn([
+            MockResponse::json(r#"{"errcode":0,"access_token":"old-token","expires_in":7200}"#),
+            rejection,
+            MockResponse::json(r#"{"errcode":0,"access_token":"new-token","expires_in":7200}"#),
+            MockResponse::json(r#"{"processQueryKey":"pq"}"#),
+        ])?;
+        let robot = dingtalk_for_mock(&server)?.openapi().robot("robot-code")?;
+        assert_eq!(
+            robot
+                .send_group_text("cid", "hello")
+                .await?
+                .process_query_key(),
+            "pq"
+        );
+        assert_eq!(server.next_request()?.path(), "/gettoken");
+        let original = server.next_request()?;
+        assert_eq!(server.next_request()?.path(), "/gettoken");
+        let retry = server.next_request()?;
+        assert_eq!(
+            original.header("x-acs-dingtalk-access-token"),
+            Some("old-token")
+        );
+        assert_eq!(
+            retry.header("x-acs-dingtalk-access-token"),
+            Some("new-token")
+        );
+        assert_eq!(original.json_body()?, retry.json_body()?);
+        server.finish()?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn repeated_token_rejection_stops_and_invalidates_the_rejected_refresh() -> TestResult<()> {
+    let server = MockServer::spawn([
+        MockResponse::json(r#"{"errcode":0,"access_token":"old-token","expires_in":7200}"#),
+        MockResponse::json(r#"{"errcode":42001,"errmsg":"expired"}"#),
+        MockResponse::json(r#"{"errcode":0,"access_token":"new-token","expires_in":7200}"#),
+        MockResponse::json(
+            r#"{"errcode":40014,"errmsg":"still invalid","requestId":"last-error"}"#,
+        ),
+        MockResponse::json(r#"{"errcode":0,"access_token":"fresh-token","expires_in":7200}"#),
+    ])?;
+    let api = dingtalk_for_mock(&server)?.openapi();
+    let error = api
+        .post_json_result::<Value, _>(&["test"], &json!({}))
+        .await
+        .err()
+        .ok_or("retry must stop")?;
+    assert_eq!(error.errcode(), Some(40014));
+    assert_eq!(error.request_id(), Some("last-error"));
+    assert_eq!(api.access_token().await?, "fresh-token");
+    for path in ["/gettoken", "/test", "/gettoken", "/test", "/gettoken"] {
+        assert_eq!(server.next_request()?.path(), path);
+    }
+    server.finish()
+}
+
+#[tokio::test]
+async fn permission_errors_do_not_refresh_or_resend() -> TestResult<()> {
+    let server = MockServer::spawn([
+        MockResponse::json(r#"{"errcode":0,"access_token":"token","expires_in":7200}"#),
+        MockResponse::json_status(
+            403,
+            "Forbidden",
+            r#"{"code":"Forbidden.AccessDenied","message":"permission denied"}"#,
+        ),
+    ])?;
+    let api = dingtalk_for_mock(&server)?.openapi();
+    assert_eq!(
+        api.robot("robot-code")?
+            .send_group_text("cid", "hello")
+            .await
+            .err()
+            .ok_or("permission denied")?
+            .api_code(),
+        Some("Forbidden.AccessDenied")
+    );
+    assert_eq!(api.access_token().await?, "token");
+    assert_eq!(server.next_request()?.path(), "/gettoken");
+    assert_eq!(
+        server.next_request()?.path(),
+        "/v1.0/robot/groupMessages/send"
+    );
+    server.finish()
+}
+
+#[tokio::test]
+async fn media_upload_and_card_update_recover_rejected_tokens() -> TestResult<()> {
+    for upload in [true, false] {
+        let success = if upload {
+            r#"{"errcode":0,"media_id":"media-1","type":"file"}"#
+        } else {
+            r#"{"processQueryKey":"pq"}"#
+        };
+        let server = MockServer::spawn([
+            MockResponse::json(r#"{"errcode":0,"access_token":"old","expires_in":7200}"#),
+            MockResponse::json(r#"{"errcode":40014,"errmsg":"invalid token"}"#),
+            MockResponse::json(r#"{"errcode":0,"access_token":"new","expires_in":7200}"#),
+            MockResponse::json(success),
+        ])?;
+        let api = dingtalk_for_mock(&server)?.openapi();
+        if upload {
+            assert_eq!(
+                api.upload_media(MediaUpload::file("test.txt", b"test".to_vec()))
+                    .await?
+                    .media_id(),
+                "media-1"
+            );
+        } else {
+            let update = dingding::openapi::InteractiveCardUpdate::card_data(
+                "card",
+                json!({"title":"updated"}),
+            )?;
+            api.robot("robot-code")?
+                .update_interactive_card(update)
+                .await?;
+        }
+        server.next_request()?;
+        let original = server.next_request()?;
+        server.next_request()?;
+        let retry = server.next_request()?;
+        if upload {
+            assert_eq!(original.query_value("access_token").as_deref(), Some("old"));
+            assert_eq!(retry.query_value("access_token").as_deref(), Some("new"));
+            assert!(retry.body_text_lossy().contains("test"));
+        } else {
+            assert_eq!(retry.method, "PUT");
+            assert_eq!(original.json_body()?, retry.json_body()?);
+            assert_eq!(retry.header("x-acs-dingtalk-access-token"), Some("new"));
+        }
+        server.finish()?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn message_lifecycle_uses_documented_endpoints_and_preserves_partial_results()
+-> TestResult<()> {
+    use dingding::openapi::GroupMessageQuery;
+    let server = MockServer::spawn([
+        MockResponse::json(r#"{"errcode":0,"access_token":"token","expires_in":7200}"#),
+        MockResponse::json(
+            r#"{"sendStatus":"SUCCESS","hasMore":true,"nextToken":"next+/=","readUserIds":["u1"],"readUsers":[{"userId":"u1","unionId":"union1"}]}"#,
+        ),
+        MockResponse::json(r#"{"sendStatus":"SUCCESS","hasMore":false,"readUserIds":["u2"]}"#),
+        MockResponse::json(
+            r#"{"sendStatus":"SUCESS","messageReadInfoList":[{"userId":"u1","name":"reader","readStatus":"READ","readTimestamp":123}]}"#,
+        ),
+        MockResponse::json(r#"{"successResult":["pq1"],"failedResult":{"pq2":"SYSTEM_ERROR"}}"#),
+        MockResponse::json(r#"{"successResult":["pq3"],"failedResult":{}}"#),
+    ])?;
+    let robot = dingtalk_for_mock(&server)?.openapi().robot("robot-code")?;
+    let first = robot
+        .query_group_message("cid", GroupMessageQuery::new("pq1")?.max_results(50)?)
+        .await?;
+    assert!(first.has_more);
+    assert_eq!(first.read_users[0].user_id.as_deref(), Some("u1"));
+    let second = robot
+        .query_group_message(
+            "cid",
+            GroupMessageQuery::new("pq1")?.next_token(first.next_token.ok_or("missing cursor")?)?,
+        )
+        .await?;
+    assert!(!second.has_more);
+    let private = robot.query_private_message("pq+/=").await?;
+    assert_eq!(private.message_read_info_list[0].read_timestamp, Some(123));
+    let recall = robot
+        .recall_group_messages("cid", ["pq1", "pq2", "pq1"])
+        .await?;
+    assert!(!recall.is_success());
+    assert_eq!(recall.failed_result["pq2"], "SYSTEM_ERROR");
+    assert!(robot.recall_private_messages(["pq3"]).await?.is_success());
+    server.next_request()?;
+    let first = server.next_request()?;
+    assert_eq!(first.path(), "/v1.0/robot/groupMessages/query");
+    assert_eq!(
+        first.json_body()?,
+        json!({"robotCode":"robot-code","openConversationId":"cid","processQueryKey":"pq1","maxResults":50})
+    );
+    assert_eq!(server.next_request()?.json_body()?["nextToken"], "next+/=");
+    let private = server.next_request()?;
+    assert_eq!(private.method, "GET");
+    assert_eq!(private.path(), "/v1.0/robot/oToMessages/readStatus");
+    assert_eq!(
+        private.query_value("processQueryKey").as_deref(),
+        Some("pq+/=")
+    );
+    assert_eq!(private.header("x-acs-dingtalk-access-token"), Some("token"));
+    let group_recall = server.next_request()?;
+    assert_eq!(group_recall.path(), "/v1.0/robot/groupMessages/recall");
+    assert_eq!(
+        group_recall.json_body()?["processQueryKeys"],
+        json!(["pq1", "pq2"])
+    );
+    let private_recall = server.next_request()?;
+    assert_eq!(private_recall.path(), "/v1.0/robot/otoMessages/batchRecall");
+    assert!(
+        private_recall
+            .json_body()?
+            .get("openConversationId")
+            .is_none()
+    );
+    server.finish()
+}
+
+#[tokio::test]
+async fn private_status_get_refreshes_invalid_tokens_and_rejects_empty_payloads() -> TestResult<()>
+{
+    let server = MockServer::spawn([
+        MockResponse::json(r#"{"errcode":0,"access_token":"old","expires_in":7200}"#),
+        MockResponse::json_status(
+            401,
+            "Unauthorized",
+            r#"{"code":"InvalidAuthentication","message":"invalid"}"#,
+        ),
+        MockResponse::json(r#"{"errcode":0,"access_token":"new","expires_in":7200}"#),
+        MockResponse::json(r#"{"sendStatus":"SUCCESS","messageReadInfoList":[]}"#),
+        MockResponse::json(r#"{"requestId":"malformed"}"#),
+    ])?;
+    let robot = dingtalk_for_mock(&server)?.openapi().robot("robot")?;
+    assert_eq!(
+        robot.query_private_message("pq").await?.send_status,
+        "SUCCESS"
+    );
+    assert_eq!(
+        robot
+            .query_private_message("pq")
+            .await
+            .err()
+            .ok_or("missing status")?
+            .request_id(),
+        Some("malformed")
+    );
+    for _ in 0..5 {
+        server.next_request()?;
+    }
+    server.finish()
+}
+
 fn dingtalk_for_mock(server: &MockServer) -> dingding::Result<DingTalk> {
     DingTalk::builder()
         .webhook_base_url(server.base_url())

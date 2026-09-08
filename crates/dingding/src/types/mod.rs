@@ -9,10 +9,11 @@ pub use crate::bot::{
 
 #[cfg(feature = "openapi")]
 pub use crate::openapi::{
-    DownloadedFile, InteractiveCard, InteractiveCardResponse, InteractiveCardSendOptions,
-    InteractiveCardUpdate, InteractiveCardUpdateOptions, MediaType, MediaUpload,
-    MessageFileDownload, RobotActionButton, RobotActionCard, RobotActionCardLayout, RobotMessage,
-    RobotMessageResponse, RobotVideo, UploadedMedia,
+    DownloadedFile, GroupMessageQuery, GroupMessageReader, GroupMessageStatus, InteractiveCard,
+    InteractiveCardResponse, InteractiveCardSendOptions, InteractiveCardUpdate,
+    InteractiveCardUpdateOptions, MediaType, MediaUpload, MessageFileDownload, MessageReadInfo,
+    MessageRecallResponse, PrivateMessageStatus, RobotActionButton, RobotActionCard,
+    RobotActionCardLayout, RobotMessage, RobotMessageResponse, RobotVideo, UploadedMedia,
 };
 
 #[cfg(feature = "stream")]
@@ -21,7 +22,8 @@ pub use crate::stream::{
     CardCallbackEvent, CardCallbackOperator, CardCallbackPayload, CardCallbackPrivateData,
     CardCallbackResponse, ReconnectPolicy, StreamBot, StreamBotBuilder, StreamClient,
     StreamClientBuilder, StreamExit, StreamFrame, StreamFrameResponse, StreamFrameType,
-    StreamHeaders, StreamRunEvent, StreamSubscription, StreamSubscriptionType,
+    StreamHeaders, StreamProcessingPolicy, StreamRunEvent, StreamSubscription,
+    StreamSubscriptionType,
 };
 
 #[cfg(feature = "webhook")]

@@ -6,6 +6,12 @@ pub use crate::{DingTalk, Error, Result, auth::AppCredentials};
 pub use crate::handler;
 
 #[cfg(feature = "bot")]
+pub use crate::bot::dedup::{
+    Deduplication, DeduplicationFuture, DeduplicationLease, EventDeduplicator,
+    MemoryEventDeduplicator,
+};
+
+#[cfg(feature = "bot")]
 pub use crate::bot::{
     AnyContext, Bot, BotAck, BotContext, BotEvent, CallbackHeaders, CallbackRequest,
     CallbackVerifier, Context, ConversationScope, GroupContext, HandleOutcome, IncomingMessage,
@@ -14,10 +20,11 @@ pub use crate::bot::{
 
 #[cfg(feature = "openapi")]
 pub use crate::openapi::{
-    DownloadedFile, InteractiveCard, InteractiveCardResponse, InteractiveCardSendOptions,
-    InteractiveCardUpdate, InteractiveCardUpdateOptions, MediaType, MediaUpload,
-    MessageFileDownload, OpenApi, RobotActionButton, RobotActionCard, RobotActionCardLayout,
-    RobotApi, RobotMessage, RobotMessageResponse, RobotVideo, UploadedMedia,
+    DownloadedFile, GroupMessageQuery, GroupMessageReader, GroupMessageStatus, InteractiveCard,
+    InteractiveCardResponse, InteractiveCardSendOptions, InteractiveCardUpdate,
+    InteractiveCardUpdateOptions, MediaType, MediaUpload, MessageFileDownload, MessageReadInfo,
+    MessageRecallResponse, OpenApi, PrivateMessageStatus, RobotActionButton, RobotActionCard,
+    RobotActionCardLayout, RobotApi, RobotMessage, RobotMessageResponse, RobotVideo, UploadedMedia,
 };
 
 #[cfg(feature = "stream")]
@@ -26,7 +33,8 @@ pub use crate::stream::{
     CardCallbackEvent, CardCallbackOperator, CardCallbackPayload, CardCallbackPrivateData,
     CardCallbackResponse, ReconnectPolicy, StreamBot, StreamBotBuilder, StreamClient,
     StreamClientBuilder, StreamExit, StreamFrame, StreamFrameResponse, StreamFrameType,
-    StreamHeaders, StreamRunEvent, StreamSubscription, StreamSubscriptionType,
+    StreamHeaders, StreamProcessingPolicy, StreamRunEvent, StreamSubscription,
+    StreamSubscriptionType,
 };
 
 #[cfg(feature = "webhook")]
