@@ -104,7 +104,7 @@ impl StreamClient {
         );
         tokio::pin!(session);
         tokio::select! {
-            result = &mut session => result.map(|(exit, ())| Some(exit)),
+            biased;
             () = shutdown => {
                 let _ = stop_sender.send(());
                 tokio::time::timeout(self.processing.shutdown_timeout, &mut session)
@@ -112,6 +112,7 @@ impl StreamClient {
                     .map_err(|_| Error::stream("shutdown drain timed out; unfinished handlers were cancelled"))??;
                 Ok(None)
             }
+            result = &mut session => result.map(|(exit, ())| Some(exit)),
         }
     }
 
@@ -140,15 +141,21 @@ impl StreamClient {
                 return Ok(StreamExit::Closed);
             }
             tokio::select! {
-                // Stop intake before polling another frame when shutdown is already ready.
+                // Stop accepting business work before handling another frame on shutdown.
                 biased;
                 _ = &mut stop, if !draining => { draining = true; }
                 Some(handled) = jobs.next(), if !jobs.is_empty() => {
                     self.emit_frame_error(&handled);
                     enqueue_ack(&sender, &handled.ack)?;
                 }
-                message = source.next(), if !draining => {
-                    let Some(message) = message else { return Ok(StreamExit::Closed) };
+                message = source.next() => {
+                    let Some(message) = message else {
+                        return if draining {
+                            Err(Error::stream("websocket closed before shutdown drain completed"))
+                        } else {
+                            Ok(StreamExit::Closed)
+                        };
+                    };
                     let message = message.map_err(|error| Error::stream(format!("websocket receive failed: {error}")))?;
                     let text = match message {
                         Message::Text(text) => text.to_string(),
@@ -157,7 +164,11 @@ impl StreamClient {
                             enqueue_message(&sender, Message::Pong(bytes))?;
                             continue;
                         }
-                        Message::Close(_) => return Ok(StreamExit::Closed),
+                        Message::Close(_) => return if draining {
+                            Err(Error::stream("websocket closed before shutdown drain completed"))
+                        } else {
+                            Ok(StreamExit::Closed)
+                        },
                         Message::Pong(_) | Message::Frame(_) => continue,
                     };
                     let frame = match StreamFrame::from_text(&text) {
@@ -173,9 +184,13 @@ impl StreamClient {
                     if frame.frame_type().is_system() {
                         let handled = self.handle_system_frame(frame)?;
                         enqueue_ack(&sender, &handled.ack)?;
-                        if handled.exit_after_ack {
+                        if handled.exit_after_ack && !draining {
                             return Ok(StreamExit::Disconnect);
                         }
+                    } else if draining {
+                        let handled = frame_failure(frame.message_id().to_owned(), Error::stream("stream is shutting down"));
+                        self.emit_frame_error(&handled);
+                        enqueue_ack(&sender, &handled.ack)?;
                     } else if jobs.len() < self.processing.max_concurrent_handlers {
                         jobs.push(self.process_business_frame(frame));
                     } else if queue.len() < self.processing.queue_capacity {

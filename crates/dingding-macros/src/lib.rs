@@ -54,8 +54,8 @@ fn expand_handler(
         ));
     }
 
-    let mut scope = "any";
-    let mut msg = "any";
+    let mut scope = None;
+    let mut msg = None;
     let mut command = None::<CommandConfig>;
     let mut filter_markers = Vec::<Expr>::new();
 
@@ -67,12 +67,21 @@ fn expand_handler(
         let key = name_value.path;
         let value = name_value.value;
         if key.is_ident("scope") {
-            scope = scope_filter(&value)?;
+            if scope.is_some() {
+                return Err(syn::Error::new_spanned(key, "duplicate `scope` option"));
+            }
+            scope = Some(scope_filter(&value)?);
             if should_mark_path_as_used(&value) {
                 filter_markers.push(value);
             }
         } else if key.is_ident("msg") || key.is_ident("message") {
-            msg = message_filter(&value)?;
+            if msg.is_some() {
+                return Err(syn::Error::new_spanned(
+                    key,
+                    "duplicate `msg` or `message` option",
+                ));
+            }
+            msg = Some(message_filter(&value)?);
             if should_mark_path_as_used(&value) {
                 filter_markers.push(value);
             }
@@ -96,6 +105,8 @@ fn expand_handler(
         }
     }
 
+    let scope = scope.unwrap_or("any");
+    let msg = msg.unwrap_or("any");
     let crate_path = dingding_crate_path();
     let scope_tokens = scope_tokens(&crate_path, scope)?;
     let ctx_tokens = context_tokens(scope)?;

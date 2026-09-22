@@ -2058,6 +2058,7 @@ pub struct Bot {
     fallback: Option<Route>,
     state: Option<BotState>,
     validation_error: Option<BotValidationError>,
+    fallback_validation_error: Option<BotValidationError>,
     deduplicator: Arc<dyn EventDeduplicator>,
 }
 
@@ -2071,6 +2072,7 @@ impl Bot {
             fallback: None,
             state: None,
             validation_error: None,
+            fallback_validation_error: None,
             deduplicator: Arc::new(MemoryEventDeduplicator::default()),
         }
     }
@@ -2225,7 +2227,7 @@ impl Bot {
     /// Registers a fallback route that runs when no normal route matches.
     #[must_use]
     pub fn fallback_route(mut self, route: Route) -> Self {
-        self.record_validation(route.validate());
+        self.fallback_validation_error = route.validate().err().map(BotValidationError::from_error);
         self.fallback = Some(route);
         self
     }
@@ -2312,7 +2314,11 @@ impl Bot {
 
     /// Validates all configured routes.
     pub fn validate(&self) -> Result<()> {
-        if let Some(error) = &self.validation_error {
+        if let Some(error) = self
+            .validation_error
+            .as_ref()
+            .or(self.fallback_validation_error.as_ref())
+        {
             return Err(error.to_error());
         }
         Ok(())
@@ -2995,6 +3001,36 @@ mod tests {
 
         assert_eq!(outcome, HandleOutcome::Fallback);
         assert!(hit.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn replacing_invalid_fallback_clears_its_validation_error() {
+        let client = DingTalk::builder().build().expect("client");
+        let bot = Bot::new(client)
+            .fallback_route(Route::new(ConversationScope::Any))
+            .fallback(|_, _| async { Ok(()) });
+
+        bot.validate().expect("replacement is valid");
+        let outcome = bot
+            .handle_event(BotEvent::text(ConversationScope::Private, "hello"))
+            .await
+            .expect("replacement handles event");
+        assert_eq!(outcome, HandleOutcome::Fallback);
+    }
+
+    #[test]
+    fn fallback_replacement_preserves_current_route_errors() {
+        let client = DingTalk::builder().build().expect("client");
+        let bot = Bot::new(client.clone())
+            .fallback(|_, _| async { Ok(()) })
+            .fallback_route(Route::new(ConversationScope::Any));
+        assert!(bot.validate().is_err());
+
+        let bot = Bot::new(client)
+            .fallback_route(Route::new(ConversationScope::Any))
+            .route(Route::new(ConversationScope::Group))
+            .fallback(|_, _| async { Ok(()) });
+        assert!(bot.validate().is_err());
     }
 
     #[derive(Debug)]

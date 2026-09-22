@@ -1,0 +1,5 @@
+error: duplicate `msg` or `message` option
+ --> tests/ui/handler_macro/duplicate_message_alias.rs:1:33
+  |
+1 | #[dingding::handler(msg = text, message = any)]
+  |                                 ^^^^^^^

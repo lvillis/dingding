@@ -54,6 +54,11 @@ const SENSITIVE_KEYS: &[&str] = &[
 ];
 
 pub(crate) fn redact_text(input: &str) -> String {
+    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(input) {
+        redact_json_value(&mut value);
+        return value.to_string();
+    }
+
     let mut output = input.to_owned();
     for key in SENSITIVE_KEYS {
         let mut search_from = 0;
@@ -79,6 +84,30 @@ pub(crate) fn redact_text(input: &str) -> String {
         }
     }
     output
+}
+
+fn redact_json_value(value: &mut serde_json::Value) {
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            serde_json::Value::Object(fields) => {
+                for (key, value) in fields {
+                    if SENSITIVE_KEYS
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(key))
+                    {
+                        *value = serde_json::Value::String("<redacted>".into());
+                    } else {
+                        pending.push(value);
+                    }
+                }
+            }
+            serde_json::Value::Array(values) => pending.extend(values.iter_mut()),
+            // Stream data and callback content can themselves contain encoded JSON.
+            serde_json::Value::String(text) => *text = redact_text(text),
+            _ => {}
+        }
+    }
 }
 
 fn is_sensitive_key_boundary(bytes: &[u8], index: usize, len: usize) -> bool {
@@ -209,6 +238,35 @@ pub(crate) fn truncate_snippet(input: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_text_handles_encoded_json_and_nested_sensitive_values() {
+        let inner = r#"{"access_token":"nested-secret","note":"visible"}"#;
+        let input = serde_json::json!({
+            "data": inner,
+            "items": [{"clientSecret": {"value": "object-secret"}}],
+            "plain": "Authorization: Bearer plain-secret",
+        });
+        let output = redact_text(&input.to_string());
+        assert!(!output.contains("nested-secret"));
+        assert!(!output.contains("object-secret"));
+        assert!(!output.contains("plain-secret"));
+        let output: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        let data: serde_json::Value = serde_json::from_str(output["data"].as_str().expect("data"))
+            .expect("valid encoded JSON");
+        assert_eq!(data["access_token"], "<redacted>");
+        assert_eq!(data["note"], "visible");
+        assert_eq!(output["items"][0]["clientSecret"], "<redacted>");
+    }
+
+    #[test]
+    fn redact_text_handles_unicode_escaped_json_keys() {
+        let output = redact_text(r#"{"access_\u0074oken":"escaped-secret","visible":true}"#);
+        assert!(!output.contains("escaped-secret"));
+        let output: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(output["access_token"], "<redacted>");
+        assert_eq!(output["visible"], true);
+    }
 
     #[test]
     fn redact_text_handles_unicode_before_sensitive_key() {

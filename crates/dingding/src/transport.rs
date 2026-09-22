@@ -293,9 +293,9 @@ fn validate_client_name(value: &str) -> Result<()> {
 }
 
 fn validate_duration(field: &'static str, value: Duration) -> Result<()> {
-    if value.is_zero() {
+    if value.is_zero() || std::time::Instant::now().checked_add(value).is_none() {
         return Err(Error::InvalidConfig(format!(
-            "{field} must be greater than zero"
+            "{field} must be positive and fit a monotonic deadline"
         )));
     }
     Ok(())
@@ -513,7 +513,7 @@ pub(crate) fn parse_dingtalk_result<T>(
 where
     T: DeserializeOwned,
 {
-    let (value, body) = decode_json_response::<DingTalkResult<T>>(response, error_body_snippet)?;
+    let (value, body) = decode_json_response::<StandardApiResponse>(response, error_body_snippet)?;
     if let Some(error) = response_envelope_error(
         value.errcode,
         value.api_code.as_deref(),
@@ -526,7 +526,16 @@ where
         return Err(error);
     }
 
-    value.result.ok_or_else(|| {
+    let payload = serde_json::from_str::<DingTalkResult<T>>(&body).map_err(|source| {
+        api_error_from_body(
+            -1,
+            format!("invalid DingTalk result payload: {source}"),
+            value.request_id.clone(),
+            &body,
+            error_body_snippet,
+        )
+    })?;
+    payload.result.ok_or_else(|| {
         api_error_from_body(
             -1,
             "missing result field in DingTalk response",
@@ -667,35 +676,7 @@ fn binary_success_body_error(
 #[cfg(feature = "openapi")]
 #[derive(serde::Deserialize)]
 struct DingTalkResult<T> {
-    #[serde(default, deserialize_with = "deserialize_optional_i64")]
-    errcode: Option<i64>,
-    #[serde(
-        rename = "code",
-        default,
-        alias = "Code",
-        deserialize_with = "deserialize_optional_string"
-    )]
-    api_code: Option<String>,
-    #[serde(
-        default,
-        alias = "message",
-        alias = "errorMessage",
-        alias = "ErrorMessage",
-        alias = "error_message",
-        deserialize_with = "deserialize_optional_string"
-    )]
-    errmsg: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_bool")]
-    success: Option<bool>,
     result: Option<T>,
-    #[serde(
-        default,
-        alias = "requestId",
-        alias = "RequestId",
-        alias = "requestid",
-        deserialize_with = "deserialize_optional_string"
-    )]
-    request_id: Option<String>,
 }
 
 fn successful_body(
@@ -903,13 +884,32 @@ fn body_snippet_for_error(body: &str, config: BodySnippetConfig) -> Option<Strin
         return None;
     }
 
-    let snippet = truncate_snippet(body, config.max_bytes);
-    Some(redact_text(&snippet))
+    Some(truncate_snippet(&redact_text(body), config.max_bytes))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn body_snippets_redact_encoded_json_before_truncating() {
+        let body = serde_json::json!({
+            "data": r#"{"access_token":"nested-secret"}"#,
+            "padding": "x".repeat(200),
+        })
+        .to_string();
+        let snippet = body_snippet_for_error(
+            &body,
+            BodySnippetConfig {
+                enabled: true,
+                max_bytes: 80,
+            },
+        )
+        .expect("snippet");
+        assert!(!snippet.contains("nested-secret"));
+        assert!(snippet.contains("<redacted>"));
+        assert!(snippet.ends_with("...(truncated)"));
+    }
 
     #[test]
     fn transport_config_rejects_invalid_default_headers() {

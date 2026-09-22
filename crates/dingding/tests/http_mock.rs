@@ -953,6 +953,81 @@ async fn rejected_tokens_are_refreshed_once_before_replaying_the_same_request() 
 }
 
 #[tokio::test]
+async fn typed_result_preserves_business_errors_before_payload_validation() -> TestResult<()> {
+    let server = MockServer::spawn([
+        MockResponse::json(r#"{"errcode":0,"access_token":"token","expires_in":7200}"#),
+        MockResponse::json(
+            r#"{"errcode":12345,"errmsg":"denied","requestId":"business-error","result":{}}"#,
+        ),
+        MockResponse::json(r#"{"errcode":0,"requestId":"bad-payload","result":{}}"#),
+    ])?;
+    let api = dingtalk_for_mock(&server)?.openapi();
+    let error = api
+        .post_json_result::<Vec<String>, _>(&["test"], &json!({}))
+        .await
+        .err()
+        .ok_or("business error expected")?;
+    assert_eq!(error.errcode(), Some(12345));
+    assert_eq!(error.request_id(), Some("business-error"));
+    let error = api
+        .post_json_result::<Vec<String>, _>(&["test"], &json!({}))
+        .await
+        .err()
+        .ok_or("invalid result expected")?;
+    assert_eq!(error.errcode(), Some(-1));
+    assert_eq!(error.request_id(), Some("bad-payload"));
+    for path in ["/gettoken", "/test", "/test"] {
+        assert_eq!(server.next_request()?.path(), path);
+    }
+    server.finish()
+}
+
+#[tokio::test]
+async fn typed_result_preserves_large_integer_precision() -> TestResult<()> {
+    let server = MockServer::spawn([
+        MockResponse::json(r#"{"errcode":0,"access_token":"token","expires_in":7200}"#),
+        MockResponse::json(&format!(r#"{{"errcode":0,"result":{}}}"#, i128::MAX)),
+    ])?;
+    let result = dingtalk_for_mock(&server)?
+        .openapi()
+        .post_json_result::<i128, _>(&["test"], &json!({}))
+        .await?;
+    assert_eq!(result, i128::MAX);
+    assert_eq!(server.next_request()?.path(), "/gettoken");
+    assert_eq!(server.next_request()?.path(), "/test");
+    server.finish()
+}
+
+#[tokio::test]
+async fn typed_result_refreshes_rejected_tokens_with_mismatched_error_payloads() -> TestResult<()> {
+    let server = MockServer::spawn([
+        MockResponse::json(r#"{"errcode":0,"access_token":"old-token","expires_in":7200}"#),
+        MockResponse::json(r#"{"code":"InvalidAuthentication.AccessTokenExpired","result":{}}"#),
+        MockResponse::json(r#"{"errcode":0,"access_token":"new-token","expires_in":7200}"#),
+        MockResponse::json(r#"{"errcode":0,"result":["accepted"]}"#),
+    ])?;
+    let values = dingtalk_for_mock(&server)?
+        .openapi()
+        .post_json_result::<Vec<String>, _>(&["test"], &json!({"body":"unchanged"}))
+        .await?;
+    assert_eq!(values, ["accepted"]);
+    assert_eq!(server.next_request()?.path(), "/gettoken");
+    let first = server.next_request()?;
+    assert_eq!(server.next_request()?.path(), "/gettoken");
+    let retry = server.next_request()?;
+    assert_eq!(
+        first.header("x-acs-dingtalk-access-token"),
+        Some("old-token")
+    );
+    assert_eq!(
+        retry.header("x-acs-dingtalk-access-token"),
+        Some("new-token")
+    );
+    assert_eq!(first.json_body()?, retry.json_body()?);
+    server.finish()
+}
+
+#[tokio::test]
 async fn repeated_token_rejection_stops_and_invalidates_the_rejected_refresh() -> TestResult<()> {
     let server = MockServer::spawn([
         MockResponse::json(r#"{"errcode":0,"access_token":"old-token","expires_in":7200}"#),

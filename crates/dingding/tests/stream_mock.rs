@@ -116,15 +116,90 @@ async fn ack(socket: &mut Socket) -> Value {
 }
 
 fn launch(stream: StreamClient) -> (oneshot::Sender<()>, JoinHandle<dingding::Result<()>>) {
+    let (stop, _observed, task) = launch_with_observed_shutdown(stream);
+    (stop, task)
+}
+
+fn launch_with_observed_shutdown(
+    stream: StreamClient,
+) -> (
+    oneshot::Sender<()>,
+    oneshot::Receiver<()>,
+    JoinHandle<dingding::Result<()>>,
+) {
     let (stop, shutdown) = oneshot::channel();
+    let (observed, observation) = oneshot::channel();
     let task = tokio::spawn(async move {
         stream
             .run_until(async {
                 let _ = shutdown.await;
+                let _ = observed.send(());
             })
             .await
     });
-    (stop, task)
+    (stop, observation, task)
+}
+
+#[tokio::test]
+async fn shutdown_preserves_heartbeats_but_rejects_new_business_frames() {
+    let (client, listener, http) = gateway(1).await;
+    let permits = Arc::new(Semaphore::new(0));
+    let gate = Arc::clone(&permits);
+    let (started, mut starts) = mpsc::unbounded_channel();
+    let stream = StreamClient::builder(client)
+        .expect("builder")
+        .on_frame(move |frame| {
+            let gate = Arc::clone(&gate);
+            let started = started.clone();
+            async move {
+                started
+                    .send(frame.message_id().to_owned())
+                    .expect("started");
+                gate.acquire().await.expect("gate").forget();
+                Ok(())
+            }
+        })
+        .build()
+        .expect("stream");
+    let (stop, observed, task) = launch_with_observed_shutdown(stream);
+    let mut socket = accept(&listener).await;
+    send(&mut socket, frame("EVENT", "topic", "accepted")).await;
+    assert_eq!(bounded(starts.recv()).await.as_deref(), Some("accepted"));
+    stop.send(()).expect("shutdown");
+    bounded(observed).await.expect("shutdown observed");
+
+    send(&mut socket, frame("SYSTEM", "ping", "draining-ping")).await;
+    let heartbeat = ack(&mut socket).await;
+    assert_eq!(heartbeat["headers"]["messageId"], "draining-ping");
+    assert_eq!(heartbeat["code"], 200);
+    send(&mut socket, Message::Ping(b"draining".to_vec().into())).await;
+    assert!(
+        matches!(bounded(socket.next()).await, Some(Ok(Message::Pong(bytes))) if bytes.as_ref() == b"draining")
+    );
+    send(&mut socket, frame("EVENT", "topic", "rejected")).await;
+    let rejected = ack(&mut socket).await;
+    assert_eq!(rejected["headers"]["messageId"], "rejected");
+    assert_eq!(rejected["code"], 500);
+    assert!(starts.try_recv().is_err());
+
+    send(
+        &mut socket,
+        frame("SYSTEM", "disconnect", "draining-disconnect"),
+    )
+    .await;
+    let disconnect = ack(&mut socket).await;
+    assert_eq!(disconnect["headers"]["messageId"], "draining-disconnect");
+    assert!(!task.is_finished());
+
+    permits.add_permits(1);
+    let accepted = ack(&mut socket).await;
+    assert_eq!(accepted["headers"]["messageId"], "accepted");
+    assert_eq!(accepted["code"], 200);
+    bounded(task)
+        .await
+        .expect("task")
+        .expect("drained shutdown");
+    bounded(http).await.expect("gateway task");
 }
 
 #[tokio::test]
@@ -369,6 +444,46 @@ impl Drop for Cancelled {
     fn drop(&mut self) {
         self.0.fetch_add(1, Ordering::SeqCst);
     }
+}
+
+#[tokio::test]
+async fn connection_loss_during_shutdown_reports_unfinished_work() {
+    let (client, listener, http) = gateway(1).await;
+    let cancelled = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&cancelled);
+    let (started, mut starts) = mpsc::unbounded_channel();
+    let stream = StreamClient::builder(client)
+        .expect("builder")
+        .on_frame(move |_| {
+            let guard = Cancelled(Arc::clone(&count));
+            let started = started.clone();
+            async move {
+                let _guard = guard;
+                started.send(()).expect("started");
+                std::future::pending::<()>().await;
+                Ok(())
+            }
+        })
+        .build()
+        .expect("stream");
+    let (stop, observed, task) = launch_with_observed_shutdown(stream);
+    let mut socket = accept(&listener).await;
+    send(&mut socket, frame("EVENT", "topic", "unfinished")).await;
+    bounded(starts.recv()).await.expect("handler started");
+    stop.send(()).expect("shutdown");
+    bounded(observed).await.expect("shutdown observed");
+    send(&mut socket, Message::Close(None)).await;
+    let error = bounded(task)
+        .await
+        .expect("task")
+        .expect_err("unfinished drain");
+    assert!(
+        error
+            .to_string()
+            .contains("closed before shutdown drain completed")
+    );
+    assert_eq!(cancelled.load(Ordering::SeqCst), 1);
+    bounded(http).await.expect("gateway task");
 }
 
 #[tokio::test]

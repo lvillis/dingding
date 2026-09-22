@@ -1,0 +1,5 @@
+error: duplicate `scope` option
+ --> tests/ui/handler_macro/duplicate_scope.rs:1:36
+  |
+1 | #[dingding::handler(scope = group, scope = any)]
+  |                                    ^^^^^

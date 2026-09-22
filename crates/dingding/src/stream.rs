@@ -1277,12 +1277,8 @@ impl ReconnectPolicy {
 
     /// Validates this reconnect policy.
     pub fn validate(&self) -> Result<()> {
-        if self.initial_delay.is_zero() {
-            return Err(Error::invalid_input(
-                "reconnect.initial_delay",
-                "value must be greater than zero",
-            ));
-        }
+        validate_stream_duration("reconnect.initial_delay", self.initial_delay)?;
+        validate_stream_duration("reconnect.max_delay", self.max_delay)?;
         if self.max_delay < self.initial_delay {
             return Err(Error::invalid_input(
                 "reconnect.max_delay",
@@ -1295,11 +1291,14 @@ impl ReconnectPolicy {
     /// Returns the reconnect delay for a one-based connection attempt number.
     #[must_use]
     pub fn delay_for_attempt(self, attempt: u32) -> Duration {
-        let exponent = attempt.saturating_sub(1).min(10);
-        let multiplier = 1_u32.checked_shl(exponent).unwrap_or(1024);
-        self.initial_delay
-            .saturating_mul(multiplier)
-            .min(self.max_delay)
+        let mut delay = self.initial_delay.min(self.max_delay);
+        for _ in 1..attempt {
+            if delay.is_zero() || delay == self.max_delay {
+                break;
+            }
+            delay = delay.saturating_mul(2).min(self.max_delay);
+        }
+        delay
     }
 }
 
@@ -1452,10 +1451,6 @@ fn push_subscription_once(
 
 fn redacted_json_value(value: &Value) -> String {
     redact_text(&value.to_string())
-}
-
-fn redacted_debug_value(value: &impl fmt::Debug) -> String {
-    redact_text(&format!("{value:?}"))
 }
 
 /// Stream subscription type.
@@ -2686,10 +2681,11 @@ pub struct StreamHeaders {
 
 impl fmt::Debug for StreamHeaders {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let extra = Value::Object(self.extra.clone().into_iter().collect());
         f.debug_struct("StreamHeaders")
             .field("topic", &self.topic)
             .field("message_id", &self.message_id)
-            .field("extra", &redacted_debug_value(&self.extra))
+            .field("extra", &redacted_json_value(&extra))
             .finish()
     }
 }
@@ -3264,6 +3260,46 @@ mod tests {
         assert_eq!(policy.delay_for_attempt(1), Duration::from_secs(2));
         assert_eq!(policy.delay_for_attempt(2), Duration::from_secs(4));
         assert_eq!(policy.delay_for_attempt(10), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn reconnect_backoff_keeps_growing_until_the_configured_maximum() {
+        let policy = ReconnectPolicy::new(Duration::from_millis(1), Duration::from_secs(30));
+
+        assert_eq!(policy.delay_for_attempt(11), Duration::from_millis(1024));
+        assert_eq!(policy.delay_for_attempt(12), Duration::from_millis(2048));
+        assert_eq!(policy.delay_for_attempt(16), Duration::from_secs(30));
+        assert_eq!(policy.delay_for_attempt(u32::MAX), Duration::from_secs(30));
+
+        let policy = ReconnectPolicy::new(Duration::from_nanos(1), Duration::MAX);
+        assert_eq!(
+            policy.delay_for_attempt(33),
+            Duration::from_nanos(1_u64 << 32)
+        );
+        assert_eq!(policy.delay_for_attempt(u32::MAX), Duration::MAX);
+        assert_eq!(
+            policy
+                .initial_delay(Duration::ZERO)
+                .delay_for_attempt(u32::MAX),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn reconnect_policy_rejects_overflowing_deadlines() {
+        for (policy, expected_field) in [
+            (
+                ReconnectPolicy::new(Duration::MAX, Duration::MAX),
+                "reconnect.initial_delay",
+            ),
+            (
+                ReconnectPolicy::default().max_delay(Duration::MAX),
+                "reconnect.max_delay",
+            ),
+        ] {
+            let error = policy.validate().expect_err("deadline must fit");
+            assert!(matches!(error, Error::InvalidInput { field, .. } if field == expected_field));
+        }
     }
 
     #[test]
@@ -4253,6 +4289,36 @@ mod tests {
         assert_eq!(
             event.text.as_ref().map(|text| text.content.as_str()),
             Some("/ping")
+        );
+    }
+
+    #[test]
+    fn stream_frame_debug_redacts_string_encoded_json() {
+        let data = serde_json::json!({
+            "access_token": "frame-secret",
+            "content": serde_json::json!({"downloadCode": "download-secret"}).to_string(),
+        })
+        .to_string();
+        let text = serde_json::json!({
+            "type": "CALLBACK",
+            "headers": {
+                "topic": BOT_MESSAGE_TOPIC,
+                "messageId": "message-1",
+                "metadata": serde_json::json!({"ticket":"header-secret"}).to_string(),
+            },
+            "data": data,
+        })
+        .to_string();
+        let frame = StreamFrame::from_text(&text).expect("frame");
+        let debug = format!("{frame:?}");
+        assert!(!debug.contains("frame-secret"));
+        assert!(!debug.contains("download-secret"));
+        assert!(!debug.contains("header-secret"));
+        assert!(debug.contains("<redacted>"));
+        assert_eq!(frame.data(), &Value::String(data));
+        assert_eq!(
+            frame.header("metadata"),
+            Some(&Value::String(r#"{"ticket":"header-secret"}"#.into()))
         );
     }
 

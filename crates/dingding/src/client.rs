@@ -398,6 +398,18 @@ mod tests {
     }
 
     #[test]
+    fn builder_rejects_overflowing_transport_deadlines() {
+        for builder in [
+            DingTalk::builder().request_timeout(Duration::MAX),
+            DingTalk::builder().total_timeout(Duration::MAX),
+            DingTalk::builder().connect_timeout(Duration::MAX),
+        ] {
+            let error = builder.build().err().expect("deadline must fit");
+            assert_eq!(error.kind(), crate::ErrorKind::InvalidConfig);
+        }
+    }
+
+    #[test]
     fn builder_rejects_invalid_transport_config() {
         let request_timeout = DingTalk::builder()
             .request_timeout(Duration::ZERO)
