@@ -7,6 +7,10 @@
 ### 🐛 Bug Fixes
 
 - Correct SDK validation, retries, shutdown, and log redaction
+
+### ⚙️ Miscellaneous Tasks
+
+- Release version 0.1.3
 ## [0.1.2] - 2026-07-09
 
 ### 🚀 Features
