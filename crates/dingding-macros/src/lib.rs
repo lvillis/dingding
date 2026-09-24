@@ -41,9 +41,9 @@ fn expand_handler(
             "dingding handlers must be async functions",
         ));
     }
-    if input.sig.unsafety.is_some() {
+    if let syn::Safety::Unsafe(token) = &input.sig.safety {
         return Err(syn::Error::new_spanned(
-            input.sig.unsafety,
+            token,
             "dingding handlers must not be unsafe functions",
         ));
     }
