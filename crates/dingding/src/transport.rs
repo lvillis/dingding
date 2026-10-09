@@ -6,7 +6,7 @@ use std::{
 
 use reqx::{
     advanced::{ClientProfile, PermissiveRetryEligibility},
-    prelude::{Client as HttpClient, RetryPolicy},
+    prelude::{Client as HttpClient, RetryPolicy, StatusPolicy},
 };
 use serde::{
     Deserialize,
@@ -166,18 +166,18 @@ impl Transport {
             .webhook_http
             .post(url.as_str())
             .json(body)?
-            .send_response()
+            .send()
             .await?)
     }
 
     #[cfg(feature = "openapi")]
     pub(crate) async fn get_webhook(&self, url: &Url) -> Result<reqx::Response> {
-        Ok(self.webhook_http.get(url.as_str()).send_response().await?)
+        Ok(self.webhook_http.get(url.as_str()).send().await?)
     }
 
     #[cfg(feature = "openapi")]
     pub(crate) async fn get_url(&self, url: &Url) -> Result<reqx::Response> {
-        Ok(self.webhook_http.get(url.as_str()).send_response().await?)
+        Ok(self.webhook_http.get(url.as_str()).send().await?)
     }
 
     #[cfg(feature = "openapi")]
@@ -192,7 +192,7 @@ impl Transport {
             .post(url.as_str())
             .try_header("content-type", content_type)?
             .body(body)
-            .send_response()
+            .send()
             .await?)
     }
 
@@ -211,8 +211,8 @@ impl Transport {
             .webhook_http
             .post(url.as_str())
             .try_header("content-type", content_type)?
-            .body_reader_with_length(reader, content_length)?
-            .send_response()
+            .body_reader_with_length(reader, content_length)
+            .send()
             .await?)
     }
 
@@ -253,7 +253,7 @@ impl Transport {
             .get(url.as_str())
             .auto_accept_encoding(false)
             .try_header("accept-encoding", "identity")?
-            .send_response_stream()
+            .send_stream()
             .await?;
         if !response.status().is_success() {
             let response = response.into_response_limited(PREFIX_LIMIT).await?;
@@ -384,7 +384,7 @@ impl Transport {
             request = request.try_header("x-acs-dingtalk-access-token", access_token)?;
         }
 
-        Ok(request.json(body)?.send_response().await?)
+        Ok(request.json(body)?.send().await?)
     }
 
     #[cfg(feature = "openapi")]
@@ -397,7 +397,7 @@ impl Transport {
             .openapi_http
             .get(url.as_str())
             .try_header("x-acs-dingtalk-access-token", access_token)?
-            .send_response()
+            .send()
             .await?)
     }
 
@@ -416,7 +416,7 @@ impl Transport {
             request = request.try_header("x-acs-dingtalk-access-token", access_token)?;
         }
 
-        Ok(request.json(body)?.send_response().await?)
+        Ok(request.json(body)?.send().await?)
     }
 
     pub(crate) fn error_body_snippet(&self) -> BodySnippetConfig {
@@ -427,6 +427,8 @@ impl Transport {
 fn build_http_client(base_url: &Url, config: &TransportConfig) -> Result<HttpClient> {
     let mut builder = HttpClient::builder(base_url.as_str())
         .profile(config.profile)
+        // DingTalk error parsing needs the body and headers of non-success responses.
+        .default_status_policy(StatusPolicy::Response)
         .client_name(config.client_name.clone())
         .connect_timeout(config.connect_timeout);
 
@@ -435,11 +437,11 @@ fn build_http_client(base_url: &Url, config: &TransportConfig) -> Result<HttpCli
     }
 
     if let Some(total_timeout) = config.total_timeout {
-        builder = builder.total_timeout(total_timeout);
+        builder = builder.total_timeout(Some(total_timeout));
     }
 
     if !config.system_proxy {
-        builder = builder.no_proxy(["*"]);
+        builder = builder.no_proxy(["*"])?;
     }
 
     if let Some(retry_policy) = &config.retry_policy {
