@@ -13,6 +13,9 @@ use syn::{Expr, ExprLit, ItemFn, Lit, Meta, Token, parse_macro_input, punctuated
 
 /// Declares a DingTalk bot handler and generates a `<function>_route` helper.
 ///
+/// Handlers may return `()`, `dingding::Result<()>`, `dingding::HandlerResult`, or another result
+/// whose error converts into a boxed `Send + Sync` application error.
+///
 /// Example:
 ///
 /// ```ignore
@@ -109,7 +112,11 @@ fn expand_handler(
     let msg = msg.unwrap_or("any");
     let crate_path = dingding_crate_path();
     let scope_tokens = scope_tokens(&crate_path, scope)?;
-    let ctx_tokens = context_tokens(scope)?;
+    let handler_method = match scope {
+        "group" => quote! { handle_group },
+        "private" | "single" | "oto" => quote! { handle_private },
+        _ => quote! { handle },
+    };
     let message_tokens = message_tokens(&crate_path, msg)?;
     let route_ident = format_ident!("{}_route", input.sig.ident);
     let fn_ident = &input.sig.ident;
@@ -117,19 +124,17 @@ fn expand_handler(
     let arg_count = input.sig.inputs.len();
     let handler_tokens = match arg_count {
         0 => quote! {
-            .handle(|_ctx, _event| async move {
+            .#handler_method(|_ctx, _event| async move {
                 #fn_ident().await
             })
         },
         1 => quote! {
-            .handle(|ctx, _event| async move {
-                let ctx = #ctx_tokens;
+            .#handler_method(|ctx, _event| async move {
                 #fn_ident(ctx).await
             })
         },
         2 => quote! {
-            .handle(|ctx, event| async move {
-                let ctx = #ctx_tokens;
+            .#handler_method(|ctx, event| async move {
                 #fn_ident(ctx, event).await
             })
         },
@@ -326,18 +331,6 @@ fn scope_tokens(
         "any" => Ok(quote! { #crate_path::bot::ConversationScope::Any }),
         "group" => Ok(quote! { #crate_path::bot::ConversationScope::Group }),
         "private" | "single" | "oto" => Ok(quote! { #crate_path::bot::ConversationScope::Private }),
-        _ => Err(syn::Error::new(
-            proc_macro2::Span::call_site(),
-            "scope must be one of: any, group, private",
-        )),
-    }
-}
-
-fn context_tokens(scope: &str) -> syn::Result<proc_macro2::TokenStream> {
-    match scope {
-        "any" => Ok(quote! { ctx }),
-        "group" => Ok(quote! { ctx.into_group()? }),
-        "private" | "single" | "oto" => Ok(quote! { ctx.into_private()? }),
         _ => Err(syn::Error::new(
             proc_macro2::Span::call_site(),
             "scope must be one of: any, group, private",

@@ -14,15 +14,15 @@ use url::Url;
 use crate::{
     DingTalk, Error, Result,
     auth::AppCredentials,
-    bot::{
-        Bot, BotContext, BotEvent, BotState, ConversationScope, HandleOutcome, MessageType, Route,
-    },
+    bot::{Bot, BotEvent, BotState, ConversationScope, HandleOutcome, MessageType, Route},
     transport::{
         BodySnippetConfig, api_error_from_body, decode_json_response, response_envelope_error,
+        with_response_metadata,
     },
     util::{non_empty_trimmed, redact::redact_text},
 };
 
+mod handlers;
 mod runtime;
 use crate::bot::dedup::{EventDeduplicator, MemoryEventDeduplicator};
 pub use runtime::StreamProcessingPolicy;
@@ -142,14 +142,14 @@ impl StreamBotBuilder {
         self
     }
 
-    /// Overrides Stream credentials.
+    /// Overrides credentials for the Stream connection and handler OpenAPI calls.
     #[must_use]
     pub fn credentials(mut self, credentials: AppCredentials) -> Self {
         self.credentials = Some(credentials);
         self
     }
 
-    /// Overrides Stream credentials.
+    /// Overrides credentials for the Stream connection and handler OpenAPI calls.
     #[must_use]
     pub fn client_id_and_secret(
         mut self,
@@ -167,127 +167,6 @@ impl StreamBotBuilder {
         self
     }
 
-    /// Registers a text command route.
-    #[must_use]
-    pub fn on_text_command<F, Fut>(
-        self,
-        scope: ConversationScope,
-        command: impl Into<String>,
-        handler: F,
-    ) -> Self
-    where
-        F: Fn(BotContext, BotEvent) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
-    {
-        self.route(
-            Route::new(scope)
-                .message_type(MessageType::Text)
-                .command(command)
-                .handle(handler),
-        )
-    }
-
-    /// Registers a text command route with multiple command aliases.
-    #[must_use]
-    pub fn on_text_commands<I, S, F, Fut>(
-        self,
-        scope: ConversationScope,
-        commands: I,
-        handler: F,
-    ) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-        F: Fn(BotContext, BotEvent) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
-    {
-        self.route(
-            Route::new(scope)
-                .message_type(MessageType::Text)
-                .commands(commands)
-                .handle(handler),
-        )
-    }
-
-    /// Registers a message route.
-    #[must_use]
-    pub fn on_message<F, Fut>(
-        self,
-        scope: ConversationScope,
-        message_type: MessageType,
-        handler: F,
-    ) -> Self
-    where
-        F: Fn(BotContext, BotEvent) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
-    {
-        self.route(Route::new(scope).message_type(message_type).handle(handler))
-    }
-
-    /// Registers a group text command route.
-    #[must_use]
-    pub fn on_group_text_command<F, Fut>(self, command: impl Into<String>, handler: F) -> Self
-    where
-        F: Fn(BotContext, BotEvent) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
-    {
-        self.on_text_command(ConversationScope::Group, command, handler)
-    }
-
-    /// Registers a group text command route with multiple command aliases.
-    #[must_use]
-    pub fn on_group_text_commands<I, S, F, Fut>(self, commands: I, handler: F) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-        F: Fn(BotContext, BotEvent) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
-    {
-        self.on_text_commands(ConversationScope::Group, commands, handler)
-    }
-
-    /// Registers a private-chat text command route.
-    #[must_use]
-    pub fn on_private_text_command<F, Fut>(self, command: impl Into<String>, handler: F) -> Self
-    where
-        F: Fn(BotContext, BotEvent) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
-    {
-        self.on_text_command(ConversationScope::Private, command, handler)
-    }
-
-    /// Registers a private-chat text command route with multiple command aliases.
-    #[must_use]
-    pub fn on_private_text_commands<I, S, F, Fut>(self, commands: I, handler: F) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-        F: Fn(BotContext, BotEvent) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
-    {
-        self.on_text_commands(ConversationScope::Private, commands, handler)
-    }
-
-    /// Registers a group message route.
-    #[must_use]
-    pub fn on_group_message<F, Fut>(self, message_type: MessageType, handler: F) -> Self
-    where
-        F: Fn(BotContext, BotEvent) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
-    {
-        self.on_message(ConversationScope::Group, message_type, handler)
-    }
-
-    /// Registers a private-chat message route.
-    #[must_use]
-    pub fn on_private_message<F, Fut>(self, message_type: MessageType, handler: F) -> Self
-    where
-        F: Fn(BotContext, BotEvent) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
-    {
-        self.on_message(ConversationScope::Private, message_type, handler)
-    }
-
     /// Registers a fallback route that runs when no normal route matches.
     #[must_use]
     pub fn fallback_route(mut self, route: Route) -> Self {
@@ -295,31 +174,7 @@ impl StreamBotBuilder {
         self
     }
 
-    /// Registers a fallback handler that runs when no normal route matches.
-    #[must_use]
-    pub fn fallback<F, Fut>(self, handler: F) -> Self
-    where
-        F: Fn(BotContext, BotEvent) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
-    {
-        self.fallback_route(Route::new(ConversationScope::Any).handle(handler))
-    }
-
-    /// Registers a fallback handler for unmatched text messages.
-    #[must_use]
-    pub fn on_unmatched_text<F, Fut>(self, scope: ConversationScope, handler: F) -> Self
-    where
-        F: Fn(BotContext, BotEvent) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
-    {
-        self.fallback_route(
-            Route::new(scope)
-                .message_type(MessageType::Text)
-                .handle(handler),
-        )
-    }
-
-    /// Configures shared application state available from [`BotContext::state`].
+    /// Configures shared application state available from [`crate::bot::BotContext::state`].
     #[must_use]
     pub fn state<T>(mut self, state: T) -> Self
     where
@@ -396,78 +251,6 @@ impl StreamBotBuilder {
         F: Fn(StreamRunEvent) + Send + Sync + 'static,
     {
         self.event_handler = Some(Arc::new(handler));
-        self
-    }
-
-    /// Registers a handler for non-system Stream frames not handled by the bot router.
-    ///
-    /// Bot message callbacks are still routed through [`Bot`] first when a bot router is
-    /// configured. Other callback/event topics, or bot message callbacks without a bot router,
-    /// are acknowledged with `200 OK` after this handler completes.
-    #[must_use]
-    pub fn on_frame<F, Fut>(mut self, handler: F) -> Self
-    where
-        F: Fn(StreamFrame) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
-    {
-        let handler = Arc::new(handler);
-        self.frame_handler = Some(Arc::new(move |frame| {
-            let handler = Arc::clone(&handler);
-            Box::pin(async move {
-                handler(frame).await?;
-                Ok(StreamFrameResponse::empty())
-            })
-        }));
-        self
-    }
-
-    /// Registers a handler that can return a Stream callback response payload.
-    #[must_use]
-    pub fn on_frame_with_response<F, Fut>(mut self, handler: F) -> Self
-    where
-        F: Fn(StreamFrame) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<StreamFrameResponse>> + Send + 'static,
-    {
-        let handler = Arc::new(handler);
-        self.frame_handler = Some(Arc::new(move |frame| {
-            let handler = Arc::clone(&handler);
-            Box::pin(async move { handler(frame).await })
-        }));
-        self
-    }
-
-    /// Registers a handler for interactive card callbacks.
-    ///
-    /// The card callback subscription is added automatically.
-    #[must_use]
-    pub fn on_card_callback<F, Fut>(self, handler: F) -> Self
-    where
-        F: Fn(CardCallbackEvent) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
-    {
-        self.on_card_callback_with_response(move |event| {
-            let future = handler(event);
-            async move {
-                future.await?;
-                Ok(StreamFrameResponse::empty())
-            }
-        })
-    }
-
-    /// Registers a card callback handler that can return a Stream callback response payload.
-    ///
-    /// The card callback subscription is added automatically.
-    #[must_use]
-    pub fn on_card_callback_with_response<F, Fut>(mut self, handler: F) -> Self
-    where
-        F: Fn(CardCallbackEvent) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<StreamFrameResponse>> + Send + 'static,
-    {
-        let handler = Arc::new(handler);
-        self.card_callback_handler = Some(Arc::new(move |event| {
-            let handler = Arc::clone(&handler);
-            Box::pin(async move { handler(event).await })
-        }));
         self
     }
 
@@ -716,9 +499,11 @@ impl StreamClient {
             .post_openapi_json(&url, None, &request)
             .await?;
         let error_body_snippet = self.client.transport().error_body_snippet();
-        let (value, body) =
-            decode_json_response::<RawOpenConnectionResponse>(response, error_body_snippet)?;
-        value.into_connection(&body, error_body_snippet)
+        with_response_metadata(response, |response| {
+            let (value, body) =
+                decode_json_response::<RawOpenConnectionResponse>(response, error_body_snippet)?;
+            value.into_connection(&body, error_body_snippet)
+        })
     }
 
     #[cfg(test)]
@@ -972,14 +757,14 @@ impl StreamClientBuilder {
         })
     }
 
-    /// Overrides Stream credentials.
+    /// Overrides credentials for the Stream connection and handler OpenAPI calls.
     #[must_use]
     pub fn credentials(mut self, credentials: AppCredentials) -> Self {
         self.credentials = Some(credentials);
         self
     }
 
-    /// Overrides Stream credentials.
+    /// Overrides credentials for the Stream connection and handler OpenAPI calls.
     #[must_use]
     pub fn client_id_and_secret(
         mut self,
@@ -1074,74 +859,6 @@ impl StreamClientBuilder {
         self
     }
 
-    /// Registers a handler for callback/event frames not handled by a bot router.
-    #[must_use]
-    pub fn on_frame<F, Fut>(mut self, handler: F) -> Self
-    where
-        F: Fn(StreamFrame) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
-    {
-        let handler = Arc::new(handler);
-        self.frame_handler = Some(Arc::new(move |frame| {
-            let handler = Arc::clone(&handler);
-            Box::pin(async move {
-                handler(frame).await?;
-                Ok(StreamFrameResponse::empty())
-            })
-        }));
-        self
-    }
-
-    /// Registers a handler that can return a Stream callback response payload.
-    #[must_use]
-    pub fn on_frame_with_response<F, Fut>(mut self, handler: F) -> Self
-    where
-        F: Fn(StreamFrame) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<StreamFrameResponse>> + Send + 'static,
-    {
-        let handler = Arc::new(handler);
-        self.frame_handler = Some(Arc::new(move |frame| {
-            let handler = Arc::clone(&handler);
-            Box::pin(async move { handler(frame).await })
-        }));
-        self
-    }
-
-    /// Registers a handler for interactive card callbacks.
-    ///
-    /// The card callback subscription is added automatically.
-    #[must_use]
-    pub fn on_card_callback<F, Fut>(self, handler: F) -> Self
-    where
-        F: Fn(CardCallbackEvent) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
-    {
-        self.on_card_callback_with_response(move |event| {
-            let future = handler(event);
-            async move {
-                future.await?;
-                Ok(StreamFrameResponse::empty())
-            }
-        })
-    }
-
-    /// Registers a card callback handler that can return a Stream callback response payload.
-    ///
-    /// The card callback subscription is added automatically.
-    #[must_use]
-    pub fn on_card_callback_with_response<F, Fut>(mut self, handler: F) -> Self
-    where
-        F: Fn(CardCallbackEvent) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<StreamFrameResponse>> + Send + 'static,
-    {
-        let handler = Arc::new(handler);
-        self.card_callback_handler = Some(Arc::new(move |event| {
-            let handler = Arc::clone(&handler);
-            Box::pin(async move { handler(event).await })
-        }));
-        self
-    }
-
     fn on_frame_handler(mut self, handler: StreamFrameHandler) -> Self {
         self.frame_handler = Some(handler);
         self
@@ -1173,11 +890,16 @@ impl StreamClientBuilder {
         }
         let credentials = self.credentials.ok_or(Error::MissingCredentials)?;
         credentials.validate()?;
+        let client = self.client.with_app_credentials(credentials.clone())?;
+        let bot = self
+            .bot
+            .map(|bot| bot.with_app_credentials(credentials.clone()))
+            .transpose()?;
 
         let subscriptions = resolve_implicit_subscriptions(
             self.subscriptions,
             self.subscriptions_replaced,
-            self.bot.is_some(),
+            bot.is_some(),
             self.frame_handler.is_some(),
             self.card_callback_handler.is_some(),
         );
@@ -1196,7 +918,7 @@ impl StreamClientBuilder {
             .transpose()?;
 
         Ok(StreamClient {
-            client: self.client,
+            client,
             credentials,
             subscriptions,
             local_ip,
@@ -1205,7 +927,7 @@ impl StreamClientBuilder {
             websocket_connect_timeout: self.websocket_connect_timeout,
             processing: self.processing,
             deduplicator: self.deduplicator,
-            bot: self.bot,
+            bot,
             event_handler: self.event_handler,
             frame_handler: self.frame_handler,
             card_callback_handler: self.card_callback_handler,
@@ -2943,9 +2665,320 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn stream_bot_credentials_apply_to_custom_client_and_context() {
+        for original_credentials in [None, Some(AppCredentials::new("other-id", "other-secret"))] {
+            let mut builder = DingTalk::builder()
+                .openapi_base_url("http://localhost:19001/modern")
+                .connect_timeout(Duration::from_secs(9));
+            if let Some(credentials) = &original_credentials {
+                builder = builder.app_credentials(credentials.clone());
+            }
+            let original = builder.build().expect("custom client");
+            let stream = StreamBot::from_client(original.clone())
+                .client_id_and_secret("stream-id", "stream-secret")
+                .on_text_command(ConversationScope::Any, "/check", |ctx, _| async move {
+                    let api = ctx.client().openapi();
+                    let credentials = api.credentials().ok_or(Error::MissingCredentials)?;
+                    assert_eq!(credentials.app_key(), "stream-id");
+                    assert_eq!(credentials.app_secret(), "stream-secret");
+                    assert_eq!(
+                        ctx.client().stream_connect_timeout(),
+                        Duration::from_secs(9)
+                    );
+                    assert_eq!(
+                        ctx.client().openapi_endpoint(&["test"])?.as_str(),
+                        "http://localhost:19001/modern/test"
+                    );
+                    Ok::<_, dingding::Error>(())
+                })
+                .build()
+                .expect("Stream bot");
+            assert_eq!(stream.client.credentials.app_key(), "stream-id");
+            assert_eq!(
+                stream
+                    .client
+                    .client
+                    .openapi()
+                    .credentials()
+                    .map(AppCredentials::app_key),
+                Some("stream-id")
+            );
+            assert_eq!(
+                original.openapi().credentials(),
+                original_credentials.as_ref()
+            );
+            stream
+                .client
+                .bot
+                .as_ref()
+                .expect("bot")
+                .handle_event(BotEvent::text(ConversationScope::Group, "/check"))
+                .await
+                .expect("handler uses Stream credentials");
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_credentials_apply_to_supplied_router_without_replacing_its_transport() {
+        let connection_client = DingTalk::new().expect("connection client");
+        let router_client = DingTalk::builder()
+            .app_key_and_secret("other-id", "other-secret")
+            .openapi_base_url("http://localhost:19002/router")
+            .connect_timeout(Duration::from_secs(11))
+            .build()
+            .expect("router client");
+        let bot = Bot::new(router_client.clone()).on_text_command(
+            ConversationScope::Any,
+            "/check",
+            |ctx, _| async move {
+                let api = ctx.client().openapi();
+                assert_eq!(
+                    api.credentials().map(AppCredentials::app_key),
+                    Some("stream-id")
+                );
+                assert_eq!(
+                    ctx.client().stream_connect_timeout(),
+                    Duration::from_secs(11)
+                );
+                assert_eq!(
+                    ctx.client().openapi_endpoint(&["test"])?.as_str(),
+                    "http://localhost:19002/router/test"
+                );
+                Ok::<_, Error>(())
+            },
+        );
+        let stream = StreamClient::builder(connection_client.clone())
+            .expect("builder")
+            .client_id_and_secret("stream-id", "stream-secret")
+            .bot(bot)
+            .build()
+            .expect("stream");
+        stream
+            .bot
+            .as_ref()
+            .expect("bot")
+            .handle_event(BotEvent::text(ConversationScope::Private, "/check"))
+            .await
+            .expect("handler credentials");
+        assert!(connection_client.openapi().credentials().is_none());
+        assert_eq!(
+            router_client
+                .openapi()
+                .credentials()
+                .map(AppCredentials::app_key),
+            Some("other-id")
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_callbacks_preserve_application_errors() {
+        use std::error::Error as _;
+        let client = DingTalk::builder()
+            .app_key_and_secret("id", "secret")
+            .build()
+            .expect("client");
+        let application_error = || std::io::Error::other("application callback failed");
+        let streams = [
+            StreamClient::builder(client.clone())
+                .expect("builder")
+                .on_frame(move |_| async move { Err::<(), _>(application_error()) })
+                .build()
+                .expect("stream"),
+            StreamClient::builder(client.clone())
+                .expect("builder")
+                .on_frame(
+                    move |_| async move { Err::<StreamFrameResponse, _>(application_error()) },
+                )
+                .build()
+                .expect("stream"),
+            StreamClient::builder(client.clone())
+                .expect("builder")
+                .on_card_callback(move |_| async move { Err::<(), _>(application_error()) })
+                .build()
+                .expect("stream"),
+            StreamClient::builder(client.clone())
+                .expect("builder")
+                .on_card_callback(move |_| async move {
+                    Err::<StreamFrameResponse, _>(application_error())
+                })
+                .build()
+                .expect("stream"),
+            StreamBot::from_client(client.clone())
+                .on_frame(move |_| async move { Err::<(), _>(application_error()) })
+                .build()
+                .expect("bot")
+                .client,
+            StreamBot::from_client(client.clone())
+                .on_frame(
+                    move |_| async move { Err::<StreamFrameResponse, _>(application_error()) },
+                )
+                .build()
+                .expect("bot")
+                .client,
+            StreamBot::from_client(client.clone())
+                .on_card_callback(move |_| async move { Err::<(), _>(application_error()) })
+                .build()
+                .expect("bot")
+                .client,
+            StreamBot::from_client(client)
+                .on_card_callback(move |_| async move {
+                    Err::<StreamFrameResponse, _>(application_error())
+                })
+                .build()
+                .expect("bot")
+                .client,
+        ];
+        let frame = serde_json::json!({
+            "specVersion":"1.0", "type":"CALLBACK",
+            "headers":{"topic":CARD_CALLBACK_TOPIC, "messageId":"card-id", "contentType":"application/json"},
+            "data":"{}",
+        }).to_string();
+        for stream in streams {
+            let handled = stream
+                .handle_text_frame(&frame)
+                .await
+                .expect("handled frame");
+            assert_eq!(
+                serde_json::to_value(&handled.ack).expect("ack")["code"],
+                500
+            );
+            let error = handled.error.expect("handler error").error;
+            assert_eq!(error.kind(), crate::ErrorKind::Handler);
+            assert!(
+                error
+                    .source()
+                    .and_then(|source| source.downcast_ref::<std::io::Error>())
+                    .is_some()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_response_keeps_payload_and_sdk_error_category() {
+        let stream = StreamBot::builder()
+            .client_id_and_secret("id", "secret")
+            .on_card_callback(|_| async {
+                Ok::<_, std::io::Error>(StreamFrameResponse::from_value(
+                    serde_json::json!({"accepted":true}),
+                ))
+            })
+            .build()
+            .expect("bot")
+            .client;
+        let response = stream.card_callback_handler.as_ref().expect("callback")(
+            CardCallbackEvent::from_value(serde_json::json!({})),
+        )
+        .await
+        .expect("response");
+        assert_eq!(response.as_value()["accepted"], true);
+        let stream = StreamBot::builder()
+            .client_id_and_secret("id", "secret")
+            .on_frame(|_| async { Err::<(), _>(Error::MissingCredentials) })
+            .build()
+            .expect("bot")
+            .client;
+        let frame = StreamFrame::from_text(
+            r#"{"type":"EVENT","headers":{"topic":"test","messageId":"id"},"data":{}}"#,
+        )
+        .expect("frame");
+        let error = stream.frame_handler.as_ref().expect("handler")(frame)
+            .await
+            .expect_err("SDK error");
+        assert_eq!(error.kind(), crate::ErrorKind::MissingCredentials);
+    }
+
+    #[tokio::test]
+    async fn stream_callbacks_accept_unit_and_response_values_on_both_builders() {
+        let client = DingTalk::builder()
+            .app_key_and_secret("id", "secret")
+            .build()
+            .expect("client");
+        let low = || StreamClient::builder(client.clone()).expect("builder");
+        let high = || StreamBot::from_client(client.clone());
+        let response = || StreamFrameResponse::from_value(serde_json::json!({"accepted":true}));
+        let streams = [
+            (low().on_frame(|_| async {}).build().expect("stream"), false),
+            (
+                low()
+                    .on_frame(move |_| async move { response() })
+                    .build()
+                    .expect("stream"),
+                true,
+            ),
+            (
+                low()
+                    .on_card_callback(|_| async {})
+                    .build()
+                    .expect("stream"),
+                false,
+            ),
+            (
+                low()
+                    .on_card_callback(move |_| async move { response() })
+                    .build()
+                    .expect("stream"),
+                true,
+            ),
+            (
+                high().on_frame(|_| async {}).build().expect("bot").client,
+                false,
+            ),
+            (
+                high()
+                    .on_frame(move |_| async move { response() })
+                    .build()
+                    .expect("bot")
+                    .client,
+                true,
+            ),
+            (
+                high()
+                    .on_card_callback(|_| async {})
+                    .build()
+                    .expect("bot")
+                    .client,
+                false,
+            ),
+            (
+                high()
+                    .on_card_callback(move |_| async move { response() })
+                    .build()
+                    .expect("bot")
+                    .client,
+                true,
+            ),
+        ];
+        for (stream, has_payload) in streams {
+            let result = if let Some(handler) = &stream.card_callback_handler {
+                assert!(
+                    stream
+                        .subscriptions
+                        .iter()
+                        .any(|subscription| subscription.topic() == CARD_CALLBACK_TOPIC)
+                );
+                handler(CardCallbackEvent::from_value(serde_json::json!({}))).await
+            } else {
+                let frame = StreamFrame::from_text(
+                    r#"{"type":"EVENT","headers":{"topic":"test","messageId":"id"},"data":{}}"#,
+                )
+                .expect("frame");
+                stream.frame_handler.as_ref().expect("handler")(frame).await
+            }
+            .expect("response");
+            assert_eq!(
+                result.into_value(),
+                if has_payload {
+                    serde_json::json!({"accepted":true})
+                } else {
+                    Value::Null
+                }
+            );
+        }
+    }
+
     fn test_bot(client: DingTalk) -> Bot {
-        Bot::new(client)
-            .route(Route::new(ConversationScope::Any).handle(|_ctx, _event| async { Ok(()) }))
+        Bot::new(client).route(Route::new(ConversationScope::Any).handle(|_ctx, _event| async {}))
     }
 
     #[test]
@@ -3377,7 +3410,7 @@ mod tests {
 
         let stream = StreamClient::builder(client)
             .expect("builder")
-            .on_card_callback(|_event| async { Ok(()) })
+            .on_card_callback(|_event| async {})
             .build()
             .expect("stream");
 
@@ -3395,7 +3428,7 @@ mod tests {
 
         let stream = StreamClient::builder(client)
             .expect("builder")
-            .on_frame(|_frame| async { Ok(()) })
+            .on_frame(|_frame| async {})
             .build()
             .expect("stream");
 
@@ -3412,13 +3445,13 @@ mod tests {
         let stream = StreamClient::builder(client.clone())
             .expect("builder")
             .websocket_connect_timeout(Duration::from_secs(9))
-            .on_frame(|_frame| async { Ok(()) })
+            .on_frame(|_frame| async {})
             .build()
             .expect("stream");
         let invalid = StreamClient::builder(client)
             .expect("builder")
             .websocket_connect_timeout(Duration::ZERO)
-            .on_frame(|_frame| async { Ok(()) })
+            .on_frame(|_frame| async {})
             .build()
             .err()
             .expect("zero websocket timeout should fail");
@@ -3432,7 +3465,7 @@ mod tests {
         let stream = StreamBot::builder()
             .client_id_and_secret("client-id", "client-secret")
             .websocket_connect_timeout(Duration::from_secs(9))
-            .on_frame(|_frame| async { Ok(()) })
+            .on_frame(|_frame| async {})
             .build()
             .expect("stream bot");
 
@@ -3462,7 +3495,7 @@ mod tests {
         let result = StreamClient::builder(client)
             .expect("builder")
             .subscriptions(vec![StreamSubscription::callback(" ")])
-            .on_frame(|_frame| async { Ok(()) })
+            .on_frame(|_frame| async {})
             .build();
         let Err(error) = result else {
             panic!("empty topic should fail");
@@ -3481,7 +3514,7 @@ mod tests {
         let result = StreamClient::builder(client)
             .expect("builder")
             .subscriptions(vec![StreamSubscription::callback("/v1.0/example events")])
-            .on_frame(|_frame| async { Ok(()) })
+            .on_frame(|_frame| async {})
             .build();
         let Err(error) = result else {
             panic!("topic should not contain whitespace");
@@ -3500,7 +3533,7 @@ mod tests {
         let result = StreamClient::builder(client)
             .expect("builder")
             .user_agent(" dingding/0.1 ")
-            .on_frame(|_frame| async { Ok(()) })
+            .on_frame(|_frame| async {})
             .build();
         let Err(error) = result else {
             panic!("user agent should not be rewritten");
@@ -3527,7 +3560,7 @@ mod tests {
 
         let result = StreamClient::builder(client)
             .expect("builder")
-            .on_frame(|_frame| async { Ok(()) })
+            .on_frame(|_frame| async {})
             .build();
         let Err(error) = result else {
             panic!("credentials should be required");
@@ -3578,7 +3611,7 @@ mod tests {
     fn stream_bot_builder_builds_from_credentials() {
         let result = StreamBot::builder()
             .client_id_and_secret("client-id", "client-secret")
-            .route(Route::new(ConversationScope::Any).handle(|_ctx, _event| async { Ok(()) }))
+            .route(Route::new(ConversationScope::Any).handle(|_ctx, _event| async {}))
             .build();
 
         assert!(result.is_ok());
@@ -3614,9 +3647,9 @@ mod tests {
     fn stream_bot_builder_registers_route_shortcuts() {
         let result = StreamBot::builder()
             .client_id_and_secret("client-id", "client-secret")
-            .on_group_text_command("/ping", |_ctx, _event| async { Ok(()) })
-            .on_private_text_commands(["/help", "help"], |_ctx, _event| async { Ok(()) })
-            .on_private_message(MessageType::Picture, |_ctx, _event| async { Ok(()) })
+            .on_group_text_command("/ping", |_ctx, _event| async {})
+            .on_private_text_commands(["/help", "help"], |_ctx, _event| async {})
+            .on_private_message(MessageType::Picture, |_ctx, _event| async {})
             .build();
 
         assert!(result.is_ok());
@@ -3628,7 +3661,7 @@ mod tests {
         let seen_events = Arc::clone(&seen);
         let stream_bot = StreamBot::builder()
             .client_id_and_secret("client-id", "client-secret")
-            .on_group_text_command("/ping", |_ctx, _event| async { Ok(()) })
+            .on_group_text_command("/ping", |_ctx, _event| async {})
             .on_event(move |event| {
                 seen_events.lock().expect("event lock").push(event);
             })
@@ -3675,7 +3708,6 @@ mod tests {
                 let seen_topic = Arc::clone(&seen_topic);
                 async move {
                     *seen_topic.lock().expect("topic lock") = Some(frame.topic().to_string());
-                    Ok(())
                 }
             })
             .build()
@@ -3790,7 +3822,7 @@ mod tests {
         let result = StreamBot::builder()
             .client_id_and_secret("client-id", "client-secret")
             .subscription(StreamSubscription::event("/v1.0/example/events"))
-            .on_frame(|_frame| async { Ok(()) })
+            .on_frame(|_frame| async {})
             .build();
 
         assert!(result.is_ok());
@@ -3801,7 +3833,7 @@ mod tests {
         let result = StreamBot::builder()
             .client_id_and_secret("client-id", "client-secret")
             .subscription(StreamSubscription::event("/v1.0/example/events"))
-            .on_frame_with_response(|_frame| async {
+            .on_frame(|_frame| async {
                 StreamFrameResponse::json(serde_json::json!({ "accepted": true }))
             })
             .build();
@@ -3813,7 +3845,7 @@ mod tests {
     fn stream_bot_builder_registers_card_callback_handler() {
         let stream = StreamBot::builder()
             .client_id_and_secret("client-id", "client-secret")
-            .on_card_callback(|_event| async { Ok(()) })
+            .on_card_callback(|_event| async {})
             .build()
             .expect("stream bot");
 
@@ -3853,7 +3885,6 @@ mod tests {
                         event.action().unwrap_or_default().to_string(),
                         event.action_value().cloned().unwrap_or(Value::Null),
                     ));
-                    Ok(())
                 }
             })
             .on_event(move |event| {
@@ -4134,7 +4165,7 @@ mod tests {
                     let data = frame.data_json()?;
                     *seen_frame.lock().expect("frame lock") =
                         Some((frame.frame_type().clone(), frame.topic().to_string(), data));
-                    Ok(())
+                    Ok::<_, dingding::Error>(())
                 }
             })
             .build()
@@ -4181,7 +4212,7 @@ mod tests {
         let stream = StreamClient::builder(client)
             .expect("builder")
             .subscriptions(vec![StreamSubscription::event("/v1.0/example/events")])
-            .on_frame_with_response(|frame| async move {
+            .on_frame(|frame| async move {
                 let data = frame.data_json()?;
                 StreamFrameResponse::json(serde_json::json!({
                     "topic": frame.topic(),
@@ -4231,7 +4262,6 @@ mod tests {
                 let seen_topic = Arc::clone(&seen_topic);
                 async move {
                     *seen_topic.lock().expect("topic lock") = Some(frame.topic().to_string());
-                    Ok(())
                 }
             })
             .build()

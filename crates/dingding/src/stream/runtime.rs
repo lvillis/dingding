@@ -32,7 +32,7 @@ use crate::{Error, Result, bot::dedup::Deduplication};
 ///         shutdown_timeout: Duration::from_secs(20),
 ///         ..StreamProcessingPolicy::default()
 ///     })
-///     .on_frame(|_frame| async { Ok(()) })
+///     .on_frame(|_frame| async {})
 ///     .run_until(async { let _ = tokio::signal::ctrl_c().await; })
 ///     .await
 /// # }

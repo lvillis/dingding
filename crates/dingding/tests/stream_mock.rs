@@ -156,7 +156,6 @@ async fn shutdown_preserves_heartbeats_but_rejects_new_business_frames() {
                     .send(frame.message_id().to_owned())
                     .expect("started");
                 gate.acquire().await.expect("gate").forget();
-                Ok(())
             }
         })
         .build()
@@ -218,7 +217,6 @@ async fn slow_handlers_preserve_heartbeats_order_and_graceful_shutdown() {
                     .send(frame.message_id().to_owned())
                     .expect("started");
                 gate.acquire().await.expect("gate").forget();
-                Ok(())
             }
         })
         .build()
@@ -269,7 +267,6 @@ async fn concurrency_and_queue_are_bounded_without_blocking_control_frames() {
                     .send(event.message_id().to_owned())
                     .expect("started");
                 gate.acquire().await.expect("gate").forget();
-                Ok(())
             }
         })
         .build()
@@ -332,7 +329,7 @@ async fn timeout_failure_and_panic_allow_retry_and_success_is_deduplicated() {
                             _ => panic!("injected handler panic"),
                         }
                     }
-                    Ok(())
+                    Ok::<_, dingding::Error>(())
                 }
             })
             .build()
@@ -368,7 +365,6 @@ async fn concurrent_duplicate_is_not_executed_or_acknowledged_as_completed() {
             async move {
                 started.send(()).expect("started");
                 gate.acquire().await.expect("gate").forget();
-                Ok(())
             }
         })
         .build()
@@ -398,7 +394,7 @@ async fn card_ack_is_replayed_after_duplicate_delivery_and_reconnection() {
             Duration::from_millis(10),
             Duration::from_millis(20),
         ))
-        .on_card_callback_with_response(move |_| {
+        .on_card_callback(move |_| {
             count.fetch_add(1, Ordering::SeqCst);
             async {
                 StreamFrameResponse::json(json!({"cardData":{"cardParamMap":{"title":"updated"}}}))
@@ -461,7 +457,6 @@ async fn connection_loss_during_shutdown_reports_unfinished_work() {
                 let _guard = guard;
                 started.send(()).expect("started");
                 std::future::pending::<()>().await;
-                Ok(())
             }
         })
         .build()
@@ -505,7 +500,6 @@ async fn shutdown_deadline_cancels_unfinished_work_and_reports_failure() {
                 let _guard = guard;
                 started.send(()).expect("started");
                 std::future::pending::<()>().await;
-                Ok(())
             }
         })
         .build()
@@ -534,7 +528,7 @@ async fn buffered_control_bursts_do_not_starve_the_ack_writer() {
             ..StreamProcessingPolicy::default()
         })
         .reconnect_policy(ReconnectPolicy::no_retry())
-        .on_frame(|_| async { Ok(()) })
+        .on_frame(|_| async {})
         .build()
         .expect("stream");
     let (stop, task) = launch(stream);
@@ -565,7 +559,7 @@ async fn already_signalled_shutdown_does_not_open_a_connection() {
             .expect("client"),
     )
     .expect("builder")
-    .on_frame(|_| async { Ok(()) })
+    .on_frame(|_| async {})
     .build()
     .expect("stream");
     bounded(stream.run_until(async {}))

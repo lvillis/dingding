@@ -32,7 +32,7 @@ async fn main() -> Result<()> {
 
     StreamBot::from_env()?
         .route(ping_route())
-        .on_card_callback_with_response(handle_card_callback)
+        .on_card_callback(handle_card_callback)
         .on_event(log_stream_event)
         .run_until(shutdown_signal())
         .await

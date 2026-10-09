@@ -66,7 +66,6 @@ async fn cancelled_bot_callback_releases_its_claim() {
                 if first {
                     std::future::pending::<()>().await;
                 }
-                Ok(())
             }
         }),
     );
@@ -93,11 +92,12 @@ impl EventDeduplicator for Unavailable {
 
 #[tokio::test]
 async fn custom_store_errors_do_not_execute_unreserved_events() {
+    async fn unexpected(_: dingding::bot::BotContext, _: BotEvent) {
+        panic!("must not execute");
+    }
     let bot = Bot::new(DingTalk::new().expect("client"))
         .deduplicator(Arc::new(Unavailable))
-        .route(
-            Route::new(ConversationScope::Any).handle(|_, _| async { panic!("must not execute") }),
-        );
+        .route(Route::new(ConversationScope::Any).handle(unexpected));
     assert!(
         bot.handle_event(event("one"))
             .await

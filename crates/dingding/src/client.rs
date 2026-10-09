@@ -17,14 +17,14 @@ use crate::{
 #[derive(Clone)]
 pub struct DingTalk {
     inner: Arc<Inner>,
+    #[cfg(feature = "openapi")]
+    app_credentials: Option<Arc<AppCredentials>>,
 }
 
 struct Inner {
     webhook_base_url: Url,
     #[cfg(feature = "openapi")]
     openapi_base_url: Url,
-    #[cfg(feature = "openapi")]
-    app_credentials: Option<AppCredentials>,
     #[cfg(feature = "openapi")]
     token_cache: MemoryTokenCache,
     #[cfg(feature = "openapi")]
@@ -62,7 +62,18 @@ impl DingTalk {
     #[cfg(feature = "openapi")]
     #[must_use]
     pub fn openapi(&self) -> crate::openapi::OpenApi {
-        crate::openapi::OpenApi::new(self.clone(), self.inner.app_credentials.clone())
+        crate::openapi::OpenApi::new(self.clone(), self.app_credentials.as_deref().cloned())
+    }
+
+    /// Returns a client using these credentials while sharing transport and token caches.
+    ///
+    /// Other clones retain their own credentials. Base URLs, timeouts, proxy settings, and
+    /// token refresh configuration are preserved.
+    #[cfg(feature = "openapi")]
+    pub fn with_app_credentials(mut self, credentials: AppCredentials) -> Result<Self> {
+        credentials.validate()?;
+        self.app_credentials = Some(Arc::new(credentials));
+        Ok(self)
     }
 
     /// Creates an OpenAPI service with explicit app credentials.
@@ -93,7 +104,7 @@ impl DingTalk {
 
     #[cfg(feature = "stream")]
     pub(crate) fn app_credentials(&self) -> Option<AppCredentials> {
-        self.inner.app_credentials.clone()
+        self.app_credentials.as_deref().cloned()
     }
 
     #[cfg(feature = "openapi")]
@@ -312,12 +323,12 @@ impl DingTalkBuilder {
         let transport = Transport::new(&webhook_base_url, None, &self.transport)?;
 
         Ok(DingTalk {
+            #[cfg(feature = "openapi")]
+            app_credentials: self.app_credentials.map(Arc::new),
             inner: Arc::new(Inner {
                 webhook_base_url,
                 #[cfg(feature = "openapi")]
                 openapi_base_url,
-                #[cfg(feature = "openapi")]
-                app_credentials: self.app_credentials,
                 #[cfg(feature = "openapi")]
                 token_cache: MemoryTokenCache::new().with_refresh_margin(self.token_refresh_margin),
                 #[cfg(feature = "openapi")]
@@ -333,6 +344,65 @@ impl DingTalkBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "openapi")]
+    #[test]
+    fn client_credentials_override_preserves_shared_configuration_and_cache() {
+        let original_credentials = AppCredentials::new("original-key", "original-secret");
+        let stream_credentials = AppCredentials::new("stream-key", "stream-secret");
+        let original = DingTalk::builder()
+            .webhook_base_url("http://localhost:19000/legacy")
+            .openapi_base_url("http://localhost:19001/modern")
+            .app_credentials(original_credentials.clone())
+            .connect_timeout(Duration::from_secs(9))
+            .access_token_refresh_margin(Duration::ZERO)
+            .build()
+            .expect("client");
+        original.store_access_token(
+            original_credentials.clone(),
+            "original-token".into(),
+            Some(7200),
+        );
+        let overridden = original
+            .clone()
+            .with_app_credentials(stream_credentials.clone())
+            .expect("override");
+        assert!(Arc::ptr_eq(&original.inner, &overridden.inner));
+        assert_eq!(
+            original.openapi().credentials(),
+            Some(&original_credentials)
+        );
+        assert_eq!(
+            overridden.openapi().credentials(),
+            Some(&stream_credentials)
+        );
+        assert_eq!(
+            overridden
+                .cached_access_token(&original_credentials)
+                .as_deref(),
+            Some("original-token")
+        );
+        overridden.store_access_token(
+            stream_credentials.clone(),
+            "stream-token".into(),
+            Some(7200),
+        );
+        assert_eq!(
+            original.cached_access_token(&stream_credentials).as_deref(),
+            Some("stream-token")
+        );
+        assert_eq!(
+            original
+                .cached_access_token(&original_credentials)
+                .as_deref(),
+            Some("original-token")
+        );
+        assert!(
+            original
+                .with_app_credentials(AppCredentials::new(" ", "secret"))
+                .is_err()
+        );
+    }
 
     #[cfg(feature = "openapi")]
     #[test]

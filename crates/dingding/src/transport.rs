@@ -1,4 +1,8 @@
-use std::{fmt, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use reqx::{
     advanced::{ClientProfile, PermissiveRetryEligibility},
@@ -119,6 +123,10 @@ pub(crate) struct Transport {
     #[cfg(feature = "openapi")]
     openapi_http: HttpClient,
     error_body_snippet: BodySnippetConfig,
+    #[cfg(feature = "openapi")]
+    stream_total_timeout: Option<Duration>,
+    #[cfg(feature = "openapi")]
+    stream_write_timeout: Duration,
 }
 
 impl Transport {
@@ -142,6 +150,10 @@ impl Transport {
                 config,
             )?,
             error_body_snippet: config.error_body_snippet,
+            #[cfg(feature = "openapi")]
+            stream_total_timeout: config.total_timeout,
+            #[cfg(feature = "openapi")]
+            stream_write_timeout: config.request_timeout.unwrap_or(Duration::from_secs(30)),
         })
     }
 
@@ -182,6 +194,179 @@ impl Transport {
             .body(body)
             .send_response()
             .await?)
+    }
+
+    #[cfg(feature = "openapi")]
+    pub(crate) async fn post_webhook_reader<R>(
+        &self,
+        url: &Url,
+        content_type: &str,
+        reader: R,
+        content_length: u64,
+    ) -> Result<reqx::Response>
+    where
+        R: tokio::io::AsyncRead + Send + 'static,
+    {
+        Ok(self
+            .webhook_http
+            .post(url.as_str())
+            .try_header("content-type", content_type)?
+            .body_reader_with_length(reader, content_length)?
+            .send_response()
+            .await?)
+    }
+
+    #[cfg(feature = "openapi")]
+    pub(crate) async fn download_to_writer<W>(
+        &self,
+        url: &Url,
+        writer: &mut W,
+        max_bytes: usize,
+    ) -> Result<(Option<String>, u64)>
+    where
+        W: tokio::io::AsyncWrite + Unpin + Send + ?Sized,
+    {
+        let transfer = self.copy_download(url, writer, max_bytes);
+        match self.stream_total_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, transfer).await.map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "download total timeout")
+            })?,
+            None => transfer.await,
+        }
+    }
+
+    #[cfg(feature = "openapi")]
+    async fn copy_download<W>(
+        &self,
+        url: &Url,
+        writer: &mut W,
+        max_bytes: usize,
+    ) -> Result<(Option<String>, u64)>
+    where
+        W: tokio::io::AsyncWrite + Unpin + Send + ?Sized,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const PREFIX_LIMIT: usize = 64 * 1024;
+        let mut response = self
+            .webhook_http
+            .get(url.as_str())
+            .auto_accept_encoding(false)
+            .try_header("accept-encoding", "identity")?
+            .send_response_stream()
+            .await?;
+        if !response.status().is_success() {
+            let response = response.into_response_limited(PREFIX_LIMIT).await?;
+            parse_binary_response(response, self.error_body_snippet)?;
+            return Err(Error::api_with_code(
+                -1,
+                None,
+                "unexpected download status",
+                None,
+                None,
+            ));
+        }
+        // Raw response streams do not decompress content. Never silently save encoded bytes.
+        if response
+            .headers()
+            .get("content-encoding")
+            .is_some_and(|value| {
+                value
+                    .to_str()
+                    .map_or(true, |value| !value.trim().eq_ignore_ascii_case("identity"))
+            })
+        {
+            return Err(Error::api_with_code(
+                -1,
+                None,
+                "server ignored identity content encoding",
+                None,
+                None,
+            ));
+        }
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        let status = response.status().as_u16();
+        let request_id = response
+            .headers()
+            .get("x-request-id")
+            .or_else(|| response.headers().get("x-acs-request-id"))
+            .and_then(|value| value.to_str().ok())
+            .and_then(normalize_response_string);
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| parse_retry_after(value, SystemTime::now()));
+        let too_large = |actual_bytes| {
+            Error::from(reqx::Error::ResponseBodyTooLarge {
+                limit_bytes: max_bytes,
+                actual_bytes,
+                method: response.method().clone(),
+                uri: response.uri_redacted().to_owned(),
+            })
+        };
+        if let Some(length) = response
+            .headers()
+            .get("content-length")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            && length > max_bytes as u64
+        {
+            return Err(too_large(usize::try_from(length).unwrap_or(usize::MAX)));
+        }
+        // Inspect only a bounded prefix for HTTP-200 DingTalk error envelopes.
+        let mut prefix = Vec::new();
+        (&mut response)
+            .take((PREFIX_LIMIT + 1).min(max_bytes.saturating_add(1)) as u64)
+            .read_to_end(&mut prefix)
+            .await?;
+        if prefix.len() <= PREFIX_LIMIT
+            && let Some(error) = binary_success_body_error(
+                &prefix,
+                content_type
+                    .as_deref()
+                    .is_some_and(|value| value.to_ascii_lowercase().contains("json")),
+                self.error_body_snippet,
+            )
+        {
+            return Err(error.with_response_metadata(status, request_id, retry_after));
+        }
+        if prefix.len() > max_bytes {
+            return Err(reqx::Error::ResponseBodyTooLarge {
+                limit_bytes: max_bytes,
+                actual_bytes: prefix.len(),
+                method: response.method().clone(),
+                uri: response.uri_redacted().to_owned(),
+            }
+            .into());
+        }
+        tokio::time::timeout(self.stream_write_timeout, writer.write_all(&prefix))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "download writer timeout")
+            })??;
+        let written = response
+            .copy_to_writer_limited(writer, max_bytes - prefix.len())
+            .await
+            .map_err(|error| match error {
+                reqx::Error::ResponseBodyTooLarge {
+                    actual_bytes,
+                    method,
+                    uri,
+                    ..
+                } => reqx::Error::ResponseBodyTooLarge {
+                    limit_bytes: max_bytes,
+                    actual_bytes: actual_bytes.saturating_add(prefix.len()),
+                    method,
+                    uri,
+                },
+                error => error,
+            })?;
+        Ok((content_type, written + prefix.len() as u64))
     }
 
     #[cfg(feature = "openapi")]
@@ -386,6 +571,29 @@ pub(crate) struct StandardApiResponse {
     pub(crate) request_id: Option<String>,
 }
 
+pub(crate) fn with_response_metadata<T>(
+    response: reqx::Response,
+    parse: impl FnOnce(reqx::Response) -> Result<T>,
+) -> Result<T> {
+    let status = response.status().as_u16();
+    let request_id = response_request_id(&response);
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| parse_retry_after(value, SystemTime::now()));
+    parse(response).map_err(|error| error.with_response_metadata(status, request_id, retry_after))
+}
+
+fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return value.parse::<u64>().ok().map(Duration::from_secs);
+    }
+    let date = httpdate::parse_http_date(value).ok()?;
+    Some(date.duration_since(now).unwrap_or(Duration::ZERO))
+}
+
 pub(crate) fn decode_json_response<T>(
     response: reqx::Response,
     error_body_snippet: BodySnippetConfig,
@@ -393,17 +601,19 @@ pub(crate) fn decode_json_response<T>(
 where
     T: DeserializeOwned,
 {
-    let body = successful_body(response, error_body_snippet)?;
-    let value = serde_json::from_str(&body).map_err(|source| {
-        api_error_from_body(
-            -1,
-            format!("invalid DingTalk JSON response: {source}"),
-            None,
-            &body,
-            error_body_snippet,
-        )
-    })?;
-    Ok((value, body))
+    with_response_metadata(response, |response| {
+        let body = successful_body(response, error_body_snippet)?;
+        let value = serde_json::from_str(&body).map_err(|source| {
+            api_error_from_body(
+                -1,
+                format!("invalid DingTalk JSON response: {source}"),
+                None,
+                &body,
+                error_body_snippet,
+            )
+        })?;
+        Ok((value, body))
+    })
 }
 
 #[cfg(feature = "webhook")]
@@ -411,32 +621,35 @@ pub(crate) fn parse_standard_response(
     response: reqx::Response,
     error_body_snippet: BodySnippetConfig,
 ) -> Result<StandardApiResponse> {
-    let (value, body) = decode_json_response::<StandardApiResponse>(response, error_body_snippet)?;
-    if let Some(error) = response_envelope_error(
-        value.errcode,
-        value.api_code.as_deref(),
-        value.errmsg.as_deref(),
-        value.success,
-        value.request_id.as_deref(),
-        &body,
-        error_body_snippet,
-    ) {
-        return Err(error);
-    }
-    match value.errcode {
-        Some(0) => Ok(value),
-        Some(_) => unreachable!("non-zero errcode should be handled before this match"),
-        None => Err(api_error_from_body(
-            -1,
-            response_error_message(
-                value.errmsg.clone(),
-                "missing errcode field in DingTalk response",
-            ),
-            value.request_id.clone(),
+    with_response_metadata(response, |response| {
+        let (value, body) =
+            decode_json_response::<StandardApiResponse>(response, error_body_snippet)?;
+        if let Some(error) = response_envelope_error(
+            value.errcode,
+            value.api_code.as_deref(),
+            value.errmsg.as_deref(),
+            value.success,
+            value.request_id.as_deref(),
             &body,
             error_body_snippet,
-        )),
-    }
+        ) {
+            return Err(error);
+        }
+        match value.errcode {
+            Some(0) => Ok(value),
+            Some(_) => unreachable!("non-zero errcode should be handled before this match"),
+            None => Err(api_error_from_body(
+                -1,
+                response_error_message(
+                    value.errmsg.clone(),
+                    "missing errcode field in DingTalk response",
+                ),
+                value.request_id.clone(),
+                &body,
+                error_body_snippet,
+            )),
+        }
+    })
 }
 
 #[cfg(feature = "openapi")]
@@ -444,58 +657,60 @@ pub(crate) fn parse_standard_text_response(
     response: reqx::Response,
     error_body_snippet: BodySnippetConfig,
 ) -> Result<String> {
-    let body = successful_body(response, error_body_snippet)?;
-    let raw = serde_json::from_str::<Value>(&body).map_err(|source| {
-        api_error_from_body(
-            -1,
-            format!("invalid DingTalk JSON response: {source}"),
-            None,
-            &body,
-            error_body_snippet,
-        )
-    })?;
-    let Value::Object(object) = &raw else {
-        return Err(api_error_from_body(
-            -1,
-            "DingTalk response must be a JSON object",
-            None,
-            &body,
-            error_body_snippet,
-        ));
-    };
-    let has_success_payload = standard_text_object_has_success_payload(object);
+    with_response_metadata(response, |response| {
+        let body = successful_body(response, error_body_snippet)?;
+        let raw = serde_json::from_str::<Value>(&body).map_err(|source| {
+            api_error_from_body(
+                -1,
+                format!("invalid DingTalk JSON response: {source}"),
+                None,
+                &body,
+                error_body_snippet,
+            )
+        })?;
+        let Value::Object(object) = &raw else {
+            return Err(api_error_from_body(
+                -1,
+                "DingTalk response must be a JSON object",
+                None,
+                &body,
+                error_body_snippet,
+            ));
+        };
+        let has_success_payload = standard_text_object_has_success_payload(object);
 
-    let value = serde_json::from_value::<StandardApiResponse>(raw).map_err(|source| {
-        api_error_from_body(
-            -1,
-            format!("invalid DingTalk JSON response: {source}"),
-            None,
+        let value = serde_json::from_value::<StandardApiResponse>(raw).map_err(|source| {
+            api_error_from_body(
+                -1,
+                format!("invalid DingTalk JSON response: {source}"),
+                None,
+                &body,
+                error_body_snippet,
+            )
+        })?;
+        if let Some(error) = response_envelope_error(
+            value.errcode,
+            value.api_code.as_deref(),
+            value.errmsg.as_deref(),
+            value.success,
+            value.request_id.as_deref(),
             &body,
             error_body_snippet,
-        )
-    })?;
-    if let Some(error) = response_envelope_error(
-        value.errcode,
-        value.api_code.as_deref(),
-        value.errmsg.as_deref(),
-        value.success,
-        value.request_id.as_deref(),
-        &body,
-        error_body_snippet,
-    ) {
-        return Err(error);
-    }
-    if value.errcode.is_none() && !has_success_payload {
-        return Err(api_error_from_body(
-            -1,
-            response_error_message(value.errmsg, "missing errcode field in DingTalk response"),
-            value.request_id,
-            &body,
-            error_body_snippet,
-        ));
-    }
+        ) {
+            return Err(error);
+        }
+        if value.errcode.is_none() && !has_success_payload {
+            return Err(api_error_from_body(
+                -1,
+                response_error_message(value.errmsg, "missing errcode field in DingTalk response"),
+                value.request_id,
+                &body,
+                error_body_snippet,
+            ));
+        }
 
-    Ok(body)
+        Ok(body)
+    })
 }
 
 #[cfg(feature = "openapi")]
@@ -513,36 +728,39 @@ pub(crate) fn parse_dingtalk_result<T>(
 where
     T: DeserializeOwned,
 {
-    let (value, body) = decode_json_response::<StandardApiResponse>(response, error_body_snippet)?;
-    if let Some(error) = response_envelope_error(
-        value.errcode,
-        value.api_code.as_deref(),
-        value.errmsg.as_deref(),
-        value.success,
-        value.request_id.as_deref(),
-        &body,
-        error_body_snippet,
-    ) {
-        return Err(error);
-    }
+    with_response_metadata(response, |response| {
+        let (value, body) =
+            decode_json_response::<StandardApiResponse>(response, error_body_snippet)?;
+        if let Some(error) = response_envelope_error(
+            value.errcode,
+            value.api_code.as_deref(),
+            value.errmsg.as_deref(),
+            value.success,
+            value.request_id.as_deref(),
+            &body,
+            error_body_snippet,
+        ) {
+            return Err(error);
+        }
 
-    let payload = serde_json::from_str::<DingTalkResult<T>>(&body).map_err(|source| {
-        api_error_from_body(
-            -1,
-            format!("invalid DingTalk result payload: {source}"),
-            value.request_id.clone(),
-            &body,
-            error_body_snippet,
-        )
-    })?;
-    payload.result.ok_or_else(|| {
-        api_error_from_body(
-            -1,
-            "missing result field in DingTalk response",
-            value.request_id,
-            &body,
-            error_body_snippet,
-        )
+        let payload = serde_json::from_str::<DingTalkResult<T>>(&body).map_err(|source| {
+            api_error_from_body(
+                -1,
+                format!("invalid DingTalk result payload: {source}"),
+                value.request_id.clone(),
+                &body,
+                error_body_snippet,
+            )
+        })?;
+        payload.result.ok_or_else(|| {
+            api_error_from_body(
+                -1,
+                "missing result field in DingTalk response",
+                value.request_id,
+                &body,
+                error_body_snippet,
+            )
+        })
     })
 }
 
@@ -551,26 +769,28 @@ pub(crate) fn parse_openapi_response<T: DeserializeOwned>(
     response: reqx::Response,
     config: BodySnippetConfig,
 ) -> Result<T> {
-    let (envelope, body) = decode_json_response::<StandardApiResponse>(response, config)?;
-    if let Some(error) = response_envelope_error(
-        envelope.errcode,
-        envelope.api_code.as_deref(),
-        envelope.errmsg.as_deref(),
-        envelope.success,
-        envelope.request_id.as_deref(),
-        &body,
-        config,
-    ) {
-        return Err(error);
-    }
-    serde_json::from_str(&body).map_err(|error| {
-        api_error_from_body(
-            -1,
-            format!("invalid DingTalk response payload: {error}"),
-            envelope.request_id,
+    with_response_metadata(response, |response| {
+        let (envelope, body) = decode_json_response::<StandardApiResponse>(response, config)?;
+        if let Some(error) = response_envelope_error(
+            envelope.errcode,
+            envelope.api_code.as_deref(),
+            envelope.errmsg.as_deref(),
+            envelope.success,
+            envelope.request_id.as_deref(),
             &body,
             config,
-        )
+        ) {
+            return Err(error);
+        }
+        serde_json::from_str(&body).map_err(|error| {
+            api_error_from_body(
+                -1,
+                format!("invalid DingTalk response payload: {error}"),
+                envelope.request_id,
+                &body,
+                config,
+            )
+        })
     })
 }
 
@@ -579,35 +799,42 @@ pub(crate) fn parse_binary_response(
     response: reqx::Response,
     error_body_snippet: BodySnippetConfig,
 ) -> Result<Vec<u8>> {
-    let status = response.status().as_u16();
-    let request_id = response_request_id(&response);
+    with_response_metadata(response, |response| {
+        let status = response.status().as_u16();
+        let request_id = response_request_id(&response);
 
-    if !(200..=299).contains(&status) {
-        let body = response.text_lossy();
-        let parsed = serde_json::from_str::<StandardApiResponse>(&body).ok();
-        let message = parsed
-            .as_ref()
-            .map(|parsed| response_error_message(parsed.errmsg.clone(), &format!("HTTP {status}")));
-        let request_id =
-            request_id.or_else(|| parsed.as_ref().and_then(|parsed| parsed.request_id.clone()));
-        return Err(api_error_from_body_with_code(
-            status.into(),
-            parsed.as_ref().and_then(|parsed| parsed.api_code.clone()),
-            message.unwrap_or_else(|| format!("HTTP {status}")),
-            request_id,
-            &body,
-            error_body_snippet,
-        ));
-    }
+        if !(200..=299).contains(&status) {
+            let body = response.text_lossy();
+            let parsed = serde_json::from_str::<StandardApiResponse>(&body).ok();
+            let message = parsed.as_ref().map(|parsed| {
+                response_error_message(parsed.errmsg.clone(), &format!("HTTP {status}"))
+            });
+            let request_id =
+                request_id.or_else(|| parsed.as_ref().and_then(|parsed| parsed.request_id.clone()));
+            return Err(api_error_from_body_with_code(
+                parsed
+                    .as_ref()
+                    .and_then(|parsed| parsed.errcode)
+                    .filter(|code| *code != 0)
+                    .unwrap_or(status.into()),
+                parsed.as_ref().and_then(|parsed| parsed.api_code.clone()),
+                message.unwrap_or_else(|| format!("HTTP {status}")),
+                request_id,
+                &body,
+                error_body_snippet,
+            ));
+        }
 
-    let content_type_is_json = response_content_type_is_json(&response);
-    let body = response.body().to_vec();
-    if let Some(error) = binary_success_body_error(&body, content_type_is_json, error_body_snippet)
-    {
-        return Err(error);
-    }
+        let content_type_is_json = response_content_type_is_json(&response);
+        let body = response.body().to_vec();
+        if let Some(error) =
+            binary_success_body_error(&body, content_type_is_json, error_body_snippet)
+        {
+            return Err(error);
+        }
 
-    Ok(body)
+        Ok(body)
+    })
 }
 
 pub(crate) fn response_envelope_error(
@@ -890,6 +1117,20 @@ fn body_snippet_for_error(body: &str, config: BodySnippetConfig) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_after_accepts_seconds_and_http_dates() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        assert_eq!(parse_retry_after(" 7 ", now), Some(Duration::from_secs(7)));
+        assert_eq!(parse_retry_after("0", now), Some(Duration::ZERO));
+        let date = httpdate::fmt_http_date(now + Duration::from_secs(20));
+        assert_eq!(parse_retry_after(&date, now), Some(Duration::from_secs(20)));
+        let past = httpdate::fmt_http_date(now - Duration::from_secs(20));
+        assert_eq!(parse_retry_after(&past, now), Some(Duration::ZERO));
+        for value in ["", "+7", "-7", "7.5", "invalid", "18446744073709551616"] {
+            assert_eq!(parse_retry_after(value, now), None, "{value}");
+        }
+    }
 
     #[test]
     fn body_snippets_redact_encoded_json_before_truncating() {

@@ -19,6 +19,160 @@ use serde_json::{Value, json};
 type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 #[tokio::test]
+async fn webhook_errors_preserve_status_retry_after_and_header_request_id() -> TestResult<()> {
+    for (status, reason) in [(429, "Too Many Requests"), (200, "OK")] {
+        let server = MockServer::spawn([MockResponse::json_status(
+            status,
+            reason,
+            r#"{"errcode":130101,"errmsg":"rate limited","requestId":"body-id"}"#,
+        )
+        .header("retry-after", "7")
+        .header("x-acs-request-id", "header-id")])?;
+        let client = DingTalk::builder()
+            .webhook_base_url(server.base_url())
+            .system_proxy(false)
+            .build()?;
+        let error = client
+            .webhook("webhook-token")?
+            .send_text("hello")
+            .await
+            .err()
+            .ok_or("request should fail")?;
+        assert_eq!(error.kind(), ErrorKind::Api);
+        assert_eq!(error.errcode(), Some(130101));
+        assert_eq!(error.status(), Some(status));
+        assert_eq!(error.retry_after(), Some(Duration::from_secs(7)));
+        assert_eq!(error.request_id(), Some("header-id"));
+        assert!(error.is_retryable());
+        server.finish()?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn typed_openapi_errors_preserve_http_metadata() -> TestResult<()> {
+    let server = MockServer::spawn([
+        MockResponse::json(r#"{"errcode":0,"access_token":"token","expires_in":7200}"#),
+        MockResponse::json_status(
+            503,
+            "Service Unavailable",
+            r#"{"errcode":99999,"errmsg":"busy","result":{"unexpected":true}}"#,
+        )
+        .header("retry-after", "9")
+        .header("x-request-id", "typed-id"),
+    ])?;
+    let error = dingtalk_for_mock(&server)?
+        .openapi()
+        .post_json_result::<String, _>(&["test"], &json!({}))
+        .await
+        .err()
+        .ok_or("typed request should fail")?;
+    assert_eq!(error.status(), Some(503));
+    assert_eq!(error.errcode(), Some(99999));
+    assert_eq!(error.retry_after(), Some(Duration::from_secs(9)));
+    assert_eq!(error.request_id(), Some("typed-id"));
+    assert!(error.is_retryable());
+    server.finish()
+}
+
+#[tokio::test]
+async fn token_and_media_errors_preserve_http_metadata() -> TestResult<()> {
+    let response = || {
+        MockResponse::json(r#"{"errcode":130101,"errmsg":"rate limited"}"#)
+            .header("retry-after", "7")
+            .header("x-request-id", "response-id")
+    };
+    let token_server = MockServer::spawn([response()])?;
+    let token_error = dingtalk_for_mock(&token_server)?
+        .openapi()
+        .access_token()
+        .await
+        .err()
+        .ok_or("token response should fail")?;
+    assert_eq!(token_error.status(), Some(200));
+    assert_eq!(token_error.retry_after(), Some(Duration::from_secs(7)));
+    assert_eq!(token_error.request_id(), Some("response-id"));
+    token_server.finish()?;
+
+    let media_server = MockServer::spawn([
+        MockResponse::json(r#"{"errcode":0,"access_token":"token","expires_in":7200}"#),
+        response(),
+    ])?;
+    let media_error = dingtalk_for_mock(&media_server)?
+        .openapi()
+        .upload_media(MediaUpload::image("test.png", b"image".to_vec()))
+        .await
+        .err()
+        .ok_or("media response should fail")?;
+    assert_eq!(media_error.status(), Some(200));
+    assert_eq!(media_error.retry_after(), Some(Duration::from_secs(7)));
+    assert_eq!(media_error.request_id(), Some("response-id"));
+    media_server.finish()
+}
+
+#[tokio::test]
+async fn binary_download_errors_preserve_business_code_and_http_metadata() -> TestResult<()> {
+    for (status, reason) in [(429, "Too Many Requests"), (200, "OK")] {
+        let download_server = MockServer::spawn([MockResponse::json_status(
+            status,
+            reason,
+            r#"{"errcode":130101,"errmsg":"rate limited"}"#,
+        )
+        .header("retry-after", "7")
+        .header("x-request-id", "file-id")])?;
+        let response = json!({"errcode":0,"result":{"downloadUrl":format!("{}/file", download_server.base_url())}});
+        let api_server = MockServer::spawn([
+            MockResponse::json(r#"{"errcode":0,"access_token":"token","expires_in":7200}"#),
+            MockResponse::json(&response.to_string()),
+        ])?;
+        let client = DingTalk::builder()
+            .webhook_base_url(api_server.base_url())
+            .openapi_base_url(api_server.base_url())
+            .app_key_and_secret("app-key", "app-secret")
+            .system_proxy(false)
+            .retry_policy(dingding::RetryPolicy::disabled())
+            .build()?;
+        let error = client
+            .openapi()
+            .robot("robot-code")?
+            .download_message_file("download-code")
+            .await
+            .err()
+            .ok_or("download should fail")?;
+        assert_eq!(error.errcode(), Some(130101));
+        assert_eq!(error.status(), Some(status));
+        assert_eq!(error.retry_after(), Some(Duration::from_secs(7)));
+        assert_eq!(error.request_id(), Some("file-id"));
+        api_server.finish()?;
+        download_server.finish()?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "stream")]
+#[tokio::test]
+async fn stream_open_errors_preserve_http_metadata() -> TestResult<()> {
+    let server =
+        MockServer::spawn([
+            MockResponse::json(r#"{"errcode":130101,"errmsg":"rate limited"}"#)
+                .header("retry-after", "7")
+                .header("x-request-id", "stream-id"),
+        ])?;
+    let stream = dingding::stream::StreamClient::builder(dingtalk_for_mock(&server)?)?
+        .on_frame(|_| async {})
+        .build()?;
+    let error = stream
+        .run_once()
+        .await
+        .err()
+        .ok_or("Stream opening should fail")?;
+    assert_eq!(error.status(), Some(200));
+    assert_eq!(error.retry_after(), Some(Duration::from_secs(7)));
+    assert_eq!(error.request_id(), Some("stream-id"));
+    server.finish()
+}
+
+#[tokio::test]
 async fn webhook_robot_posts_expected_query_and_json_body() -> TestResult<()> {
     let server = MockServer::spawn([MockResponse::json(
         r#"{"errcode":0,"errmsg":"ok","requestId":"req-webhook"}"#,
@@ -1235,6 +1389,531 @@ async fn private_status_get_refreshes_invalid_tokens_and_rejects_empty_payloads(
     server.finish()
 }
 
+#[tokio::test]
+async fn paginator_preserves_query_and_retries_only_the_failed_page() -> TestResult<()> {
+    use dingding::openapi::GroupMessageQuery;
+    let server = MockServer::spawn([
+        MockResponse::json(r#"{"errcode":0,"access_token":"token","expires_in":7200}"#),
+        MockResponse::json(
+            r#"{"sendStatus":"SUCCESS","hasMore":true,"nextToken":"next+/=","readUserIds":["u1"]}"#,
+        ),
+        MockResponse::json(r#"{"errcode":130101,"errmsg":"busy"}"#),
+        MockResponse::json(r#"{"sendStatus":"SUCCESS","hasMore":false,"readUserIds":["u2"]}"#),
+    ])?;
+    let robot = dingtalk_for_mock(&server)?.openapi().robot("robot")?;
+    let mut pages =
+        robot.query_group_message_pages("cid", GroupMessageQuery::new("key")?.max_results(20)?)?;
+    assert_eq!(
+        pages.next_page().await?.ok_or("first page")?.read_user_ids,
+        ["u1"]
+    );
+    assert!(pages.next_page().await.is_err());
+    assert_eq!(
+        pages.next_page().await?.ok_or("second page")?.read_user_ids,
+        ["u2"]
+    );
+    assert!(pages.next_page().await?.is_none());
+    assert!(pages.next_page().await?.is_none());
+    server.next_request()?;
+    let first = server.next_request()?.json_body()?;
+    let failed = server.next_request()?.json_body()?;
+    let retried = server.next_request()?.json_body()?;
+    assert!(first.get("nextToken").is_none());
+    assert_eq!(failed, retried);
+    assert_eq!(
+        retried,
+        json!({"robotCode":"robot","openConversationId":"cid","processQueryKey":"key","maxResults":20,"nextToken":"next+/="})
+    );
+    server.finish()
+}
+
+#[tokio::test]
+async fn paginator_rejects_cursor_cycles_and_stops() -> TestResult<()> {
+    use dingding::openapi::GroupMessageQuery;
+    let server = MockServer::spawn([
+        MockResponse::json(r#"{"errcode":0,"access_token":"token","expires_in":7200}"#),
+        MockResponse::json(r#"{"sendStatus":"SUCCESS","hasMore":true,"nextToken":"b"}"#),
+        MockResponse::json(r#"{"sendStatus":"SUCCESS","hasMore":true,"nextToken":"a"}"#),
+    ])?;
+    let mut pages = dingtalk_for_mock(&server)?
+        .openapi()
+        .robot("robot")?
+        .query_group_message_pages("cid", GroupMessageQuery::new("key")?.next_token("a")?)?;
+    assert!(pages.next_page().await?.is_some());
+    let error = pages
+        .next_page()
+        .await
+        .err()
+        .ok_or("cursor cycle must fail")?;
+    assert!(error.to_string().contains("repeated"));
+    assert!(pages.next_page().await?.is_none());
+    server.finish()
+}
+
+#[tokio::test]
+async fn paginator_rejects_missing_cursor_and_validates_before_network() -> TestResult<()> {
+    use dingding::openapi::GroupMessageQuery;
+    let server = MockServer::spawn([
+        MockResponse::json(r#"{"errcode":0,"access_token":"token","expires_in":7200}"#),
+        MockResponse::json(r#"{"sendStatus":"SUCCESS","hasMore":true}"#),
+    ])?;
+    let robot = dingtalk_for_mock(&server)?.openapi().robot("robot")?;
+    assert!(
+        robot
+            .query_group_message_pages("", GroupMessageQuery::new("key")?)
+            .is_err()
+    );
+    let mut pages = robot.query_group_message_pages("cid", GroupMessageQuery::new("key")?)?;
+    assert!(pages.next_page().await.is_err());
+    server.finish()
+}
+
+#[cfg(feature = "bot")]
+#[tokio::test]
+async fn proactive_context_replies_ignore_expired_session_and_choose_correct_recipient()
+-> TestResult<()> {
+    use dingding::{
+        bot::{Bot, BotEvent, ConversationScope},
+        openapi::RobotMessage,
+    };
+    for scope in [ConversationScope::Group, ConversationScope::Private] {
+        let server = MockServer::spawn([
+            MockResponse::json(r#"{"errcode":0,"access_token":"token","expires_in":7200}"#),
+            MockResponse::json(r#"{"processQueryKey":"reply-key"}"#),
+        ])?;
+        let client = dingtalk_for_mock(&server)?;
+        let robot = client.openapi().robot("robot")?;
+        let bot = Bot::new(client).on_message(
+            ConversationScope::Any,
+            dingding::bot::MessageType::Text,
+            move |ctx, _| {
+                let robot = robot.clone();
+                async move {
+                    assert!(ctx.is_session_webhook_expired());
+                    assert!(
+                        ctx.reply_text("must not use expired webhook")
+                            .await
+                            .is_err()
+                    );
+                    let response = ctx
+                        .reply_via_robot(&robot, RobotMessage::text("done"))
+                        .await?;
+                    assert_eq!(response.process_query_key(), "reply-key");
+                    Ok::<_, dingding::Error>(())
+                }
+            },
+        );
+        let mut event = BotEvent::text(scope.clone(), "work");
+        event.open_conversation_id = Some("group-id".into());
+        event.sender_staff_id = Some("staff-id".into());
+        event.sender_id = Some("not-a-staff-id".into());
+        event.session_webhook = Some("http://127.0.0.1:1/never".into());
+        event.session_webhook_expires_at_millis = Some(1);
+        bot.handle_event(event).await?;
+        server.next_request()?;
+        let request = server.next_request()?;
+        let body = request.json_body()?;
+        if scope == ConversationScope::Group {
+            assert_eq!(request.path(), "/v1.0/robot/groupMessages/send");
+            assert_eq!(body["openConversationId"], "group-id");
+            assert!(body.get("userIds").is_none());
+        } else {
+            assert_eq!(request.path(), "/v1.0/robot/oToMessages/batchSend");
+            assert_eq!(body["userIds"], json!(["staff-id"]));
+            assert!(body.get("openConversationId").is_none());
+        }
+        server.finish()?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "bot")]
+#[tokio::test]
+async fn reply_targets_roundtrip_and_never_guess_missing_identity() -> TestResult<()> {
+    use dingding::{
+        bot::{BotEvent, ConversationScope},
+        openapi::RobotReplyTarget,
+    };
+    for target in [
+        RobotReplyTarget::group("sensitive-group")?,
+        RobotReplyTarget::private("sensitive-staff")?,
+    ] {
+        let saved = serde_json::to_string(&target)?;
+        assert_eq!(serde_json::from_str::<RobotReplyTarget>(&saved)?, target);
+        assert!(!format!("{target:?}").contains("sensitive"));
+    }
+    let mut event = BotEvent::text(ConversationScope::Private, "hello");
+    event.sender_id = Some("encrypted-id".into());
+    assert!(event.robot_reply_target().is_err());
+    event.conversation_scope = ConversationScope::Group;
+    event.sender_staff_id = Some("staff".into());
+    assert!(event.robot_reply_target().is_err());
+    event.conversation_scope = ConversationScope::Any;
+    event.open_conversation_id = Some("cid".into());
+    assert!(event.robot_reply_target().is_err());
+    let invalid: RobotReplyTarget =
+        serde_json::from_value(json!({"scope":"private","user_id":""}))?;
+    let robot = DingTalk::new()?.openapi().robot("robot")?;
+    assert_eq!(
+        invalid
+            .send_text(&robot, "no network")
+            .await
+            .err()
+            .ok_or("invalid recipient")?
+            .kind(),
+        ErrorKind::InvalidInput
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn streamed_download_writes_large_files_without_body_buffer() -> TestResult<()> {
+    for content_type in ["application/octet-stream", "application/json"] {
+        let bytes = if content_type == "application/json" {
+            serde_json::to_vec(&json!({"file": "x".repeat(192 * 1024)}))?
+        } else {
+            vec![42; 192 * 1024]
+        };
+        let download = MockServer::spawn([MockResponse::bytes(content_type, &bytes)])?;
+        let api = download_api_server(&download)?;
+        let mut output = Vec::new();
+        let info = dingtalk_for_mock(&api)?
+            .openapi()
+            .robot("robot")?
+            .download_message_file_to("code", &mut output, bytes.len())
+            .await?;
+        assert_eq!(output, bytes);
+        assert_eq!(info.bytes_written(), bytes.len() as u64);
+        assert_eq!(info.content_type(), Some(content_type));
+        assert_eq!(
+            download.next_request()?.header("accept-encoding"),
+            Some("identity")
+        );
+        api.finish()?;
+        download.finish()?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn streamed_download_rejects_http_and_business_errors_before_writing() -> TestResult<()> {
+    for status in [200, 400] {
+        let download = MockServer::spawn([MockResponse::json_status(
+            status,
+            "Error",
+            r#"{"errcode":130101,"errmsg":"busy"}"#,
+        )
+        .header("retry-after", "7")
+        .header("x-request-id", "stream-file")])?;
+        let api = download_api_server(&download)?;
+        let mut output = Vec::new();
+        let error = dingtalk_for_mock(&api)?
+            .openapi()
+            .robot("robot")?
+            .download_message_file_to("code", &mut output, 1024)
+            .await
+            .err()
+            .ok_or("must fail")?;
+        assert_eq!(error.errcode(), Some(130101));
+        assert_eq!(error.status(), Some(status));
+        assert_eq!(error.retry_after(), Some(Duration::from_secs(7)));
+        assert_eq!(error.request_id(), Some("stream-file"));
+        assert!(output.is_empty());
+        api.finish()?;
+        download.finish()?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn streamed_download_enforces_limits_with_and_without_content_length() -> TestResult<()> {
+    for chunked in [false, true] {
+        let mut response = MockResponse::bytes("application/octet-stream", &[1; 8192]);
+        response.chunked = chunked;
+        let download = MockServer::spawn([response])?;
+        let api = download_api_server(&download)?;
+        let mut output = Vec::new();
+        let robot = dingtalk_for_mock(&api)?.openapi().robot("robot")?;
+        assert_eq!(
+            robot
+                .download_message_file_to("code", &mut output, 0)
+                .await
+                .err()
+                .ok_or("zero limit")?
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+        assert!(
+            robot
+                .download_message_file_to("code", &mut output, 4096)
+                .await
+                .is_err()
+        );
+        assert!(output.is_empty());
+        api.finish()?;
+        download.finish()?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn streamed_download_rejects_unexpected_content_encoding() -> TestResult<()> {
+    let download =
+        MockServer::spawn([MockResponse::bytes("application/octet-stream", b"encoded")
+            .header("content-encoding", "gzip")])?;
+    let api = download_api_server(&download)?;
+    let mut output = Vec::new();
+    assert!(
+        dingtalk_for_mock(&api)?
+            .openapi()
+            .robot("robot")?
+            .download_message_file_to("code", &mut output, 1024)
+            .await
+            .is_err()
+    );
+    assert!(output.is_empty());
+    api.finish()?;
+    download.finish()
+}
+
+#[tokio::test]
+async fn streamed_download_does_not_treat_a_large_file_prefix_as_an_error() -> TestResult<()> {
+    let mut bytes = br#"{"errcode":123,"errmsg":"file content"}"#.to_vec();
+    bytes.resize(64 * 1024, b' ');
+    bytes.extend_from_slice(b"\nadditional file content");
+    let download = MockServer::spawn([MockResponse::bytes("application/octet-stream", &bytes)])?;
+    let api = download_api_server(&download)?;
+    let mut output = Vec::new();
+    dingtalk_for_mock(&api)?
+        .openapi()
+        .robot("robot")?
+        .download_message_file_to("code", &mut output, bytes.len())
+        .await?;
+    assert_eq!(output, bytes);
+    api.finish()?;
+    download.finish()
+}
+
+#[tokio::test]
+async fn streamed_download_limits_partial_output_and_reports_full_limit() -> TestResult<()> {
+    let mut response = MockResponse::bytes("application/octet-stream", &vec![1; 96 * 1024]);
+    response.chunked = true;
+    let download = MockServer::spawn([response])?;
+    let api = download_api_server(&download)?;
+    let mut output = Vec::new();
+    let limit = 70 * 1024;
+    let error = dingtalk_for_mock(&api)?
+        .openapi()
+        .robot("robot")?
+        .download_message_file_to("code", &mut output, limit)
+        .await
+        .err()
+        .ok_or("size limit")?;
+    assert!(!output.is_empty());
+    assert!(output.len() <= limit);
+    let source = match &error {
+        dingding::Error::Transport { source, .. } => source.as_ref(),
+        _ => return Err(format!("expected a transport size-limit error, got {error:?}").into()),
+    };
+    assert!(
+        matches!(source, reqx::Error::ResponseBodyTooLarge { limit_bytes, actual_bytes, .. } if *limit_bytes == limit && *actual_bytes > limit)
+    );
+    api.finish()?;
+    download.finish()
+}
+
+#[tokio::test]
+async fn streamed_download_preserves_destination_failure() -> TestResult<()> {
+    let download = MockServer::spawn([MockResponse::bytes("application/octet-stream", b"file")])?;
+    let api = download_api_server(&download)?;
+    let (mut writer, reader) = tokio::io::duplex(1);
+    drop(reader);
+    let error = dingtalk_for_mock(&api)?
+        .openapi()
+        .robot("robot")?
+        .download_message_file_to("code", &mut writer, 100)
+        .await
+        .err()
+        .ok_or("writer closed")?;
+    assert_eq!(error.kind(), ErrorKind::Io);
+    assert_eq!(
+        error
+            .source()
+            .and_then(|error| error.downcast_ref::<io::Error>())
+            .ok_or("I/O source")?
+            .kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    api.finish()?;
+    download.finish()
+}
+
+#[tokio::test]
+async fn streamed_download_times_out_a_blocked_writer() -> TestResult<()> {
+    let download = MockServer::spawn([MockResponse::bytes("application/octet-stream", b"file")])?;
+    let api = download_api_server(&download)?;
+    let client = DingTalk::builder()
+        .webhook_base_url(api.base_url())
+        .openapi_base_url(api.base_url())
+        .app_key_and_secret("key", "secret")
+        .system_proxy(false)
+        .total_timeout(Duration::from_millis(100))
+        .build()?;
+    let (mut writer, _unread) = tokio::io::duplex(1);
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        client
+            .openapi()
+            .robot("robot")?
+            .download_message_file_to("code", &mut writer, 1024),
+    )
+    .await?
+    .err()
+    .ok_or("blocked writer")?;
+    assert_eq!(error.kind(), ErrorKind::Io);
+    api.finish()?;
+    download.finish()
+}
+
+#[tokio::test]
+async fn file_upload_streams_multipart_and_reopens_on_token_rejection() -> TestResult<()> {
+    use dingding::openapi::MediaFileUpload;
+    let file = TempMediaFile::new(&vec![42; 192 * 1024])?;
+    let server = MockServer::spawn([
+        MockResponse::json(r#"{"errcode":0,"access_token":"old","expires_in":7200}"#),
+        MockResponse::json(r#"{"errcode":40014,"errmsg":"invalid token"}"#),
+        MockResponse::json(r#"{"errcode":0,"access_token":"new","expires_in":7200}"#),
+        MockResponse::json(r#"{"errcode":0,"media_id":"media-key","type":"file"}"#),
+    ])?;
+    let uploaded = dingtalk_for_mock(&server)?
+        .openapi()
+        .robot("robot")?
+        .upload_media_file(
+            MediaFileUpload::new(MediaType::File, &file.0)
+                .file_name("report.bin")
+                .content_type("application/octet-stream")
+                .max_bytes(192 * 1024),
+        )
+        .await?;
+    assert_eq!(uploaded.media_id(), "media-key");
+    server.next_request()?;
+    let first = server.next_request()?;
+    server.next_request()?;
+    let retry = server.next_request()?;
+    for (request, token) in [(&first, "old"), (&retry, "new")] {
+        assert_eq!(request.path(), "/media/upload");
+        assert_eq!(request.query_value("access_token").as_deref(), Some(token));
+        assert_eq!(
+            request
+                .header("content-length")
+                .ok_or("content length")?
+                .parse::<usize>()?,
+            request.body.len()
+        );
+        assert!(
+            request
+                .body_text_lossy()
+                .contains("filename=\"report.bin\"")
+        );
+        let boundary = request
+            .header("content-type")
+            .ok_or("content type")?
+            .split("boundary=")
+            .nth(1)
+            .ok_or("boundary")?;
+        assert!(
+            request
+                .body
+                .ends_with(format!("\r\n--{boundary}--\r\n").as_bytes())
+        );
+        assert!(find_subslice(&request.body, &vec![42; 192 * 1024]).is_some());
+    }
+    server.finish()
+}
+
+#[tokio::test]
+async fn file_upload_validates_local_files_before_credentials() -> TestResult<()> {
+    use dingding::openapi::MediaFileUpload;
+    let openapi = DingTalk::new()?.openapi();
+    let file = TempMediaFile::new(b"test")?;
+    for upload in [
+        MediaFileUpload::new(MediaType::File, &file.0).max_bytes(3),
+        MediaFileUpload::new(MediaType::File, &file.0).max_bytes(0),
+        MediaFileUpload::new(MediaType::File, &file.0).file_name("../bad"),
+        MediaFileUpload::new(MediaType::File, &file.0).content_type("text/plain\r\nInjected: x"),
+    ] {
+        assert_eq!(
+            openapi
+                .upload_media_file(upload)
+                .await
+                .err()
+                .ok_or("validation")?
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+    }
+    let empty = TempMediaFile::new(b"")?;
+    assert_eq!(
+        openapi
+            .upload_media_file(MediaFileUpload::new(MediaType::File, &empty.0))
+            .await
+            .err()
+            .ok_or("empty")?
+            .kind(),
+        ErrorKind::InvalidInput
+    );
+    let missing = file.0.with_extension("missing");
+    let error = openapi
+        .upload_media_file(MediaFileUpload::new(MediaType::File, missing))
+        .await
+        .err()
+        .ok_or("missing")?;
+    assert_eq!(error.kind(), ErrorKind::Io);
+    assert!(
+        error
+            .source()
+            .and_then(|source| source.downcast_ref::<io::Error>())
+            .is_some()
+    );
+    Ok(())
+}
+
+fn download_api_server(download: &MockServer) -> io::Result<MockServer> {
+    MockServer::spawn([
+        MockResponse::json(r#"{"errcode":0,"access_token":"token","expires_in":7200}"#),
+        MockResponse::json(
+            &json!({"errcode":0,"result":{"downloadUrl":format!("{}/file", download.base_url())}})
+                .to_string(),
+        ),
+    ])
+}
+
+struct TempMediaFile(std::path::PathBuf);
+
+impl TempMediaFile {
+    fn new(bytes: &[u8]) -> TestResult<Self> {
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random)?;
+        let path = std::env::temp_dir().join(format!(
+            "dingding-media-{:032x}.bin",
+            u128::from_le_bytes(random)
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)?;
+        let temp = Self(path);
+        file.write_all(bytes)?;
+        Ok(temp)
+    }
+}
+
+impl Drop for TempMediaFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 fn dingtalk_for_mock(server: &MockServer) -> dingding::Result<DingTalk> {
     DingTalk::builder()
         .webhook_base_url(server.base_url())
@@ -1277,6 +1956,7 @@ impl MockServer {
         I: IntoIterator<Item = MockResponse>,
     {
         let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
         let base_url = format!("http://{}", listener.local_addr()?);
         let responses = responses.into_iter().collect::<Vec<_>>();
         let (sender, requests) = mpsc::channel();
@@ -1314,6 +1994,8 @@ struct MockResponse {
     reason: &'static str,
     content_type: &'static str,
     body: Vec<u8>,
+    headers: Vec<(String, String)>,
+    chunked: bool,
 }
 
 impl MockResponse {
@@ -1323,6 +2005,8 @@ impl MockResponse {
             reason: "OK",
             content_type: "application/json",
             body: body.as_bytes().to_vec(),
+            headers: Vec::new(),
+            chunked: false,
         }
     }
 
@@ -1332,6 +2016,8 @@ impl MockResponse {
             reason,
             content_type: "application/json",
             body: body.as_bytes().to_vec(),
+            headers: Vec::new(),
+            chunked: false,
         }
     }
 
@@ -1341,7 +2027,14 @@ impl MockResponse {
             reason: "OK",
             content_type,
             body: body.to_vec(),
+            headers: Vec::new(),
+            chunked: false,
         }
+    }
+
+    fn header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.to_string(), value.to_string()));
+        self
     }
 }
 
@@ -1390,7 +2083,19 @@ fn serve(
     responses: Vec<MockResponse>,
 ) -> io::Result<()> {
     for response in responses {
-        let (mut stream, _addr) = listener.accept()?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (mut stream, _addr) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => return Err(error),
+            }
+        };
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         let request = read_request(&mut stream)?;
         sender
@@ -1476,13 +2181,28 @@ fn read_request(stream: &mut impl Read) -> io::Result<RecordedRequest> {
 fn write_response(stream: &mut impl Write, response: MockResponse) -> io::Result<()> {
     write!(
         stream,
-        "HTTP/1.1 {} {}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        response.status,
-        response.reason,
-        response.content_type,
-        response.body.len()
+        "HTTP/1.1 {} {}\r\ncontent-type: {}\r\nconnection: close\r\n",
+        response.status, response.reason, response.content_type,
     )?;
-    stream.write_all(&response.body)?;
+    if response.chunked {
+        write!(stream, "transfer-encoding: chunked\r\n")?;
+    } else {
+        write!(stream, "content-length: {}\r\n", response.body.len())?;
+    }
+    for (name, value) in response.headers {
+        write!(stream, "{name}: {value}\r\n")?;
+    }
+    stream.write_all(b"\r\n")?;
+    if response.chunked {
+        for chunk in response.body.chunks(1024) {
+            write!(stream, "{:x}\r\n", chunk.len())?;
+            stream.write_all(chunk)?;
+            stream.write_all(b"\r\n")?;
+        }
+        stream.write_all(b"0\r\n\r\n")?;
+    } else {
+        stream.write_all(&response.body)?;
+    }
     stream.flush()
 }
 

@@ -1,4 +1,8 @@
-use std::{fmt, time::SystemTime, time::SystemTimeError};
+use std::{
+    error::Error as StdError,
+    fmt,
+    time::{Duration, SystemTime, SystemTimeError},
+};
 
 use thiserror::Error as ThisError;
 
@@ -6,6 +10,12 @@ use crate::util::redact::redact_text;
 
 /// SDK result type.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Application error accepted by bot and Stream handlers.
+pub type BoxError = Box<dyn StdError + Send + Sync + 'static>;
+
+/// Handler result that supports `?` with SDK and application errors.
+pub type HandlerResult<T = ()> = std::result::Result<T, BoxError>;
 
 /// Stable high-level error category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +41,10 @@ pub enum ErrorKind {
     MissingCredentials,
     /// A bot route was invoked with an incompatible conversation scope.
     BotScope,
+    /// An application handler failed.
+    Handler,
+    /// A local file or asynchronous I/O operation failed.
+    Io,
 }
 
 impl ErrorKind {
@@ -48,6 +62,8 @@ impl ErrorKind {
             Self::InvalidInput => "invalid_input",
             Self::MissingCredentials => "missing_credentials",
             Self::BotScope => "bot_scope",
+            Self::Handler => "handler",
+            Self::Io => "io",
         }
     }
 }
@@ -71,6 +87,10 @@ pub enum Error {
         request_id: Option<String>,
         /// Optional redacted body snippet.
         error_body_snippet: Option<String>,
+        /// HTTP response status, independent of the DingTalk business error code.
+        status: Option<u16>,
+        /// Delay requested by the server, parsed when the response was received.
+        retry_after: Option<Box<Duration>>,
     },
 
     /// HTTP transport or request construction failure.
@@ -128,6 +148,26 @@ pub enum Error {
         /// Actual scope.
         actual: String,
     },
+
+    /// Application handler failure with the original error preserved.
+    #[error("handler error: {message}")]
+    Handler {
+        /// Original application error.
+        #[source]
+        source: BoxError,
+        /// Redacted application error message.
+        message: String,
+    },
+
+    /// File or asynchronous I/O failure, with the original source preserved.
+    #[error("I/O error: {message}")]
+    Io {
+        /// Original I/O failure.
+        #[source]
+        source: std::io::Error,
+        /// Redacted error message.
+        message: String,
+    },
 }
 
 impl Error {
@@ -145,6 +185,8 @@ impl Error {
             Self::InvalidInput { .. } => ErrorKind::InvalidInput,
             Self::MissingCredentials => ErrorKind::MissingCredentials,
             Self::BotScope { .. } => ErrorKind::BotScope,
+            Self::Handler { .. } => ErrorKind::Handler,
+            Self::Io { .. } => ErrorKind::Io,
         }
     }
 
@@ -195,12 +237,16 @@ impl Error {
     #[must_use]
     pub fn status(&self) -> Option<u16> {
         match self {
+            Self::Api { status, .. } => *status,
             Self::Transport { source, .. } => source.status_code(),
             _ => None,
         }
     }
 
-    /// Returns whether the error is likely retryable.
+    /// Returns whether the failure may be transient.
+    ///
+    /// This does not imply that replaying a message send or another non-idempotent operation
+    /// is safe. A timeout can occur after the server accepted the request.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
@@ -215,8 +261,14 @@ impl Error {
                 }
                 _ => false,
             },
-            Self::Api { code, api_code, .. } => {
-                matches!(*code, 429 | 500..=599 | 130101 | 130102)
+            Self::Api {
+                code,
+                api_code,
+                status,
+                ..
+            } => {
+                matches!(status, Some(429 | 500..=599))
+                    || matches!(*code, 429 | 500..=599 | 130101 | 130102)
                     || api_code
                         .as_deref()
                         .is_some_and(is_retryable_dingtalk_api_code)
@@ -225,13 +277,50 @@ impl Error {
         }
     }
 
-    /// Returns retry-after hint when the transport layer parsed one.
+    /// Returns the server's retry-after hint when one was parsed.
     #[must_use]
     pub fn retry_after(&self) -> Option<std::time::Duration> {
         match self {
+            Self::Api { retry_after, .. } => retry_after.as_deref().copied(),
             Self::Transport { source, .. } => source.retry_after(SystemTime::now()),
             _ => None,
         }
+    }
+
+    /// Converts an application error into an SDK handler error.
+    ///
+    /// Existing SDK errors retain their category and metadata. Other errors retain their
+    /// original source for downcasting while their displayed message is redacted.
+    pub fn handler(source: impl Into<BoxError>) -> Self {
+        match source.into().downcast::<Self>() {
+            Ok(error) => *error,
+            Err(source) => {
+                let message = redact_text(&source.to_string());
+                Self::Handler { source, message }
+            }
+        }
+    }
+
+    pub(crate) fn with_response_metadata(
+        mut self,
+        response_status: u16,
+        response_request_id: Option<String>,
+        response_retry_after: Option<Duration>,
+    ) -> Self {
+        if let Self::Api {
+            status,
+            request_id,
+            retry_after,
+            ..
+        } = &mut self
+        {
+            *status = Some(response_status);
+            if response_request_id.is_some() {
+                *request_id = response_request_id;
+            }
+            *retry_after = response_retry_after.map(Box::new);
+        }
+        self
     }
 
     pub(crate) fn invalid_input(field: &'static str, message: impl Into<String>) -> Self {
@@ -264,6 +353,8 @@ impl Error {
             message: message.into(),
             request_id,
             error_body_snippet,
+            status: None,
+            retry_after: None,
         }
     }
 }
@@ -278,6 +369,13 @@ impl From<reqx::Error> for Error {
     }
 }
 
+impl From<std::io::Error> for Error {
+    fn from(source: std::io::Error) -> Self {
+        let message = redact_text(&source.to_string());
+        Self::Io { source, message }
+    }
+}
+
 impl fmt::Debug for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -287,6 +385,8 @@ impl fmt::Debug for Error {
                 message,
                 request_id,
                 error_body_snippet,
+                status,
+                retry_after,
             } => f
                 .debug_struct("Api")
                 .field("code", code)
@@ -294,6 +394,8 @@ impl fmt::Debug for Error {
                 .field("message", message)
                 .field("request_id", request_id)
                 .field("error_body_snippet", error_body_snippet)
+                .field("status", status)
+                .field("retry_after", retry_after)
                 .finish(),
             Self::Transport { message, .. } => f
                 .debug_struct("Transport")
@@ -318,6 +420,10 @@ impl fmt::Debug for Error {
                 .field("expected", expected)
                 .field("actual", actual)
                 .finish(),
+            Self::Handler { message, .. } => {
+                f.debug_struct("Handler").field("message", message).finish()
+            }
+            Self::Io { message, .. } => f.debug_struct("Io").field("message", message).finish(),
         }
     }
 }
@@ -368,6 +474,53 @@ impl fmt::Display for ErrorKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sdk_error_stays_compact_for_downstream_results() {
+        assert!(std::mem::size_of::<Error>() <= 128);
+    }
+
+    #[test]
+    fn handler_errors_preserve_sources_and_redact_display() {
+        let error = Error::handler(std::io::Error::other(
+            "request failed: https://example.test/?access_token=business-secret",
+        ));
+        assert_eq!(error.kind(), ErrorKind::Handler);
+        let source = error.source().expect("application source");
+        assert!(source.downcast_ref::<std::io::Error>().is_some());
+        assert!(source.to_string().contains("business-secret"));
+        for message in [error.to_string(), format!("{error:?}")] {
+            assert!(!message.contains("business-secret"));
+            assert!(message.contains("<redacted>"));
+        }
+    }
+
+    #[test]
+    fn handler_conversion_preserves_sdk_error_metadata() {
+        let original =
+            Error::api_with_code(130101, None, "rate limited", Some("body-id".into()), None)
+                .with_response_metadata(
+                    429,
+                    Some("header-id".into()),
+                    Some(Duration::from_secs(7)),
+                );
+        let boxed: BoxError = Box::new(original);
+        let error = Error::handler(boxed);
+        assert_eq!(error.kind(), ErrorKind::Api);
+        assert_eq!(error.errcode(), Some(130101));
+        assert_eq!(error.status(), Some(429));
+        assert_eq!(error.request_id(), Some("header-id"));
+        assert_eq!(error.retry_after(), Some(Duration::from_secs(7)));
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn retryability_uses_http_status_separately_from_business_code() {
+        let error = Error::api_with_code(99999, None, "busy", None, None)
+            .with_response_metadata(503, None, None);
+        assert_eq!(error.errcode(), Some(99999));
+        assert!(error.is_retryable());
+    }
 
     #[test]
     fn error_kind_exposes_stable_labels() {

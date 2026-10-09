@@ -1,6 +1,8 @@
 //! Common imports for DingTalk bot applications.
 
-pub use crate::{DingTalk, Error, Result, auth::AppCredentials};
+pub use crate::{
+    BoxError, DingTalk, Error, HandlerResult, IntoHandlerResult, Result, auth::AppCredentials,
+};
 
 #[cfg(feature = "macros")]
 pub use crate::handler;
@@ -20,11 +22,12 @@ pub use crate::bot::{
 
 #[cfg(feature = "openapi")]
 pub use crate::openapi::{
-    DownloadedFile, GroupMessageQuery, GroupMessageReader, GroupMessageStatus, InteractiveCard,
-    InteractiveCardResponse, InteractiveCardSendOptions, InteractiveCardUpdate,
-    InteractiveCardUpdateOptions, MediaType, MediaUpload, MessageFileDownload, MessageReadInfo,
-    MessageRecallResponse, OpenApi, PrivateMessageStatus, RobotActionButton, RobotActionCard,
-    RobotActionCardLayout, RobotApi, RobotMessage, RobotMessageResponse, RobotVideo, UploadedMedia,
+    DownloadedFile, DownloadedFileInfo, GroupMessagePages, GroupMessageQuery, GroupMessageReader,
+    GroupMessageStatus, InteractiveCard, InteractiveCardResponse, InteractiveCardSendOptions,
+    InteractiveCardUpdate, InteractiveCardUpdateOptions, MediaFileUpload, MediaType, MediaUpload,
+    MessageFileDownload, MessageReadInfo, MessageRecallResponse, OpenApi, PrivateMessageStatus,
+    RobotActionButton, RobotActionCard, RobotActionCardLayout, RobotApi, RobotMessage,
+    RobotMessageResponse, RobotReplyTarget, RobotVideo, UploadedMedia,
 };
 
 #[cfg(feature = "stream")]

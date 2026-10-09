@@ -9,15 +9,20 @@ use crate::{
     transport::{
         BodySnippetConfig, api_error_from_body, decode_json_response, parse_binary_response,
         parse_dingtalk_result, parse_standard_text_response, response_envelope_error,
+        with_response_metadata,
     },
     util::{non_empty_trimmed, redact::redact_text},
 };
 
 mod lifecycle;
+mod media_io;
+pub use media_io::{DownloadedFileInfo, MediaFileUpload};
+mod reply;
 pub use lifecycle::{
-    GroupMessageQuery, GroupMessageReader, GroupMessageStatus, MessageReadInfo,
+    GroupMessagePages, GroupMessageQuery, GroupMessageReader, GroupMessageStatus, MessageReadInfo,
     MessageRecallResponse, PrivateMessageStatus,
 };
+pub use reply::RobotReplyTarget;
 
 /// Minimal OpenAPI service.
 #[derive(Clone)]
@@ -76,39 +81,44 @@ impl OpenApi {
             query.append_pair("appsecret", credentials.app_secret());
         }
 
-        let (response, body) = decode_json_response::<AccessTokenResponse>(
-            self.client.transport().get_webhook(&url).await?,
-            self.client.transport().error_body_snippet(),
-        )?;
+        let response = self.client.transport().get_webhook(&url).await?;
+        let (token, expires_in) = with_response_metadata(response, |response| {
+            let (response, body) = decode_json_response::<AccessTokenResponse>(
+                response,
+                self.client.transport().error_body_snippet(),
+            )?;
 
-        if let Some(error) = response_envelope_error(
-            response.errcode,
-            response.api_code.as_deref(),
-            response.errmsg.as_deref(),
-            response.success,
-            response.request_id.as_deref(),
-            &body,
-            self.client.transport().error_body_snippet(),
-        ) {
-            return Err(error);
-        }
+            if let Some(error) = response_envelope_error(
+                response.errcode,
+                response.api_code.as_deref(),
+                response.errmsg.as_deref(),
+                response.success,
+                response.request_id.as_deref(),
+                &body,
+                self.client.transport().error_body_snippet(),
+            ) {
+                return Err(error);
+            }
 
-        let token = response
-            .access_token
-            .as_deref()
-            .and_then(|value| non_empty_trimmed(value, "access_token").ok())
-            .ok_or_else(|| {
-                api_error_from_body(
-                    -1,
-                    "missing access_token in DingTalk response",
-                    response.request_id.clone(),
-                    &body,
-                    self.client.transport().error_body_snippet(),
-                )
-            })?;
+            let token = response
+                .access_token
+                .as_deref()
+                .and_then(|value| non_empty_trimmed(value, "access_token").ok())
+                .ok_or_else(|| {
+                    api_error_from_body(
+                        -1,
+                        "missing access_token in DingTalk response",
+                        response.request_id.clone(),
+                        &body,
+                        self.client.transport().error_body_snippet(),
+                    )
+                })?;
+
+            Ok((token, response.expires_in))
+        })?;
 
         self.client
-            .store_access_token(credentials.clone(), token.clone(), response.expires_in);
+            .store_access_token(credentials.clone(), token.clone(), expires_in);
 
         Ok(token)
     }
@@ -2841,42 +2851,44 @@ fn parse_media_upload_response(
     error_body_snippet: crate::transport::BodySnippetConfig,
     requested_media_type: &MediaType,
 ) -> Result<UploadedMedia> {
-    let (parsed, body) =
-        decode_json_response::<RawMediaUploadResponse>(response, error_body_snippet)?;
-    if let Some(error) = response_envelope_error(
-        parsed.errcode,
-        parsed.api_code.as_deref(),
-        parsed.errmsg.as_deref(),
-        parsed.success,
-        parsed.request_id.as_deref(),
-        &body,
-        error_body_snippet,
-    ) {
-        return Err(error);
-    }
+    with_response_metadata(response, |response| {
+        let (parsed, body) =
+            decode_json_response::<RawMediaUploadResponse>(response, error_body_snippet)?;
+        if let Some(error) = response_envelope_error(
+            parsed.errcode,
+            parsed.api_code.as_deref(),
+            parsed.errmsg.as_deref(),
+            parsed.success,
+            parsed.request_id.as_deref(),
+            &body,
+            error_body_snippet,
+        ) {
+            return Err(error);
+        }
 
-    let raw = serde_json::from_str::<Value>(&body)?;
-    let media_id = required_response_string(
-        parsed.media_id.as_deref(),
-        "media_id",
-        "missing media_id in DingTalk response",
-        parsed.request_id.clone(),
-        &body,
-        error_body_snippet,
-    )?;
-    let media_type = match parsed.media_type {
-        Some(value) => MediaType::from_raw(value)?,
-        None => requested_media_type.clone(),
-    };
-    let created_at_millis = parsed
-        .created_at
-        .and_then(|value| u64::try_from(value).ok());
+        let raw = serde_json::from_str::<Value>(&body)?;
+        let media_id = required_response_string(
+            parsed.media_id.as_deref(),
+            "media_id",
+            "missing media_id in DingTalk response",
+            parsed.request_id.clone(),
+            &body,
+            error_body_snippet,
+        )?;
+        let media_type = match parsed.media_type {
+            Some(value) => MediaType::from_raw(value)?,
+            None => requested_media_type.clone(),
+        };
+        let created_at_millis = parsed
+            .created_at
+            .and_then(|value| u64::try_from(value).ok());
 
-    Ok(UploadedMedia {
-        media_type,
-        media_id,
-        created_at_millis,
-        raw,
+        Ok(UploadedMedia {
+            media_type,
+            media_id,
+            created_at_millis,
+            raw,
+        })
     })
 }
 

@@ -22,6 +22,93 @@ static ALIASES_PATH_HIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static ZERO_ARG_HIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static MESSAGE_ALIAS_HIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+#[dingding::handler(command = "/unit-zero")]
+async fn unit_zero() {}
+
+#[dingding::handler(scope = Scope::Group, command = "/unit-group")]
+async fn unit_group(ctx: GroupContext) {
+    assert!(ctx.is_group());
+}
+
+#[dingding::handler(scope = Scope::Private, command = "/unit-private")]
+async fn unit_private(ctx: PrivateContext, event: BotEvent) {
+    assert!(ctx.is_private());
+    assert_eq!(event.conversation_scope, Scope::Private);
+}
+
+#[tokio::test]
+async fn handler_macro_accepts_unit_for_all_supported_signatures() -> Result<()> {
+    let bot = Bot::new(DingTalk::new()?)
+        .route(unit_zero_route())
+        .route(unit_group_route())
+        .route(unit_private_route());
+    for (scope, command) in [
+        (Scope::Private, "/unit-zero"),
+        (Scope::Group, "/unit-group"),
+        (Scope::Private, "/unit-private"),
+    ] {
+        assert_eq!(
+            bot.handle_event(BotEvent::text(scope, command)).await?,
+            HandleOutcome::Matched
+        );
+    }
+    assert_eq!(
+        bot.handle_event(BotEvent::text(Scope::Private, "/unit-group"))
+            .await?,
+        HandleOutcome::Ignored
+    );
+    Ok(())
+}
+
+#[dingding::handler(scope = Scope::Any, msg = Msg::Text, command = "/io")]
+async fn io_handler(_ctx: AnyContext) -> std::io::Result<()> {
+    Err(std::io::Error::other("application IO failure"))
+}
+
+#[dingding::handler(scope = Scope::Group, msg = Msg::Text, command = "/mixed")]
+async fn mixed_handler(ctx: GroupContext, _event: BotEvent) -> dingding::HandlerResult {
+    assert!(ctx.is_group());
+    let _ = String::from_utf8(b"text".to_vec())?;
+    Err(dingding::Error::MissingCredentials.into())
+}
+
+#[dingding::handler(scope = Scope::Private, command = "/zero")]
+async fn io_zero_arg() -> std::io::Result<()> {
+    Ok(())
+}
+
+#[tokio::test]
+async fn handler_macro_accepts_application_errors_and_preserves_sdk_errors()
+-> dingding::HandlerResult {
+    use std::error::Error as _;
+    let bot = Bot::new(DingTalk::new()?)
+        .route(io_handler_route())
+        .route(mixed_handler_route())
+        .route(io_zero_arg_route());
+    let error = bot
+        .handle_event(BotEvent::text(Scope::Private, "/io"))
+        .await
+        .expect_err("IO failure");
+    assert_eq!(error.kind(), dingding::ErrorKind::Handler);
+    assert!(
+        error
+            .source()
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .is_some()
+    );
+    let error = bot
+        .handle_event(BotEvent::text(Scope::Group, "/mixed"))
+        .await
+        .expect_err("SDK failure");
+    assert_eq!(error.kind(), dingding::ErrorKind::MissingCredentials);
+    assert_eq!(
+        bot.handle_event(BotEvent::text(Scope::Private, "/zero"))
+            .await?,
+        HandleOutcome::Matched
+    );
+    Ok(())
+}
+
 #[dingding::handler(scope = Scope::Any, msg = Msg::Text, command = PING)]
 async fn ping_path(_ctx: AnyContext) -> Result<()> {
     PATH_HIT_COUNT.fetch_add(1, Ordering::SeqCst);

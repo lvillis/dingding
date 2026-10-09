@@ -40,6 +40,7 @@ compile_error!("Enable at least one capability feature: `webhook`, `openapi`, or
 
 mod client;
 mod error;
+mod handler_result;
 #[cfg(feature = "webhook")]
 mod signature;
 mod transport;
@@ -67,7 +68,8 @@ pub mod prelude;
 pub mod types;
 
 pub use client::{DingTalk, DingTalkBuilder};
-pub use error::{Error, ErrorKind, Result};
+pub use error::{BoxError, Error, ErrorKind, HandlerResult, Result};
+pub use handler_result::IntoHandlerResult;
 pub use reqx::advanced::ClientProfile;
 pub use reqx::prelude::RetryPolicy;
 pub use transport::BodySnippetConfig;

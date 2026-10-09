@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fmt,
+};
 
 use super::{RobotApi, validate_machine_identifier};
 use crate::{Error, Result, transport::parse_openapi_response, util::redact::redact_text};
@@ -42,6 +45,60 @@ impl GroupMessageQuery {
         }
         self.max_results = Some(value);
         Ok(self)
+    }
+}
+
+/// Lazy group-message reader pagination. Pages are not accumulated in memory.
+///
+/// Request errors leave the current query intact for an explicit retry. A repeated
+/// cursor terminates pagination with an error instead of looping indefinitely.
+pub struct GroupMessagePages {
+    robot: RobotApi,
+    conversation_id: String,
+    query: Option<GroupMessageQuery>,
+    seen_cursors: HashSet<String>,
+}
+
+impl fmt::Debug for GroupMessagePages {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GroupMessagePages")
+            .field("finished", &self.query.is_none())
+            .finish_non_exhaustive()
+    }
+}
+
+impl GroupMessagePages {
+    /// Requests the next page, or returns `None` once pagination has finished.
+    ///
+    /// Dropping this future before it completes does not advance the cursor.
+    pub async fn next_page(&mut self) -> Result<Option<GroupMessageStatus>> {
+        let Some(query) = self.query.as_ref() else {
+            return Ok(None);
+        };
+        let page = self
+            .robot
+            .query_group_message(&self.conversation_id, query.clone())
+            .await?;
+        if page.has_more {
+            let cursor = page.next_token.as_deref().ok_or_else(|| {
+                Error::api_with_code(-1, None, "missing next-page cursor", None, None)
+            })?;
+            let next = query.clone().next_token(cursor)?;
+            if !self.seen_cursors.insert(cursor.to_owned()) {
+                self.query = None;
+                return Err(Error::api_with_code(
+                    -1,
+                    None,
+                    "repeated next-page cursor",
+                    None,
+                    None,
+                ));
+            }
+            self.query = Some(next);
+        } else {
+            self.query = None;
+        }
+        Ok(Some(page))
     }
 }
 
@@ -193,6 +250,35 @@ impl fmt::Debug for MessageRecallResponse {
 }
 
 impl RobotApi {
+    /// Creates a lazy paginator without issuing a request.
+    ///
+    /// ```no_run
+    /// # use dingding::{Result, openapi::{RobotApi, GroupMessageQuery}};
+    /// # async fn query(robot: &RobotApi) -> Result<()> {
+    /// let mut pages = robot.query_group_message_pages(
+    ///     "conversation-id", GroupMessageQuery::new("process-query-key")?.max_results(50)?,
+    /// )?;
+    /// while let Some(page) = pages.next_page().await? {
+    ///     for reader in page.read_users { /* process reader */ }
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub fn query_group_message_pages(
+        &self,
+        open_conversation_id: impl Into<String>,
+        query: GroupMessageQuery,
+    ) -> Result<GroupMessagePages> {
+        let conversation_id = open_conversation_id.into();
+        validate_machine_identifier(&conversation_id, "open_conversation_id")?;
+        let seen_cursors = query.next_token.iter().cloned().collect();
+        Ok(GroupMessagePages {
+            robot: self.clone(),
+            conversation_id,
+            query: Some(query),
+            seen_cursors,
+        })
+    }
+
     /// Queries a page of group message readers and the platform send status.
     ///
     /// ```no_run
