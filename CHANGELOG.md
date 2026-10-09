@@ -3,6 +3,10 @@
 ### 🚀 Features
 
 - Unify handler APIs and add streaming media and proactive replies
+
+### ⚙️ Miscellaneous Tasks
+
+- Release version 0.1.5
 ## [0.1.4] - 2026-09-24
 
 ### ⚙️ Miscellaneous Tasks
