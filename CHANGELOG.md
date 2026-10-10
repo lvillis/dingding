@@ -1,8 +1,17 @@
+## [0.1.9] - 2026-10-10
+
+### 🚀 Features
+
+- Add Graviola TLS support for HTTP and Stream WebSockets
 ## [0.1.8] - 2026-10-10
 
 ### 🐛 Bug Fixes
 
 - Drain Stream tasks, reset backoff, and expose structured errors
+
+### ⚙️ Miscellaneous Tasks
+
+- Release version 0.1.8
 ## [0.1.7] - 2026-10-09
 
 ### ⚙️ Miscellaneous Tasks
