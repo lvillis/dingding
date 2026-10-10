@@ -25,7 +25,7 @@ async fn bot_callbacks_replay_success_and_retry_failure() {
     let calls = Arc::new(AtomicUsize::new(0));
     let count = Arc::clone(&calls);
     let bot = Bot::new(DingTalk::new().expect("client")).route(
-        Route::new(ConversationScope::Any).handle(move |_, _| {
+        Route::new(ConversationScope::Any).handle(move |_| {
             let first = count.fetch_add(1, Ordering::SeqCst) == 0;
             async move {
                 if first {
@@ -60,7 +60,7 @@ async fn cancelled_bot_callback_releases_its_claim() {
     let calls = Arc::new(AtomicUsize::new(0));
     let count = Arc::clone(&calls);
     let bot = Bot::new(DingTalk::new().expect("client")).route(
-        Route::new(ConversationScope::Any).handle(move |_, _| {
+        Route::new(ConversationScope::Any).handle(move |_| {
             let first = count.fetch_add(1, Ordering::SeqCst) == 0;
             async move {
                 if first {
@@ -92,7 +92,7 @@ impl EventDeduplicator for Unavailable {
 
 #[tokio::test]
 async fn custom_store_errors_do_not_execute_unreserved_events() {
-    async fn unexpected(_: dingding::bot::BotContext, _: BotEvent) {
+    async fn unexpected(_: dingding::bot::BotContext) {
         panic!("must not execute");
     }
     let bot = Bot::new(DingTalk::new().expect("client"))

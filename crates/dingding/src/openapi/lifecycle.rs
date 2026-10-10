@@ -71,6 +71,10 @@ impl GroupMessagePages {
     /// Requests the next page, or returns `None` once pagination has finished.
     ///
     /// Dropping this future before it completes does not advance the cursor.
+    /// Request failures likewise leave the same page available for an explicit
+    /// retry. Page size and an initial cursor are preserved. Repeated cursors
+    /// terminate with an error; cycle detection uses memory proportional to the
+    /// number of pages. No request is made after completion.
     pub async fn next_page(&mut self) -> Result<Option<GroupMessageStatus>> {
         let Some(query) = self.query.as_ref() else {
             return Ok(None);

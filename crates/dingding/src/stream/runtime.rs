@@ -1,20 +1,20 @@
 use std::{
-    collections::VecDeque, fmt, future::Future, panic::AssertUnwindSafe, pin::Pin, time::Duration,
+    collections::{BTreeMap, VecDeque},
+    fmt,
+    future::Future,
+    panic::AssertUnwindSafe,
+    pin::Pin,
+    time::Duration,
 };
 
-use futures_util::{
-    FutureExt, Sink, SinkExt, Stream, StreamExt, future::try_join, stream::FuturesUnordered,
-};
+use futures_util::{FutureExt, Sink, SinkExt, StreamExt, stream::FuturesUnordered};
 use serde_json::Value;
-use tokio::sync::{mpsc, oneshot};
-use tokio_tungstenite::{
-    WebSocketStream,
-    tungstenite::{self, Message},
-};
+use tokio::{sync::mpsc, time::Instant};
+use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 
 use super::{
     StreamAck, StreamAckData, StreamClient, StreamExit, StreamFrame, StreamHandleResult,
-    validate_stream_duration,
+    StreamRunEvent, validate_stream_duration,
 };
 use crate::{Error, Result, bot::dedup::Deduplication};
 
@@ -32,7 +32,7 @@ use crate::{Error, Result, bot::dedup::Deduplication};
 ///         shutdown_timeout: Duration::from_secs(20),
 ///         ..StreamProcessingPolicy::default()
 ///     })
-///     .on_frame(|_frame| async {})
+///     .on_frame(|_ctx, _frame| async {})
 ///     .run_until(async { let _ = tokio::signal::ctrl_c().await; })
 ///     .await
 /// # }
@@ -49,6 +49,9 @@ pub struct StreamProcessingPolicy {
     pub write_timeout: Duration,
     /// Maximum total time to finish accepted work, send ACKs, and close after shutdown.
     pub shutdown_timeout: Duration,
+    /// Maximum total time to finish accepted work after disconnect or transport loss.
+    /// ACKs are attempted only while the socket is usable. Defaults to 30 seconds.
+    pub disconnect_timeout: Duration,
 }
 
 impl Default for StreamProcessingPolicy {
@@ -59,6 +62,7 @@ impl Default for StreamProcessingPolicy {
             handler_timeout: Duration::from_secs(30),
             write_timeout: Duration::from_secs(5),
             shutdown_timeout: Duration::from_secs(30),
+            disconnect_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -79,7 +83,106 @@ impl StreamProcessingPolicy {
         }
         validate_stream_duration("handler_timeout", self.handler_timeout)?;
         validate_stream_duration("write_timeout", self.write_timeout)?;
-        validate_stream_duration("shutdown_timeout", self.shutdown_timeout)
+        validate_stream_duration("shutdown_timeout", self.shutdown_timeout)?;
+        validate_stream_duration("disconnect_timeout", self.disconnect_timeout)
+    }
+}
+
+/// Why accepted Stream frame processing was cancelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StreamCancellationReason {
+    /// The per-frame processing deadline expired, including deduplication operations.
+    HandlerTimeout,
+    /// The connection's bounded drain deadline expired after disconnect or transport loss.
+    DisconnectTimeout,
+    /// The caller's graceful shutdown deadline expired.
+    ShutdownTimeout,
+    /// The running future was dropped without completing its drain.
+    RunnerDropped,
+}
+
+impl StreamCancellationReason {
+    /// Returns a stable lowercase label for logs and metrics.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HandlerTimeout => "handler_timeout",
+            Self::DisconnectTimeout => "disconnect_timeout",
+            Self::ShutdownTimeout => "shutdown_timeout",
+            Self::RunnerDropped => "runner_dropped",
+        }
+    }
+}
+
+impl fmt::Display for StreamCancellationReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// Kept outside the job futures so cancellation also reports work not yet polled.
+struct PendingFrames<'a> {
+    client: &'a StreamClient,
+    ids: BTreeMap<u64, String>,
+    reason: StreamCancellationReason,
+}
+
+impl Drop for PendingFrames<'_> {
+    fn drop(&mut self) {
+        for message_id in self.ids.values() {
+            self.client.emit_event(StreamRunEvent::FrameCancelled {
+                message_id: message_id.clone(),
+                reason: self.reason,
+            });
+        }
+    }
+}
+
+struct SocketState {
+    sender: Option<mpsc::Sender<Message>>,
+    connected: bool,
+    shutdown: bool,
+    exit: Result<StreamExit>,
+    drain: Option<(Instant, StreamCancellationReason)>,
+    policy: StreamProcessingPolicy,
+}
+
+impl SocketState {
+    fn drain(&mut self, timeout: Duration, reason: StreamCancellationReason) {
+        let deadline = Instant::now() + timeout;
+        if self.drain.is_none_or(|(current, _)| deadline < current) {
+            self.drain = Some((deadline, reason));
+        }
+    }
+
+    fn disconnect(&mut self, error: Option<Error>) {
+        self.connected = false;
+        self.sender = None;
+        if let Some(error) = error
+            && self.exit.is_ok()
+        {
+            self.exit = Err(error);
+        }
+        self.drain(
+            self.policy.disconnect_timeout,
+            StreamCancellationReason::DisconnectTimeout,
+        );
+    }
+
+    fn send(&mut self, message: Message) {
+        if let Some(sender) = &self.sender
+            && let Err(error) = enqueue_message(sender, message)
+        {
+            self.disconnect(Some(error));
+        }
+    }
+
+    fn ack(&mut self, ack: &StreamAck) {
+        match serde_json::to_string(ack) {
+            Ok(text) => self.send(Message::Text(text.into())),
+            Err(error) => self.disconnect(Some(error.into())),
+        }
     }
 }
 
@@ -87,120 +190,152 @@ impl StreamClient {
     pub(super) async fn run_socket<S, F>(
         &self,
         socket: WebSocketStream<S>,
-        shutdown: Pin<&mut F>,
+        mut shutdown: Pin<&mut F>,
+        connected_for: &mut Duration,
     ) -> Result<Option<StreamExit>>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
         F: Future<Output = ()> + ?Sized,
     {
-        let (sink, source) = socket.split();
+        let connected_at = Instant::now();
+        let mut lifetime_recorded = false;
+        let (sink, mut source) = socket.split();
         let (sender, receiver) = mpsc::channel(
             self.processing.queue_capacity + self.processing.max_concurrent_handlers + 8,
         );
-        let (stop_sender, stop_receiver) = oneshot::channel();
-        let session = try_join(
-            self.dispatch_socket(source, sender, stop_receiver),
-            write_socket(sink, receiver, self.processing.write_timeout),
-        );
-        tokio::pin!(session);
-        tokio::select! {
-            biased;
-            () = shutdown => {
-                let _ = stop_sender.send(());
-                tokio::time::timeout(self.processing.shutdown_timeout, &mut session)
-                    .await
-                    .map_err(|_| Error::stream("shutdown drain timed out; unfinished handlers were cancelled"))??;
-                Ok(None)
-            }
-            result = &mut session => result.map(|(exit, ())| Some(exit)),
-        }
-    }
-
-    async fn dispatch_socket<S>(
-        &self,
-        mut source: S,
-        sender: mpsc::Sender<Message>,
-        mut stop: oneshot::Receiver<()>,
-    ) -> Result<StreamExit>
-    where
-        S: Stream<Item = std::result::Result<Message, tungstenite::Error>> + Unpin,
-    {
+        let mut pending = PendingFrames {
+            client: self,
+            ids: BTreeMap::new(),
+            reason: StreamCancellationReason::RunnerDropped,
+        };
         let mut jobs = FuturesUnordered::new();
         let mut queue = VecDeque::new();
-        let mut draining = false;
+        let mut next_id = 0_u64;
+        let mut state = SocketState {
+            sender: Some(sender),
+            connected: true,
+            shutdown: false,
+            exit: Ok(StreamExit::Closed),
+            drain: None,
+            policy: self.processing,
+        };
+        let writer = write_socket(sink, receiver, self.processing.write_timeout);
+        tokio::pin!(writer);
+        let mut writer_done = false;
         loop {
             // A buffered input burst must also give the sibling ACK writer time to run.
             tokio::task::yield_now().await;
             while jobs.len() < self.processing.max_concurrent_handlers {
-                let Some(frame) = queue.pop_front() else {
+                let Some((id, frame)) = queue.pop_front() else {
                     break;
                 };
-                jobs.push(self.process_business_frame(frame));
+                jobs.push(async move { (id, self.process_business_frame(frame).await) });
             }
-            if draining && jobs.is_empty() && queue.is_empty() {
-                return Ok(StreamExit::Closed);
+            if state.drain.is_some() && jobs.is_empty() && queue.is_empty() {
+                state.sender = None;
+                if writer_done {
+                    return state
+                        .exit
+                        .map(|exit| if state.shutdown { None } else { Some(exit) });
+                }
             }
+            let deadline = state
+                .drain
+                .map(|(deadline, _)| deadline)
+                .unwrap_or_else(Instant::now);
             tokio::select! {
                 // Stop accepting business work before handling another frame on shutdown.
                 biased;
-                _ = &mut stop, if !draining => { draining = true; }
-                Some(handled) = jobs.next(), if !jobs.is_empty() => {
-                    self.emit_frame_error(&handled);
-                    enqueue_ack(&sender, &handled.ack)?;
+                () = shutdown.as_mut(), if !state.shutdown => {
+                    state.shutdown = true;
+                    state.drain(self.processing.shutdown_timeout, StreamCancellationReason::ShutdownTimeout);
                 }
-                message = source.next() => {
-                    let Some(message) = message else {
-                        return if draining {
-                            Err(Error::stream("websocket closed before shutdown drain completed"))
-                        } else {
-                            Ok(StreamExit::Closed)
-                        };
-                    };
-                    let message = message.map_err(|error| Error::stream(format!("websocket receive failed: {error}")))?;
-                    let text = match message {
-                        Message::Text(text) => text.to_string(),
-                        Message::Binary(bytes) => String::from_utf8(bytes.to_vec()).map_err(|error| Error::stream(format!("invalid utf-8 frame: {error}")))?,
-                        Message::Ping(bytes) => {
-                            enqueue_message(&sender, Message::Pong(bytes))?;
-                            continue;
-                        }
-                        Message::Close(_) => return if draining {
-                            Err(Error::stream("websocket closed before shutdown drain completed"))
-                        } else {
-                            Ok(StreamExit::Closed)
-                        },
-                        Message::Pong(_) | Message::Frame(_) => continue,
-                    };
-                    let frame = match StreamFrame::from_text(&text) {
-                        Ok(frame) => frame,
-                        Err(error) => {
-                            let id = StreamFrame::message_id_from_text(&text).unwrap_or_default();
-                            let handled = frame_failure(id, error);
-                            self.emit_frame_error(&handled);
-                            enqueue_ack(&sender, &handled.ack)?;
-                            continue;
-                        }
-                    };
-                    if frame.frame_type().is_system() {
-                        let handled = self.handle_system_frame(frame)?;
-                        enqueue_ack(&sender, &handled.ack)?;
-                        if handled.exit_after_ack && !draining {
-                            return Ok(StreamExit::Disconnect);
-                        }
-                    } else if draining {
-                        let handled = frame_failure(frame.message_id().to_owned(), Error::stream("stream is shutting down"));
-                        self.emit_frame_error(&handled);
-                        enqueue_ack(&sender, &handled.ack)?;
-                    } else if jobs.len() < self.processing.max_concurrent_handlers {
-                        jobs.push(self.process_business_frame(frame));
-                    } else if queue.len() < self.processing.queue_capacity {
-                        queue.push_back(frame);
+                () = tokio::time::sleep_until(deadline), if state.drain.is_some() => {
+                    let reason = state.drain.map(|(_, reason)| reason).unwrap_or(StreamCancellationReason::RunnerDropped);
+                    pending.reason = reason;
+                    let message = if reason == StreamCancellationReason::ShutdownTimeout {
+                        "shutdown drain timed out; unfinished handlers were cancelled"
                     } else {
-                        let handled = frame_failure(frame.message_id().to_owned(), Error::stream("business frame queue is full"));
-                        self.emit_frame_error(&handled);
-                        enqueue_ack(&sender, &handled.ack)?;
+                        "disconnect drain timed out; unfinished handlers were cancelled"
+                    };
+                    return Err(Error::stream(message));
+                }
+                result = &mut writer, if !writer_done => {
+                    writer_done = true;
+                    if let Err(error) = result
+                        && state.connected
+                    {
+                        state.disconnect(Some(error));
                     }
                 }
+                Some((id, handled)) = jobs.next(), if !jobs.is_empty() => {
+                    pending.ids.remove(&id);
+                    self.emit_frame_error(&handled);
+                    state.ack(&handled.ack);
+                }
+                message = source.next(), if state.connected && state.sender.is_some() => {
+                    let text = match message {
+                        Some(Ok(Message::Text(text))) => Some(Ok(text.to_string())),
+                        Some(Ok(Message::Binary(bytes))) => Some(String::from_utf8(bytes.to_vec())
+                            .map_err(|error| Error::stream(format!("invalid utf-8 frame: {error}")))),
+                        Some(Ok(Message::Ping(bytes))) => {
+                            state.send(Message::Pong(bytes));
+                            None
+                        }
+                        Some(Ok(Message::Close(_))) | None => {
+                            state.disconnect(None);
+                            None
+                        }
+                        Some(Err(error)) => {
+                            state.disconnect(Some(Error::stream(format!("websocket receive failed: {error}"))));
+                            None
+                        }
+                        Some(Ok(Message::Pong(_) | Message::Frame(_))) => None,
+                    };
+                    match text {
+                        Some(Err(error)) => state.disconnect(Some(error)),
+                        Some(Ok(text)) => match StreamFrame::from_text(&text) {
+                            Err(error) => {
+                                let id = StreamFrame::message_id_from_text(&text).unwrap_or_default();
+                                let handled = frame_failure(id, error);
+                                self.emit_frame_error(&handled);
+                                state.ack(&handled.ack);
+                            }
+                            Ok(frame) if frame.frame_type().is_system() => match self.handle_system_frame(frame) {
+                                Ok(handled) => {
+                                    state.ack(&handled.ack);
+                                    if handled.exit_after_ack {
+                                        if state.exit.is_ok() {
+                                            state.exit = Ok(StreamExit::Disconnect);
+                                        }
+                                        state.drain(self.processing.disconnect_timeout, StreamCancellationReason::DisconnectTimeout);
+                                    }
+                                }
+                                Err(error) => state.disconnect(Some(error)),
+                            },
+                            Ok(frame) => {
+                                if state.drain.is_some() || (jobs.len() >= self.processing.max_concurrent_handlers
+                                    && queue.len() >= self.processing.queue_capacity)
+                                {
+                                    let message = if state.drain.is_some() { "stream is draining" } else { "business frame queue is full" };
+                                    let handled = frame_failure(frame.message_id().to_owned(), Error::stream(message));
+                                    self.emit_frame_error(&handled);
+                                    state.ack(&handled.ack);
+                                } else {
+                                    let id = next_id;
+                                    next_id = next_id.wrapping_add(1);
+                                    pending.ids.insert(id, frame.message_id().to_owned());
+                                    queue.push_back((id, frame));
+                                }
+                            }
+                        },
+                        None => {}
+                    }
+                }
+            }
+            if state.drain.is_some() && !lifetime_recorded {
+                *connected_for = connected_at.elapsed();
+                lifetime_recorded = true;
             }
         }
     }
@@ -212,7 +347,13 @@ impl StreamClient {
             Ok(Ok(Ok(handled))) => handled,
             Ok(Ok(Err(error))) => frame_failure(message_id, error),
             Ok(Err(_)) => frame_failure(message_id, Error::stream("business handler panicked")),
-            Err(_) => frame_failure(message_id, Error::stream("business handler timed out")),
+            Err(_) => {
+                self.emit_event(StreamRunEvent::FrameCancelled {
+                    message_id: message_id.clone(),
+                    reason: StreamCancellationReason::HandlerTimeout,
+                });
+                frame_failure(message_id, Error::stream("business handler timed out"))
+            }
         }
     }
 
@@ -258,10 +399,6 @@ fn frame_failure(message_id: String, error: Error) -> StreamHandleResult {
     )
 }
 
-fn enqueue_ack(sender: &mpsc::Sender<Message>, ack: &StreamAck) -> Result<()> {
-    enqueue_message(sender, Message::Text(serde_json::to_string(ack)?.into()))
-}
-
 fn enqueue_message(sender: &mpsc::Sender<Message>, message: Message) -> Result<()> {
     sender
         .try_send(message)
@@ -292,6 +429,252 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FailingWriter {
+        inner: tokio::io::DuplexStream,
+        fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        failed: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    impl tokio::io::AsyncRead for FailingWriter {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buffer)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for FailingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                self.failed.notify_one();
+                return std::task::Poll::Ready(Err(std::io::Error::other(
+                    "injected write failure",
+                )));
+            }
+            Pin::new(&mut self.inner).poll_write(cx, bytes)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn ack_writer_failure_drains_instead_of_dropping_handlers() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let permits = Arc::clone(&gate);
+        let completed = Arc::new(AtomicBool::new(false));
+        let done = Arc::clone(&completed);
+        let (started, mut starts) = mpsc::unbounded_channel();
+        let (events, mut received) = mpsc::unbounded_channel();
+        let client = StreamClient::builder(
+            crate::DingTalk::builder()
+                .app_key_and_secret("id", "secret")
+                .build()
+                .expect("client"),
+        )
+        .expect("builder")
+        .on_event(move |event| {
+            let _ = events.send(event);
+        })
+        .on_frame(move |_, _| {
+            let permits = Arc::clone(&permits);
+            let done = Arc::clone(&done);
+            let started = started.clone();
+            async move {
+                started.send(()).expect("started");
+                permits.acquire().await.expect("gate").forget();
+                done.store(true, Ordering::SeqCst);
+            }
+        })
+        .build()
+        .expect("stream");
+        let (local, remote) = tokio::io::duplex(4096);
+        let fail = Arc::new(AtomicBool::new(false));
+        let failed = Arc::new(tokio::sync::Notify::new());
+        let socket = WebSocketStream::from_raw_socket(
+            FailingWriter {
+                inner: local,
+                fail: Arc::clone(&fail),
+                failed: Arc::clone(&failed),
+            },
+            Role::Client,
+            None,
+        )
+        .await;
+        let mut server = WebSocketStream::from_raw_socket(remote, Role::Server, None).await;
+        let task = tokio::spawn(async move {
+            let shutdown = std::future::pending();
+            tokio::pin!(shutdown);
+            let mut lifetime = Duration::ZERO;
+            client
+                .run_socket(socket, shutdown.as_mut(), &mut lifetime)
+                .await
+        });
+        server
+            .send(Message::Text(
+                serde_json::json!({
+                    "type":"EVENT", "headers":{"topic":"test","messageId":"work"}, "data":"{}"
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("work");
+        tokio::time::timeout(Duration::from_secs(1), starts.recv())
+            .await
+            .expect("deadline")
+            .expect("started");
+        fail.store(true, Ordering::SeqCst);
+        server
+            .send(Message::Text(
+                serde_json::json!({
+                    "type":"SYSTEM", "headers":{"topic":"ping","messageId":"ping"}, "data":"{}"
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("ping");
+        tokio::time::timeout(Duration::from_secs(1), failed.notified())
+            .await
+            .expect("write failed");
+        assert!(!task.is_finished());
+        gate.add_permits(1);
+        let error = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("deadline")
+            .expect("task")
+            .expect_err("write failure");
+        assert!(error.to_string().contains("websocket send failed"));
+        assert!(completed.load(Ordering::SeqCst));
+        while let Ok(event) = received.try_recv() {
+            assert!(!matches!(event, StreamRunEvent::FrameCancelled { .. }));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overlapping_drains_keep_the_earliest_deadline_and_reason() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let mut state = SocketState {
+            sender: Some(sender),
+            connected: true,
+            shutdown: false,
+            exit: Ok(StreamExit::Closed),
+            drain: None,
+            policy: StreamProcessingPolicy::default(),
+        };
+        state.drain(
+            Duration::from_secs(10),
+            StreamCancellationReason::DisconnectTimeout,
+        );
+        let first = state.drain;
+        tokio::time::advance(Duration::from_secs(3)).await;
+        state.drain(
+            Duration::from_secs(10),
+            StreamCancellationReason::DisconnectTimeout,
+        );
+        state.drain(
+            Duration::from_secs(30),
+            StreamCancellationReason::ShutdownTimeout,
+        );
+        assert_eq!(state.drain, first);
+        state.drain(
+            Duration::from_secs(1),
+            StreamCancellationReason::ShutdownTimeout,
+        );
+        assert_eq!(
+            state.drain,
+            Some((
+                Instant::now() + Duration::from_secs(1),
+                StreamCancellationReason::ShutdownTimeout
+            ))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connection_lifetime_excludes_disconnect_drain_time() {
+        use std::sync::Arc;
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let permits = Arc::clone(&gate);
+        let (started, mut starts) = mpsc::unbounded_channel();
+        let client = StreamClient::builder(
+            crate::DingTalk::builder()
+                .app_key_and_secret("id", "secret")
+                .build()
+                .expect("client"),
+        )
+        .expect("builder")
+        .on_frame(move |_, _| {
+            let permits = Arc::clone(&permits);
+            let started = started.clone();
+            async move {
+                started.send(()).expect("started");
+                permits.acquire().await.expect("gate").forget();
+            }
+        })
+        .build()
+        .expect("stream");
+        let (local, remote) = tokio::io::duplex(4096);
+        let socket = WebSocketStream::from_raw_socket(local, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(remote, Role::Server, None).await;
+        let task = tokio::spawn(async move {
+            let shutdown = std::future::pending();
+            tokio::pin!(shutdown);
+            let mut lifetime = Duration::ZERO;
+            let result = client
+                .run_socket(socket, shutdown.as_mut(), &mut lifetime)
+                .await;
+            (result, lifetime)
+        });
+        server
+            .send(Message::Text(
+                serde_json::json!({
+                    "type":"EVENT", "headers":{"topic":"test","messageId":"work"}, "data":"{}"
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("work");
+        starts.recv().await.expect("handler started");
+        tokio::time::advance(Duration::from_secs(2)).await;
+        server.send(Message::Text(serde_json::json!({
+            "type":"SYSTEM", "headers":{"topic":"disconnect","messageId":"disconnect"}, "data":"{}"
+        }).to_string().into())).await.expect("disconnect");
+        server.next().await.expect("disconnect ACK").expect("ACK");
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(!task.is_finished());
+        gate.add_permits(1);
+        let (result, lifetime) = task.await.expect("task");
+        assert_eq!(result.expect("drain"), Some(StreamExit::Disconnect));
+        assert_eq!(lifetime, Duration::from_secs(2));
+    }
 
     #[tokio::test]
     async fn stalled_ack_writes_have_a_deadline() {
@@ -331,6 +714,14 @@ mod tests {
             },
             StreamProcessingPolicy {
                 shutdown_timeout: Duration::ZERO,
+                ..StreamProcessingPolicy::default()
+            },
+            StreamProcessingPolicy {
+                disconnect_timeout: Duration::ZERO,
+                ..StreamProcessingPolicy::default()
+            },
+            StreamProcessingPolicy {
+                disconnect_timeout: Duration::MAX,
                 ..StreamProcessingPolicy::default()
             },
         ] {

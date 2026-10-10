@@ -222,7 +222,18 @@ impl RobotApi {
     /// Requests identity content encoding and rejects unexpected encoded responses.
     /// On failure or cancellation, the writer may contain partial data; use a
     /// temporary file and rename only after success. The writer is flushed but not
-    /// closed. A total timeout, when configured on the client, also covers writes.
+    /// closed. The byte limit also applies without a Content-Length header. Larger
+    /// responses are streamed without full JSON inspection.
+    ///
+    /// The effective total timeout (from the profile or an explicit override)
+    /// covers the file request, all destination writes, and flush. It is a separate
+    /// deadline from resolving the download URL. With no total timeout, a blocked
+    /// destination can wait indefinitely; `request_timeout` bounds network reads,
+    /// not local writes. See [`crate::DingTalkBuilder::total_timeout`].
+    ///
+    /// Destination failures use [`crate::ErrorKind::Io`] and retain the original
+    /// I/O source. HTTP deadline failures use [`crate::ErrorKind::Transport`]. The
+    /// result includes MIME type, bytes written, and the temporary download URL.
     ///
     /// ```no_run
     /// # use dingding::{Result, openapi::RobotApi};

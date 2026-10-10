@@ -38,7 +38,10 @@ async fn main() -> Result<()> {
         .await
 }
 
-async fn handle_card_callback(event: CardCallbackEvent) -> Result<StreamFrameResponse> {
+async fn handle_card_callback(
+    _ctx: StreamContext,
+    event: CardCallbackEvent,
+) -> Result<CardCallbackResponse> {
     let payload = event.payload();
     let action = payload.action().unwrap_or("unknown");
     let card_biz_id = payload.card_biz_id().unwrap_or("unknown");
@@ -87,7 +90,7 @@ async fn handle_card_callback(event: CardCallbackEvent) -> Result<StreamFrameRes
         )])?,
     };
 
-    response.into_stream_response()
+    Ok(response)
 }
 
 fn init_tracing() {
@@ -119,6 +122,7 @@ fn log_stream_event(event: StreamRunEvent) {
         StreamRunEvent::ReconnectScheduled {
             next_attempt,
             delay,
+            ..
         } => {
             info!(next_attempt, ?delay, "stream reconnect scheduled");
         }

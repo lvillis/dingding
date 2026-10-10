@@ -13,7 +13,7 @@ use std::env;
 
 use dingding::{
     DingTalk, Error, Result,
-    openapi::{RobotActionCard, RobotMessage},
+    openapi::{RobotActionCard, RobotMessage, RobotReplyTarget},
 };
 use serde_json::Value;
 
@@ -45,14 +45,7 @@ async fn main() -> Result<()> {
     let message = message()?;
     let msg_key = message.msg_key()?.to_string();
 
-    let response = match target {
-        Target::Group(open_conversation_id) => {
-            robot
-                .send_group_message(open_conversation_id, message)
-                .await?
-        }
-        Target::Private(user_id) => robot.send_private_message([user_id], message).await?,
-    };
+    let response = target.send_message(&robot, message).await?;
 
     println!(
         "message sent: msg_key={msg_key} process_query_key={}",
@@ -113,13 +106,13 @@ fn custom_message() -> Result<RobotMessage> {
     RobotMessage::custom(msg_key, msg_param)
 }
 
-fn target() -> Result<Target> {
+fn target() -> Result<RobotReplyTarget> {
     match (
         optional_env(OPEN_CONVERSATION_ID_ENV),
         optional_env(PRIVATE_USER_ID_ENV),
     ) {
-        (Some(open_conversation_id), None) => Ok(Target::Group(open_conversation_id)),
-        (None, Some(user_id)) => Ok(Target::Private(user_id)),
+        (Some(open_conversation_id), None) => RobotReplyTarget::group(open_conversation_id),
+        (None, Some(user_id)) => RobotReplyTarget::private(user_id),
         (None, None) => Err(Error::InvalidConfig(format!(
             "set `{OPEN_CONVERSATION_ID_ENV}` or `{PRIVATE_USER_ID_ENV}` before running"
         ))),
@@ -148,9 +141,4 @@ fn optional_json_env(name: &str) -> Result<Option<Value>> {
     optional_env(name)
         .map(|value| serde_json::from_str::<Value>(&value).map_err(Error::from))
         .transpose()
-}
-
-enum Target {
-    Group(String),
-    Private(String),
 }

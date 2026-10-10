@@ -1,0 +1,5 @@
+error: dingding handlers accept zero arguments or one context; use `ctx.event()` for the event
+ --> tests/ui/handler_macro/two_args.rs:2:15
+  |
+2 | async fn ping(_ctx: dingding::bot::Context, _event: dingding::bot::BotEvent) {}
+  |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

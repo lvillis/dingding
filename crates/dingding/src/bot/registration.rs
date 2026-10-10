@@ -1,6 +1,6 @@
 use std::future::Future;
 
-use super::{Bot, BotContext, BotEvent, ConversationScope, MessageType, Route};
+use super::{Bot, BotContext, ConversationScope, GroupContext, MessageType, PrivateContext, Route};
 use crate::IntoHandlerResult;
 
 // Keep the Bot and StreamBotBuilder registration surfaces identical.
@@ -16,7 +16,7 @@ macro_rules! impl_registration {
                 handler: F,
             ) -> Self
             where
-                F: Fn(BotContext, BotEvent) -> Fut + Send + Sync + 'static,
+                F: Fn(BotContext) -> Fut + Send + Sync + 'static,
                 Fut: Future + Send + 'static,
                 Fut::Output: IntoHandlerResult,
             {
@@ -39,7 +39,7 @@ macro_rules! impl_registration {
             where
                 I: IntoIterator<Item = S>,
                 S: Into<String>,
-                F: Fn(BotContext, BotEvent) -> Fut + Send + Sync + 'static,
+                F: Fn(BotContext) -> Fut + Send + Sync + 'static,
                 Fut: Future + Send + 'static,
                 Fut::Output: IntoHandlerResult,
             {
@@ -60,7 +60,7 @@ macro_rules! impl_registration {
                 handler: F,
             ) -> Self
             where
-                F: Fn(BotContext, BotEvent) -> Fut + Send + Sync + 'static,
+                F: Fn(BotContext) -> Fut + Send + Sync + 'static,
                 Fut: Future + Send + 'static,
                 Fut::Output: IntoHandlerResult,
             {
@@ -68,6 +68,7 @@ macro_rules! impl_registration {
             }
 
             /// Registers a group command returning `()` or an SDK/application result.
+            /// The handler receives a [`GroupContext`], matching [`Route::handle_group`].
             #[must_use]
             pub fn on_group_text_command<F, Fut>(
                 self,
@@ -75,27 +76,39 @@ macro_rules! impl_registration {
                 handler: F,
             ) -> Self
             where
-                F: Fn(BotContext, BotEvent) -> Fut + Send + Sync + 'static,
+                F: Fn(GroupContext) -> Fut + Send + Sync + 'static,
                 Fut: Future + Send + 'static,
                 Fut::Output: IntoHandlerResult,
             {
-                self.on_text_command(ConversationScope::Group, command, handler)
+                self.route(
+                    Route::new(ConversationScope::Group)
+                        .message_type(MessageType::Text)
+                        .command(command)
+                        .handle_group(handler),
+                )
             }
 
             /// Registers group command aliases returning `()` or an SDK/application result.
+            /// The handler receives a [`GroupContext`].
             #[must_use]
             pub fn on_group_text_commands<I, S, F, Fut>(self, commands: I, handler: F) -> Self
             where
                 I: IntoIterator<Item = S>,
                 S: Into<String>,
-                F: Fn(BotContext, BotEvent) -> Fut + Send + Sync + 'static,
+                F: Fn(GroupContext) -> Fut + Send + Sync + 'static,
                 Fut: Future + Send + 'static,
                 Fut::Output: IntoHandlerResult,
             {
-                self.on_text_commands(ConversationScope::Group, commands, handler)
+                self.route(
+                    Route::new(ConversationScope::Group)
+                        .message_type(MessageType::Text)
+                        .commands(commands)
+                        .handle_group(handler),
+                )
             }
 
             /// Registers a private-chat command returning `()` or an SDK/application result.
+            /// The handler receives a [`PrivateContext`], matching [`Route::handle_private`].
             #[must_use]
             pub fn on_private_text_command<F, Fut>(
                 self,
@@ -103,64 +116,89 @@ macro_rules! impl_registration {
                 handler: F,
             ) -> Self
             where
-                F: Fn(BotContext, BotEvent) -> Fut + Send + Sync + 'static,
+                F: Fn(PrivateContext) -> Fut + Send + Sync + 'static,
                 Fut: Future + Send + 'static,
                 Fut::Output: IntoHandlerResult,
             {
-                self.on_text_command(ConversationScope::Private, command, handler)
+                self.route(
+                    Route::new(ConversationScope::Private)
+                        .message_type(MessageType::Text)
+                        .command(command)
+                        .handle_private(handler),
+                )
             }
 
             /// Registers private-chat command aliases returning `()` or an SDK/application result.
+            /// The handler receives a [`PrivateContext`].
             #[must_use]
             pub fn on_private_text_commands<I, S, F, Fut>(self, commands: I, handler: F) -> Self
             where
                 I: IntoIterator<Item = S>,
                 S: Into<String>,
-                F: Fn(BotContext, BotEvent) -> Fut + Send + Sync + 'static,
+                F: Fn(PrivateContext) -> Fut + Send + Sync + 'static,
                 Fut: Future + Send + 'static,
                 Fut::Output: IntoHandlerResult,
             {
-                self.on_text_commands(ConversationScope::Private, commands, handler)
+                self.route(
+                    Route::new(ConversationScope::Private)
+                        .message_type(MessageType::Text)
+                        .commands(commands)
+                        .handle_private(handler),
+                )
             }
 
             /// Registers a group message handler returning `()` or an SDK/application result.
+            /// The handler receives a [`GroupContext`].
             #[must_use]
             pub fn on_group_message<F, Fut>(self, message_type: MessageType, handler: F) -> Self
             where
-                F: Fn(BotContext, BotEvent) -> Fut + Send + Sync + 'static,
+                F: Fn(GroupContext) -> Fut + Send + Sync + 'static,
                 Fut: Future + Send + 'static,
                 Fut::Output: IntoHandlerResult,
             {
-                self.on_message(ConversationScope::Group, message_type, handler)
+                self.route(
+                    Route::new(ConversationScope::Group)
+                        .message_type(message_type)
+                        .handle_group(handler),
+                )
             }
 
             /// Registers a private message handler returning `()` or an SDK/application result.
+            /// The handler receives a [`PrivateContext`].
             #[must_use]
             pub fn on_private_message<F, Fut>(self, message_type: MessageType, handler: F) -> Self
             where
-                F: Fn(BotContext, BotEvent) -> Fut + Send + Sync + 'static,
+                F: Fn(PrivateContext) -> Fut + Send + Sync + 'static,
                 Fut: Future + Send + 'static,
                 Fut::Output: IntoHandlerResult,
             {
-                self.on_message(ConversationScope::Private, message_type, handler)
+                self.route(
+                    Route::new(ConversationScope::Private)
+                        .message_type(message_type)
+                        .handle_private(handler),
+                )
             }
 
-            /// Registers a fallback returning `()` or an SDK/application result.
+            /// Appends a catch-all fallback returning `()` or an SDK/application result.
+            ///
+            /// Register this last, after specific fallbacks. See [`Self::fallback_route`].
             #[must_use]
             pub fn fallback<F, Fut>(self, handler: F) -> Self
             where
-                F: Fn(BotContext, BotEvent) -> Fut + Send + Sync + 'static,
+                F: Fn(BotContext) -> Fut + Send + Sync + 'static,
                 Fut: Future + Send + 'static,
                 Fut::Output: IntoHandlerResult,
             {
                 self.fallback_route(Route::new(ConversationScope::Any).handle(handler))
             }
 
-            /// Registers an unmatched-text fallback returning `()` or an SDK/application result.
+            /// Appends an unmatched-text fallback returning `()` or an SDK/application result.
+            ///
+            /// Fallbacks accumulate in registration order. See [`Self::fallback_route`].
             #[must_use]
             pub fn on_unmatched_text<F, Fut>(self, scope: ConversationScope, handler: F) -> Self
             where
-                F: Fn(BotContext, BotEvent) -> Fut + Send + Sync + 'static,
+                F: Fn(BotContext) -> Fut + Send + Sync + 'static,
                 Fut: Future + Send + 'static,
                 Fut::Output: IntoHandlerResult,
             {

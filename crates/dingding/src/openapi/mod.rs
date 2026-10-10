@@ -1,3 +1,43 @@
+//! Typed enterprise robot messages, interactive cards, media, and message lifecycle.
+//!
+//! Configure [`DingTalk`] with
+//! [`app_credentials_from_env`](crate::DingTalkBuilder::app_credentials_from_env),
+//! then obtain an [`OpenApi`] or a [`RobotApi`]. Client clones share token caches and
+//! refresh locks keyed by the full credential pair. Explicit token rejection
+//! triggers one refresh and replay; permission and ambiguous transport failures do not.
+//!
+//! # Delayed replies and message lifecycle
+//!
+//! Persist a [`RobotReplyTarget`] and the application's identity with background
+//! jobs instead of persisting a session webhook. The worker chooses the appropriate
+//! robot and sends explicitly through OpenAPI:
+//!
+//! ```no_run
+//! use dingding::prelude::*;
+//!
+//! async fn complete_job(robot: &RobotApi, target: &RobotReplyTarget) -> Result<()> {
+//!     let response = target.send_text(robot, "Job completed").await?;
+//!     let _query_key = response.process_query_key();
+//!     Ok(())
+//! }
+//! ```
+//!
+//! Save the returned process query key to inspect send/read status or recall a
+//! message. [`RobotApi::query_group_message_pages`] fetches pages lazily without
+//! accumulating them; [`RobotApi::query_group_message`] permits manual pagination.
+//! [`RobotApi::query_private_message`] queries private messages. Batch recall can
+//! contain both successes and failures even when HTTP succeeds; inspect both
+//! collections in [`MessageRecallResponse`].
+//!
+//! # Media
+//!
+//! [`MediaUpload`] and [`RobotApi::download_message_file`] buffer small files in
+//! memory. [`MediaFileUpload`] and [`RobotApi::upload_media_file`] stream local files;
+//! [`RobotApi::download_message_file_to`] streams into an async writer with a byte
+//! limit. These methods document token recovery, cancellation, partial output,
+//! deadlines, and local I/O errors. Destination paths and overwrite policy remain
+//! application-owned.
+
 use std::{fmt, future::Future};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};

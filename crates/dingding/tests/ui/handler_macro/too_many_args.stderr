@@ -1,4 +1,4 @@
-error: dingding handlers may accept at most `(ctx, event)`
+error: dingding handlers accept zero arguments or one context; use `ctx.event()` for the event
  --> tests/ui/handler_macro/too_many_args.rs:3:5
   |
 3 | /     _ctx: dingding::bot::AnyContext,

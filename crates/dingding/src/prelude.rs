@@ -2,6 +2,7 @@
 
 pub use crate::{
     BoxError, DingTalk, Error, HandlerResult, IntoHandlerResult, Result, auth::AppCredentials,
+    handler_future,
 };
 
 #[cfg(feature = "macros")]
@@ -34,10 +35,10 @@ pub use crate::openapi::{
 pub use crate::stream::{
     BOT_MESSAGE_TOPIC, CARD_CALLBACK_TOPIC, CardCallbackActionValue, CardCallbackContent,
     CardCallbackEvent, CardCallbackOperator, CardCallbackPayload, CardCallbackPrivateData,
-    CardCallbackResponse, ReconnectPolicy, StreamBot, StreamBotBuilder, StreamClient,
-    StreamClientBuilder, StreamExit, StreamFrame, StreamFrameResponse, StreamFrameType,
-    StreamHeaders, StreamProcessingPolicy, StreamRunEvent, StreamSubscription,
-    StreamSubscriptionType,
+    CardCallbackResponse, ReconnectPolicy, StreamBot, StreamBotBuilder, StreamCancellationReason,
+    StreamClient, StreamClientBuilder, StreamContext, StreamError, StreamExit, StreamFrame,
+    StreamFrameResponse, StreamFrameType, StreamHeaders, StreamProcessingPolicy, StreamRunEvent,
+    StreamSubscription, StreamSubscriptionType,
 };
 
 #[cfg(feature = "webhook")]

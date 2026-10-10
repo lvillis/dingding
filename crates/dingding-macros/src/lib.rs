@@ -15,6 +15,7 @@ use syn::{Expr, ExprLit, ItemFn, Lit, Meta, Token, parse_macro_input, punctuated
 ///
 /// Handlers may return `()`, `dingding::Result<()>`, `dingding::HandlerResult`, or another result
 /// whose error converts into a boxed `Send + Sync` application error.
+/// Accepts zero arguments or one context argument. Access the event with `ctx.event()`.
 ///
 /// Example:
 ///
@@ -124,24 +125,19 @@ fn expand_handler(
     let arg_count = input.sig.inputs.len();
     let handler_tokens = match arg_count {
         0 => quote! {
-            .#handler_method(|_ctx, _event| async move {
+            .#handler_method(|_ctx| async move {
                 #fn_ident().await
             })
         },
         1 => quote! {
-            .#handler_method(|ctx, _event| async move {
+            .#handler_method(|ctx| async move {
                 #fn_ident(ctx).await
-            })
-        },
-        2 => quote! {
-            .#handler_method(|ctx, event| async move {
-                #fn_ident(ctx, event).await
             })
         },
         _ => {
             return Err(syn::Error::new_spanned(
                 &input.sig.inputs,
-                "dingding handlers may accept at most `(ctx, event)`",
+                "dingding handlers accept zero arguments or one context; use `ctx.event()` for the event",
             ));
         }
     };

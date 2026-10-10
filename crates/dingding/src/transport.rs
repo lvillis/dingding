@@ -47,7 +47,7 @@ pub(crate) struct TransportConfig {
     pub(crate) client_name: String,
     pub(crate) profile: ClientProfile,
     pub(crate) request_timeout: Option<Duration>,
-    pub(crate) total_timeout: Option<Duration>,
+    pub(crate) total_timeout: Option<Option<Duration>>,
     pub(crate) connect_timeout: Duration,
     pub(crate) system_proxy: bool,
     pub(crate) retry_policy: Option<RetryPolicy>,
@@ -107,7 +107,7 @@ impl TransportConfig {
         if let Some(request_timeout) = self.request_timeout {
             validate_duration("request_timeout", request_timeout)?;
         }
-        if let Some(total_timeout) = self.total_timeout {
+        if let Some(Some(total_timeout)) = self.total_timeout {
             validate_duration("total_timeout", total_timeout)?;
         }
         for (index, (name, value)) in self.default_headers.iter().enumerate() {
@@ -123,10 +123,6 @@ pub(crate) struct Transport {
     #[cfg(feature = "openapi")]
     openapi_http: HttpClient,
     error_body_snippet: BodySnippetConfig,
-    #[cfg(feature = "openapi")]
-    stream_total_timeout: Option<Duration>,
-    #[cfg(feature = "openapi")]
-    stream_write_timeout: Duration,
 }
 
 impl Transport {
@@ -150,10 +146,6 @@ impl Transport {
                 config,
             )?,
             error_body_snippet: config.error_body_snippet,
-            #[cfg(feature = "openapi")]
-            stream_total_timeout: config.total_timeout,
-            #[cfg(feature = "openapi")]
-            stream_write_timeout: config.request_timeout.unwrap_or(Duration::from_secs(30)),
         })
     }
 
@@ -226,26 +218,7 @@ impl Transport {
     where
         W: tokio::io::AsyncWrite + Unpin + Send + ?Sized,
     {
-        let transfer = self.copy_download(url, writer, max_bytes);
-        match self.stream_total_timeout {
-            Some(timeout) => tokio::time::timeout(timeout, transfer).await.map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::TimedOut, "download total timeout")
-            })?,
-            None => transfer.await,
-        }
-    }
-
-    #[cfg(feature = "openapi")]
-    async fn copy_download<W>(
-        &self,
-        url: &Url,
-        writer: &mut W,
-        max_bytes: usize,
-    ) -> Result<(Option<String>, u64)>
-    where
-        W: tokio::io::AsyncWrite + Unpin + Send + ?Sized,
-    {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 
         const PREFIX_LIMIT: usize = 64 * 1024;
         let mut response = self
@@ -323,7 +296,8 @@ impl Transport {
         (&mut response)
             .take((PREFIX_LIMIT + 1).min(max_bytes.saturating_add(1)) as u64)
             .read_to_end(&mut prefix)
-            .await?;
+            .await
+            .map_err(stream_read_error)?;
         if prefix.len() <= PREFIX_LIMIT
             && let Some(error) = binary_success_body_error(
                 &prefix,
@@ -344,13 +318,14 @@ impl Transport {
             }
             .into());
         }
-        tokio::time::timeout(self.stream_write_timeout, writer.write_all(&prefix))
-            .await
-            .map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::TimedOut, "download writer timeout")
-            })??;
+        let prefix_len = prefix.len();
+        // Keep the inspected prefix in memory until reqx writes or flushes it under
+        // the original deadline. The extra byte prevents BufWriter bypassing its buffer.
+        let mut writer = BufWriter::with_capacity(prefix_len + 1, writer);
+        writer.write_all(&prefix).await?;
+        drop(prefix);
         let written = response
-            .copy_to_writer_limited(writer, max_bytes - prefix.len())
+            .copy_to_writer_limited(&mut writer, max_bytes - prefix_len)
             .await
             .map_err(|error| match error {
                 reqx::Error::ResponseBodyTooLarge {
@@ -360,13 +335,21 @@ impl Transport {
                     ..
                 } => reqx::Error::ResponseBodyTooLarge {
                     limit_bytes: max_bytes,
-                    actual_bytes: actual_bytes.saturating_add(prefix.len()),
+                    actual_bytes: actual_bytes.saturating_add(prefix_len),
                     method,
                     uri,
-                },
-                error => error,
+                }
+                .into(),
+                reqx::Error::WriteBody { source, .. } => {
+                    let source = source
+                        .downcast::<std::io::Error>()
+                        .map(|source| *source)
+                        .unwrap_or_else(std::io::Error::other);
+                    Error::from(source)
+                }
+                error => Error::from(error),
             })?;
-        Ok((content_type, written + prefix.len() as u64))
+        Ok((content_type, written + prefix_len as u64))
     }
 
     #[cfg(feature = "openapi")]
@@ -424,6 +407,23 @@ impl Transport {
     }
 }
 
+#[cfg(feature = "openapi")]
+fn stream_read_error(error: std::io::Error) -> Error {
+    // reqx's AsyncRead adapter wraps transport failures in io::Error. Unwrap
+    // those so a network timeout is not reported as a local destination failure.
+    if error.get_ref().is_none() {
+        return error.into();
+    }
+    let kind = error.kind();
+    match error.into_inner() {
+        Some(source) => match source.downcast::<reqx::Error>() {
+            Ok(source) => (*source).into(),
+            Err(source) => std::io::Error::new(kind, source).into(),
+        },
+        None => std::io::Error::from(kind).into(),
+    }
+}
+
 fn build_http_client(base_url: &Url, config: &TransportConfig) -> Result<HttpClient> {
     let mut builder = HttpClient::builder(base_url.as_str())
         .profile(config.profile)
@@ -437,7 +437,7 @@ fn build_http_client(base_url: &Url, config: &TransportConfig) -> Result<HttpCli
     }
 
     if let Some(total_timeout) = config.total_timeout {
-        builder = builder.total_timeout(Some(total_timeout));
+        builder = builder.total_timeout(total_timeout);
     }
 
     if !config.system_proxy {
@@ -587,7 +587,7 @@ pub(crate) fn with_response_metadata<T>(
     parse(response).map_err(|error| error.with_response_metadata(status, request_id, retry_after))
 }
 
-fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
+pub(crate) fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
     let value = value.trim();
     if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
         return value.parse::<u64>().ok().map(Duration::from_secs);
@@ -1119,6 +1119,30 @@ fn body_snippet_for_error(body: &str, config: BodySnippetConfig) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "openapi")]
+    #[test]
+    fn streamed_read_errors_preserve_transport_classification() {
+        let deadline = reqx::Error::DeadlineExceeded {
+            timeout_ms: 100,
+            method: "GET".parse().expect("method"),
+            uri: "https://example.test/file".into(),
+        };
+        let error = stream_read_error(std::io::Error::other(deadline));
+        assert_eq!(error.kind(), crate::ErrorKind::Transport);
+        assert!(error.is_retryable());
+        assert!(matches!(error, Error::Transport { source, .. }
+            if matches!(*source, reqx::Error::DeadlineExceeded { timeout_ms: 100, .. })));
+
+        for source in [
+            std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "read failed"),
+        ] {
+            let error = stream_read_error(source);
+            assert!(matches!(error, Error::Io { source, .. }
+                if source.kind() == std::io::ErrorKind::BrokenPipe));
+        }
+    }
 
     #[test]
     fn retry_after_accepts_seconds_and_http_dates() {

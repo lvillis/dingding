@@ -104,8 +104,17 @@ pub enum Error {
     },
 
     /// Stream connection or protocol failure.
-    #[error("stream error: {0}")]
-    Stream(String),
+    #[error("stream error: {message}")]
+    Stream {
+        /// Redacted connection or protocol error text.
+        message: String,
+        /// HTTP status if a WebSocket upgrade was rejected.
+        status: Option<u16>,
+        /// Redacted request id from the upgrade response.
+        request_id: Option<String>,
+        /// Server retry hint captured when the upgrade was rejected.
+        retry_after: Option<Duration>,
+    },
 
     /// JSON serialization or deserialization failure.
     #[error("serialization error: {0}")]
@@ -177,7 +186,7 @@ impl Error {
         match self {
             Self::Api { .. } => ErrorKind::Api,
             Self::Transport { .. } => ErrorKind::Transport,
-            Self::Stream(_) => ErrorKind::Stream,
+            Self::Stream { .. } => ErrorKind::Stream,
             Self::Serialization(_) => ErrorKind::Serialization,
             Self::Signature | Self::InvalidSignature(_) => ErrorKind::Signature,
             Self::Timestamp(_) => ErrorKind::Timestamp,
@@ -194,7 +203,7 @@ impl Error {
     #[must_use]
     pub fn request_id(&self) -> Option<&str> {
         match self {
-            Self::Api { request_id, .. } => request_id.as_deref(),
+            Self::Api { request_id, .. } | Self::Stream { request_id, .. } => request_id.as_deref(),
             Self::Transport { source, .. } => source.request_id(),
             _ => None,
         }
@@ -233,11 +242,11 @@ impl Error {
         }
     }
 
-    /// Returns HTTP status code when available.
+    /// Returns HTTP status code when available, including HTTP 200 business errors.
     #[must_use]
     pub fn status(&self) -> Option<u16> {
         match self {
-            Self::Api { status, .. } => *status,
+            Self::Api { status, .. } | Self::Stream { status, .. } => *status,
             Self::Transport { source, .. } => source.status_code(),
             _ => None,
         }
@@ -250,6 +259,7 @@ impl Error {
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
+            Self::Stream { status, .. } => matches!(status, Some(429 | 500..=599)),
             Self::Transport { source, .. } => match source.code() {
                 reqx::ErrorCode::Timeout
                 | reqx::ErrorCode::DeadlineExceeded
@@ -278,10 +288,15 @@ impl Error {
     }
 
     /// Returns the server's retry-after hint when one was parsed.
+    ///
+    /// Supports delta seconds and HTTP dates. Expired dates yield zero; malformed
+    /// values are ignored. For API errors, the delay is evaluated at response
+    /// parsing time, so applications should account for time spent before retrying.
     #[must_use]
     pub fn retry_after(&self) -> Option<std::time::Duration> {
         match self {
             Self::Api { retry_after, .. } => retry_after.as_deref().copied(),
+            Self::Stream { retry_after, .. } => *retry_after,
             Self::Transport { source, .. } => source.retry_after(SystemTime::now()),
             _ => None,
         }
@@ -337,7 +352,41 @@ impl Error {
 
     #[cfg(feature = "stream")]
     pub(crate) fn stream(message: impl Into<String>) -> Self {
-        Self::Stream(redact_text(&message.into()))
+        Self::Stream {
+            message: redact_text(&message.into()),
+            status: None,
+            request_id: None,
+            retry_after: None,
+        }
+    }
+
+    #[cfg(feature = "stream")]
+    pub(crate) fn websocket_connect(source: tokio_tungstenite::tungstenite::Error) -> Self {
+        let mut error = Self::stream(format!("websocket connect failed: {source}"));
+        if let tokio_tungstenite::tungstenite::Error::Http(response) = source
+            && let Self::Stream {
+                status,
+                request_id,
+                retry_after,
+                ..
+            } = &mut error
+        {
+            *status = Some(response.status().as_u16());
+            *request_id = response
+                .headers()
+                .get("x-request-id")
+                .or_else(|| response.headers().get("x-acs-request-id"))
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(redact_text);
+            *retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| crate::transport::parse_retry_after(value, SystemTime::now()));
+        }
+        error
     }
 
     pub(crate) fn api_with_code(
@@ -401,7 +450,18 @@ impl fmt::Debug for Error {
                 .debug_struct("Transport")
                 .field("message", message)
                 .finish(),
-            Self::Stream(message) => f.debug_tuple("Stream").field(message).finish(),
+            Self::Stream {
+                message,
+                status,
+                request_id,
+                retry_after,
+            } => f
+                .debug_struct("Stream")
+                .field("message", message)
+                .field("status", status)
+                .field("request_id", request_id)
+                .field("retry_after", retry_after)
+                .finish(),
             Self::Serialization(source) => f.debug_tuple("Serialization").field(source).finish(),
             Self::Timestamp(source) => f.debug_tuple("Timestamp").field(source).finish(),
             Self::Signature => f.write_str("Signature"),

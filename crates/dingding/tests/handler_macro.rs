@@ -31,9 +31,9 @@ async fn unit_group(ctx: GroupContext) {
 }
 
 #[dingding::handler(scope = Scope::Private, command = "/unit-private")]
-async fn unit_private(ctx: PrivateContext, event: BotEvent) {
+async fn unit_private(ctx: PrivateContext) {
     assert!(ctx.is_private());
-    assert_eq!(event.conversation_scope, Scope::Private);
+    assert_eq!(ctx.event().conversation_scope, Scope::Private);
 }
 
 #[tokio::test]
@@ -66,7 +66,7 @@ async fn io_handler(_ctx: AnyContext) -> std::io::Result<()> {
 }
 
 #[dingding::handler(scope = Scope::Group, msg = Msg::Text, command = "/mixed")]
-async fn mixed_handler(ctx: GroupContext, _event: BotEvent) -> dingding::HandlerResult {
+async fn mixed_handler(ctx: GroupContext) -> dingding::HandlerResult {
     assert!(ctx.is_group());
     let _ = String::from_utf8(b"text".to_vec())?;
     Err(dingding::Error::MissingCredentials.into())

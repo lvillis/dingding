@@ -230,13 +230,12 @@ impl DingTalkBuilder {
         self
     }
 
-    /// Applies a reqx transport profile.
+    /// Selects transport defaults without replacing explicit timeout or retry settings.
+    ///
+    /// Explicit settings take precedence regardless of builder call order.
     #[must_use]
     pub fn profile(mut self, value: ClientProfile) -> Self {
         self.transport.profile = value;
-        self.transport.request_timeout = None;
-        self.transport.total_timeout = None;
-        self.transport.retry_policy = None;
         self
     }
 
@@ -247,17 +246,26 @@ impl DingTalkBuilder {
         self
     }
 
-    /// Sets per-request timeout.
+    /// Sets the transport's per-attempt timeout (and streamed body read timeout).
+    ///
+    /// This is not a deadline for destination writes. Use [`Self::total_timeout`]
+    /// to bound a complete streaming download, including writes and flush.
     #[must_use]
     pub fn request_timeout(mut self, value: Duration) -> Self {
         self.transport.request_timeout = Some(value);
         self
     }
 
-    /// Sets total request deadline.
+    /// Sets the total deadline for each HTTP request, including transport retries.
+    ///
+    /// Accepts a [`Duration`] or `Some(duration)` to set a deadline, and `None`
+    /// to disable the profile's deadline. Explicit settings override the profile
+    /// regardless of setter order. Streaming downloads include destination writes
+    /// and flush. Operations issuing multiple HTTP requests (for example token
+    /// recovery or resolving a download URL) have a separate deadline per request.
     #[must_use]
-    pub fn total_timeout(mut self, value: Duration) -> Self {
-        self.transport.total_timeout = Some(value);
+    pub fn total_timeout(mut self, value: impl Into<Option<Duration>>) -> Self {
+        self.transport.total_timeout = Some(value.into());
         self
     }
 
@@ -344,6 +352,68 @@ impl DingTalkBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_transport_settings_override_profiles_in_any_order() {
+        let configure = |builder: DingTalkBuilder| {
+            builder
+                .request_timeout(Duration::from_secs(7))
+                .total_timeout(Duration::from_secs(13))
+                .retry_policy(RetryPolicy::disabled())
+        };
+        for builder in [
+            configure(DingTalk::builder()).profile(ClientProfile::LowLatency),
+            configure(DingTalk::builder().profile(ClientProfile::LowLatency)),
+            configure(DingTalk::builder().profile(ClientProfile::HighThroughput))
+                .profile(ClientProfile::LowLatency),
+        ] {
+            assert_eq!(
+                builder.transport.request_timeout,
+                Some(Duration::from_secs(7))
+            );
+            assert_eq!(
+                builder.transport.total_timeout,
+                Some(Some(Duration::from_secs(13)))
+            );
+            assert!(builder.transport.retry_policy.is_some());
+            assert!(matches!(
+                builder.transport.profile,
+                ClientProfile::LowLatency
+            ));
+            builder.build().expect("valid explicit settings");
+        }
+    }
+
+    #[test]
+    fn profile_deadline_can_be_disabled_in_any_order() {
+        for builder in [
+            DingTalk::builder()
+                .profile(ClientProfile::LowLatency)
+                .total_timeout(None),
+            DingTalk::builder()
+                .total_timeout(None)
+                .profile(ClientProfile::LowLatency),
+        ] {
+            assert_eq!(builder.transport.total_timeout, Some(None));
+            builder.build().expect("disabled total timeout");
+        }
+    }
+
+    #[test]
+    fn profiles_do_not_hide_invalid_explicit_settings() {
+        for builder in [
+            DingTalk::builder().request_timeout(Duration::ZERO),
+            DingTalk::builder().total_timeout(Duration::ZERO),
+            DingTalk::builder().retry_policy(RetryPolicy::standard().max_attempts(0)),
+        ] {
+            assert!(
+                builder
+                    .profile(ClientProfile::HighThroughput)
+                    .build()
+                    .is_err()
+            );
+        }
+    }
 
     #[cfg(feature = "openapi")]
     #[test]

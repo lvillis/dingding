@@ -1,3 +1,142 @@
+//! Receive robot messages, interactive card callbacks, and other Stream frames.
+//!
+//! [`StreamBot`] combines routing and a connection. [`StreamClient`] accepts an
+//! independently configured [`Bot`] for applications that need separate transports
+//! or lower-level subscriptions. Both support [`StreamProcessingPolicy`].
+//!
+//! # Context and state
+//!
+//! Frame and card handlers receive `(StreamContext, event)`. Return `()` for an
+//! empty acknowledgement, [`StreamFrameResponse`] for a raw payload, or
+//! [`CardCallbackResponse`] for a validated card update. Any can be wrapped in an
+//! SDK or application result. An empty `CardCallbackResponse` is invalid; use `()`
+//! when acknowledging without an update.
+//!
+//! ```
+//! use dingding::prelude::*;
+//!
+//! fn configure(client: DingTalk) -> StreamBotBuilder {
+//!     StreamBot::from_client(client)
+//!         .state(String::from("done"))
+//!         .on_group_text_command("/ping", |ctx| handler_future(async move {
+//!             let text = String::from_utf8(b"pong".to_vec())?;
+//!             ctx.reply_text(text).await?;
+//!             Ok(())
+//!         }))
+//!         .on_card_callback(|ctx, _| async move {
+//!             CardCallbackResponse::new().card_data([
+//!                 ("status", ctx.state_required::<String>()?),
+//!             ])
+//!         })
+//! }
+//! ```
+//!
+//! All business handlers share the same state allocation, even in card-only or
+//! frame-only applications. [`StreamClientBuilder`] inherits a supplied Bot's
+//! state; an explicit [`StreamClientBuilder::state`] overrides it for all handlers
+//! regardless of setter order. Other clones of the supplied Bot keep their state.
+//!
+//! Explicit builder credentials override client defaults for the connection and
+//! every handler's SDK client, including a separately supplied Bot. Transports,
+//! base URLs, and proxy settings are preserved; other client clones are unchanged.
+//! [`StreamContext::client`] uses the connection's SDK transport, while a supplied
+//! Bot keeps its own. Use [`DingTalk::with_app_credentials`] to configure an
+//! independently used client clone.
+//!
+//! # Diagnostics
+//!
+//! Stream emits structured `tracing` events under the `dingding::stream` target:
+//! connection and frame/handler failures at WARN, connection lifecycle at INFO,
+//! and attempts, reconnect scheduling, and handled events at DEBUG. Error messages
+//! are redacted; message bodies, card contents, and original error source chains
+//! are not logged. Install a subscriber in the application to collect these events.
+//! The library never installs a global subscriber or writes directly to stdout/stderr.
+//! [`StreamRunEvent::ConnectionError`] and [`StreamRunEvent::FrameError`] contain a
+//! [`StreamError`] with `kind`, HTTP `status`, `errcode`, `api_code`, `request_id`,
+//! `retry_after`, and retryability accessors. Missing metadata is `None`. Text fields
+//! are redacted; response bodies and original sources are not included.
+//!
+//! [`StreamBotBuilder::on_event`] and [`StreamClientBuilder::on_event`] are
+//! optional observers and do not disable diagnostics. Avoid logging the same
+//! events twice. Handler errors produce failure ACKs without stopping the runner;
+//! connection errors retry by default. Neither automatically sends an error message
+//! to the conversation.
+//!
+//! Observers can request shutdown through an application-owned signal, for example
+//! to stop reconnecting on an authentication error:
+//!
+//! ```no_run
+//! use dingding::prelude::*;
+//! # async fn run() -> Result<()> {
+//! let (stop, mut stopped) = tokio::sync::watch::channel(false);
+//! StreamBot::from_env()?
+//!     .on_text_command(Scope::Any, "/ping", |ctx| async move {
+//!         ctx.reply_text("pong").await
+//!     })
+//!     .on_event(move |event| {
+//!         if let StreamRunEvent::ConnectionError { error, .. } = event
+//!             && matches!(error.status(), Some(401 | 403))
+//!         {
+//!             let _ = stop.send(true);
+//!         }
+//!     })
+//!     .run_until(async move { let _ = stopped.wait_for(|stop| *stop).await; })
+//!     .await
+//! # }
+//! ```
+//!
+//! # Processing and shutdown
+//!
+//! Defaults: one concurrent handler, 64 waiting business frames, a 30-second
+//! handler timeout, 5-second write timeout, and separate 30-second shutdown and
+//! disconnect drain deadlines.
+//! Concurrency greater than one allows out-of-order completion. Heartbeats and
+//! ACK writes continue while asynchronous handlers run. Overload, handler errors,
+//! panics, and timeouts produce failure ACKs. Handler deadlines also cover
+//! deduplication storage operations.
+//!
+//! [`StreamBot::run_until`] and [`StreamClient::run_until`] stop accepting business
+//! work when the shutdown future resolves, then drain accepted handlers and ACKs.
+//! Work exceeding the shutdown deadline is cancelled and an error is returned.
+//! Server disconnects also stop accepting business work and drain accepted frames,
+//! including queued work, within [`StreamProcessingPolicy::disconnect_timeout`].
+//! The same policy applies to WebSocket close, receive failure, and write failure.
+//! After transport loss, local processing and deduplication completion continue,
+//! but ACKs cannot be delivered. Reconnection starts only after drain finishes.
+//! If shutdown overlaps disconnect, the earlier deadline wins; further disconnects
+//! do not extend it. Per-handler deadlines still apply during drain.
+//!
+//! [`StreamRunEvent::FrameCancelled`] identifies every cancelled accepted frame and
+//! its [`StreamCancellationReason`], including queued work that never started.
+//! Handler timeouts also emit this event. Dropping the run future directly cancels
+//! work without draining and emits `RunnerDropped` events. Process termination does
+//! not guarantee notifications. Deadlines are cooperative: handlers must not block
+//! the executor, and detached tasks spawned by handlers are not managed by the SDK.
+//! `run()` continues until a terminal error or cancellation. Reconnect backoff
+//! defaults to one through thirty seconds and counts consecutive failed attempts
+//! or short-lived connections, independently of lifetime attempt numbers. A socket
+//! open for [`ReconnectPolicy::reset_after`] (60 seconds by default) resets backoff;
+//! setup and drain time do not count. [`ReconnectPolicy::no_retry`] returns connection
+//! failures to the caller, but normal disconnects still reconnect.
+//!
+//! # Deduplication
+//!
+//! Successful results are retained in memory for five minutes, up to 10,000 entries.
+//! Completed duplicates replay the saved response. In-flight duplicates do not
+//! receive successful completion. Failed or cancelled work releases its reservation;
+//! active reservations are not evicted for capacity, and a full cache fails closed.
+//!
+//! Multiple replicas can share an asynchronous [`EventDeduplicator`]. Use a separate
+//! application namespace, renewable leases, stale-owner fencing, and atomic response
+//! storage at completion. Business effects still need durable idempotency across
+//! process crashes and retention expiry. A cancelled or failed handler may already
+//! have submitted an external operation. An undelivered ACK may lead to redelivery,
+//! but the SDK does not guarantee that DingTalk will redeliver. Cached successful
+//! results can replay ACKs within their retention; they cannot provide exactly-once
+//! business execution, recover unrecorded external results, or roll back side effects.
+//! Persist jobs and external operation identifiers durably before acknowledging them,
+//! and record/reconcile results outside the handler deadline when necessary.
+
 use std::{
     any::Any, collections::BTreeMap, fmt, future::Future, pin::Pin, sync::Arc, time::Duration,
 };
@@ -22,10 +161,17 @@ use crate::{
     util::{non_empty_trimmed, redact::redact_text},
 };
 
+mod context;
+mod diagnostics;
+mod error;
+#[cfg(test)]
+mod handler_tests;
 mod handlers;
 mod runtime;
 use crate::bot::dedup::{EventDeduplicator, MemoryEventDeduplicator};
-pub use runtime::StreamProcessingPolicy;
+pub use context::StreamContext;
+pub use error::StreamError;
+pub use runtime::{StreamCancellationReason, StreamProcessingPolicy};
 
 /// Stream topic for robot message callbacks.
 pub const BOT_MESSAGE_TOPIC: &str = "/v1.0/im/bot/messages/get";
@@ -35,11 +181,12 @@ pub const CARD_CALLBACK_TOPIC: &str = "/v1.0/card/instances/callback";
 type StreamEventHandler = Arc<dyn Fn(StreamRunEvent) + Send + Sync + 'static>;
 type BoxStreamFrameFuture =
     Pin<Box<dyn Future<Output = Result<StreamFrameResponse>> + Send + 'static>>;
-type StreamFrameHandler = Arc<dyn Fn(StreamFrame) -> BoxStreamFrameFuture + Send + Sync + 'static>;
+type StreamFrameHandler =
+    Arc<dyn Fn(StreamContext, StreamFrame) -> BoxStreamFrameFuture + Send + Sync + 'static>;
 type CardCallbackFuture =
     Pin<Box<dyn Future<Output = Result<StreamFrameResponse>> + Send + 'static>>;
 type CardCallbackHandler =
-    Arc<dyn Fn(CardCallbackEvent) -> CardCallbackFuture + Send + Sync + 'static>;
+    Arc<dyn Fn(StreamContext, CardCallbackEvent) -> CardCallbackFuture + Send + Sync + 'static>;
 
 /// High-level Stream robot application.
 #[derive(Clone)]
@@ -87,7 +234,7 @@ pub struct StreamBotBuilder {
     client: Option<DingTalk>,
     credentials: Option<AppCredentials>,
     routes: Vec<Route>,
-    fallback: Option<Route>,
+    fallbacks: Vec<Route>,
     state: Option<BotState>,
     subscriptions: Vec<StreamSubscription>,
     subscriptions_replaced: bool,
@@ -108,7 +255,7 @@ impl StreamBotBuilder {
             client: None,
             credentials: None,
             routes: Vec::new(),
-            fallback: None,
+            fallbacks: Vec::new(),
             state: None,
             subscriptions: Vec::new(),
             subscriptions_replaced: false,
@@ -160,21 +307,26 @@ impl StreamBotBuilder {
         self
     }
 
-    /// Registers a route.
+    /// Appends a route. Conflicts and unreachable routes are rejected by [`Self::build`].
     #[must_use]
     pub fn route(mut self, route: Route) -> Self {
         self.routes.push(route);
         self
     }
 
-    /// Registers a fallback route that runs when no normal route matches.
+    /// Appends a fallback route used when no normal route matches.
+    ///
+    /// Fallbacks accumulate in registration order. Put specific fallbacks first
+    /// and catch-all handlers last. See [`Bot::fallback_route`].
     #[must_use]
     pub fn fallback_route(mut self, route: Route) -> Self {
-        self.fallback = Some(route);
+        self.fallbacks.push(route);
         self
     }
 
-    /// Configures shared application state available from [`crate::bot::BotContext::state`].
+    /// Configures shared state for bot, frame, and card handlers.
+    ///
+    /// Available through [`crate::bot::BotContext::state`] and [`StreamContext::state`].
     #[must_use]
     pub fn state<T>(mut self, state: T) -> Self
     where
@@ -244,7 +396,10 @@ impl StreamBotBuilder {
         self
     }
 
-    /// Registers a synchronous runtime event handler.
+    /// Registers an optional synchronous runtime event observer.
+    ///
+    /// Use this for metrics or custom observers. Structured `tracing` diagnostics
+    /// are emitted independently; avoid logging the same events twice.
     #[must_use]
     pub fn on_event<F>(mut self, handler: F) -> Self
     where
@@ -260,7 +415,7 @@ impl StreamBotBuilder {
             client,
             credentials,
             routes,
-            fallback,
+            fallbacks,
             state,
             subscriptions,
             subscriptions_replaced,
@@ -275,14 +430,14 @@ impl StreamBotBuilder {
             card_callback_handler,
         } = self;
 
-        let has_bot_route = !routes.is_empty() || fallback.is_some();
+        let has_bot_route = !routes.is_empty() || !fallbacks.is_empty();
         let has_frame_handler = frame_handler.is_some() || card_callback_handler.is_some();
         if !has_bot_route && !has_frame_handler {
             return Err(Error::InvalidConfig(
                 "stream bot route, frame handler, or card callback handler is required".to_string(),
             ));
         }
-        validate_bot_routes(&routes, fallback.as_ref())?;
+        validate_bot_routes(&routes, &fallbacks)?;
 
         let client = match client {
             Some(client) => client,
@@ -303,6 +458,7 @@ impl StreamBotBuilder {
             .reconnect_policy(reconnect)
             .processing_policy(processing)
             .deduplicator(Arc::clone(&deduplicator));
+        stream.state = state;
         if let Some(websocket_connect_timeout) = websocket_connect_timeout {
             stream = stream.websocket_connect_timeout(websocket_connect_timeout);
         }
@@ -312,11 +468,8 @@ impl StreamBotBuilder {
             for route in routes {
                 bot = bot.route(route);
             }
-            if let Some(route) = fallback {
+            for route in fallbacks {
                 bot = bot.fallback_route(route);
-            }
-            if let Some(state) = state {
-                bot = bot.state_arc(state);
             }
             stream = stream.bot(bot);
         }
@@ -363,6 +516,7 @@ impl StreamBotBuilder {
 #[derive(Clone)]
 pub struct StreamClient {
     client: DingTalk,
+    state: Option<BotState>,
     credentials: AppCredentials,
     subscriptions: Vec<StreamSubscription>,
     local_ip: Option<String>,
@@ -378,15 +532,26 @@ pub struct StreamClient {
 }
 
 impl StreamClient {
+    fn handler_context(&self) -> StreamContext {
+        StreamContext {
+            client: self.client.clone(),
+            state: self.state.clone(),
+        }
+    }
+
     /// Creates a Stream client builder.
     pub fn builder(client: DingTalk) -> Result<StreamClientBuilder> {
         StreamClientBuilder::new(client)
     }
 
-    /// Opens one Stream WebSocket connection and runs until the connection closes.
+    /// Opens one Stream WebSocket connection and drains accepted work when it closes.
+    ///
+    /// Uses [`StreamProcessingPolicy::disconnect_timeout`]. Errors are returned to
+    /// the caller without reconnecting; cancellation and frame events are still emitted.
     pub async fn run_once(&self) -> Result<StreamExit> {
         let mut shutdown = Box::pin(pending());
-        self.run_once_with_shutdown(1, shutdown.as_mut())
+        let mut connected_for = Duration::ZERO;
+        self.run_once_with_shutdown(1, shutdown.as_mut(), &mut connected_for)
             .await?
             .ok_or_else(|| Error::stream("unexpected shutdown"))
     }
@@ -395,6 +560,7 @@ impl StreamClient {
         &self,
         attempt: u32,
         mut shutdown: Pin<&mut F>,
+        connected_for: &mut Duration,
     ) -> Result<Option<StreamExit>>
     where
         F: Future<Output = ()> + ?Sized,
@@ -406,7 +572,7 @@ impl StreamClient {
             tokio::time::timeout(self.websocket_connect_timeout, connect_async(url.as_str()))
                 .await
                 .map_err(|_| Error::stream("websocket connect timed out"))?
-                .map_err(|source| Error::stream(format!("websocket connect failed: {source}")))
+                .map_err(Error::websocket_connect)
         };
         let (socket, _response) = tokio::select! {
             biased;
@@ -414,7 +580,7 @@ impl StreamClient {
             result = connect => result?,
         };
         self.emit_event(StreamRunEvent::ConnectionOpened { attempt });
-        let exit = self.run_socket(socket, shutdown).await?;
+        let exit = self.run_socket(socket, shutdown, connected_for).await?;
         if let Some(exit) = exit {
             self.emit_event(StreamRunEvent::ConnectionClosed { attempt, exit });
         }
@@ -426,7 +592,10 @@ impl StreamClient {
         self.run_until(pending()).await
     }
 
-    /// Runs the Stream client with reconnect backoff until `shutdown` resolves.
+    /// Runs with reconnect backoff until `shutdown` resolves, then drains accepted work.
+    ///
+    /// Server disconnects drain before reconnecting. See the module's processing,
+    /// cancellation, and deduplication contracts.
     pub async fn run_until<F>(&self, shutdown: F) -> Result<()>
     where
         F: Future<Output = ()>,
@@ -434,10 +603,12 @@ impl StreamClient {
         let shutdown = shutdown.fuse();
         pin_mut!(shutdown);
         let mut attempt = 1_u32;
+        let mut consecutive_failures = 0_u32;
 
         loop {
+            let mut connected_for = Duration::ZERO;
             let run_result = self
-                .run_once_with_shutdown(attempt, shutdown.as_mut())
+                .run_once_with_shutdown(attempt, shutdown.as_mut(), &mut connected_for)
                 .await;
             match run_result {
                 Ok(None) => {
@@ -454,7 +625,7 @@ impl StreamClient {
                     self.emit_event(StreamRunEvent::ConnectionError {
                         attempt,
                         retrying,
-                        error: error.to_string(),
+                        error: StreamError::from(&error),
                     });
                     if !self.reconnect.retry_on_error {
                         return Err(error);
@@ -462,10 +633,14 @@ impl StreamClient {
                 }
             }
 
-            let delay = self.reconnect.delay_for_attempt(attempt);
+            consecutive_failures = self
+                .reconnect
+                .failures_after_connection(consecutive_failures, connected_for);
+            let delay = self.reconnect.delay_for_failures(consecutive_failures);
             attempt = attempt.saturating_add(1);
             self.emit_event(StreamRunEvent::ReconnectScheduled {
                 next_attempt: attempt,
+                consecutive_failures,
                 delay,
             });
 
@@ -606,7 +781,7 @@ impl StreamClient {
         let payload = event.payload();
         let card_biz_id = payload.card_biz_id().map(ToOwned::to_owned);
         let action = payload.action().map(ToOwned::to_owned);
-        match handler(event).await {
+        match handler(self.handler_context(), event).await {
             Ok(response) => {
                 self.emit_event(StreamRunEvent::CardCallbackHandled {
                     message_id: message_id.clone(),
@@ -632,7 +807,7 @@ impl StreamClient {
             return Ok(StreamHandleResult::ack(StreamAck::not_found(message_id)));
         };
 
-        match handler(frame).await {
+        match handler(self.handler_context(), frame).await {
             Ok(response) => Ok(StreamHandleResult::ack(StreamAck::ok(
                 message_id,
                 StreamAckData::Response(response.into_value()),
@@ -664,6 +839,7 @@ impl StreamClient {
     }
 
     fn emit_event(&self, event: StreamRunEvent) {
+        event.trace();
         if let Some(handler) = &self.event_handler {
             handler(event);
         }
@@ -675,7 +851,7 @@ impl StreamClient {
         };
         self.emit_event(StreamRunEvent::FrameError {
             message_id: error.message_id.clone(),
-            error: error.error.to_string(),
+            error: StreamError::from(&error.error),
         });
     }
 }
@@ -720,6 +896,7 @@ impl StreamHandleResult {
 /// Builder for [`StreamClient`].
 pub struct StreamClientBuilder {
     client: DingTalk,
+    state: Option<BotState>,
     credentials: Option<AppCredentials>,
     subscriptions: Vec<StreamSubscription>,
     subscriptions_replaced: bool,
@@ -741,6 +918,7 @@ impl StreamClientBuilder {
         let websocket_connect_timeout = client.stream_connect_timeout();
         Ok(Self {
             client,
+            state: None,
             credentials,
             subscriptions: Vec::new(),
             subscriptions_replaced: false,
@@ -779,6 +957,19 @@ impl StreamClientBuilder {
     #[must_use]
     pub fn bot(mut self, bot: Bot) -> Self {
         self.bot = Some(bot);
+        self
+    }
+
+    /// Configures shared state for the bot router, frame handlers, and card callbacks.
+    ///
+    /// Overrides state on a supplied bot regardless of builder call order. When omitted,
+    /// the supplied bot's state is shared with Stream callbacks.
+    #[must_use]
+    pub fn state<T>(mut self, state: T) -> Self
+    where
+        T: Send + Sync + 'static,
+    {
+        self.state = Some(Arc::new(state));
         self
     }
 
@@ -842,9 +1033,10 @@ impl StreamClientBuilder {
         self
     }
 
-    /// Registers a synchronous runtime event handler.
+    /// Registers an optional synchronous runtime event observer.
     ///
-    /// Use this to bridge Stream lifecycle events into your logging or metrics system.
+    /// Use this for metrics or custom observers. Structured `tracing` diagnostics
+    /// are emitted independently; avoid logging the same events twice.
     #[must_use]
     pub fn on_event<F>(mut self, handler: F) -> Self
     where
@@ -891,9 +1083,18 @@ impl StreamClientBuilder {
         let credentials = self.credentials.ok_or(Error::MissingCredentials)?;
         credentials.validate()?;
         let client = self.client.with_app_credentials(credentials.clone())?;
+        let state = self
+            .state
+            .or_else(|| self.bot.as_ref().and_then(Bot::shared_state));
         let bot = self
             .bot
-            .map(|bot| bot.with_app_credentials(credentials.clone()))
+            .map(|bot| {
+                let bot = match &state {
+                    Some(state) => bot.state_arc(Arc::clone(state)),
+                    None => bot,
+                };
+                bot.with_app_credentials(credentials.clone())
+            })
             .transpose()?;
 
         let subscriptions = resolve_implicit_subscriptions(
@@ -919,6 +1120,7 @@ impl StreamClientBuilder {
 
         Ok(StreamClient {
             client,
+            state,
             credentials,
             subscriptions,
             local_ip,
@@ -942,6 +1144,9 @@ pub struct ReconnectPolicy {
     pub initial_delay: Duration,
     /// Maximum reconnect delay.
     pub max_delay: Duration,
+    /// Connection lifetime required to reset backoff, excluding connect and drain time.
+    /// The default is 60 seconds. Brief connections continue to increase backoff.
+    pub reset_after: Duration,
     /// Whether errors should be retried.
     pub retry_on_error: bool,
 }
@@ -951,6 +1156,7 @@ impl Default for ReconnectPolicy {
         Self {
             initial_delay: Duration::from_secs(1),
             max_delay: Duration::from_secs(30),
+            reset_after: Duration::from_secs(60),
             retry_on_error: true,
         }
     }
@@ -963,7 +1169,7 @@ impl ReconnectPolicy {
         Self {
             initial_delay,
             max_delay,
-            retry_on_error: true,
+            ..Self::default()
         }
     }
 
@@ -990,6 +1196,13 @@ impl ReconnectPolicy {
         self
     }
 
+    /// Sets how long a connection must stay open before its backoff is reset.
+    #[must_use]
+    pub fn reset_after(mut self, value: Duration) -> Self {
+        self.reset_after = value;
+        self
+    }
+
     /// Sets whether connection errors should be retried.
     #[must_use]
     pub fn retry_on_error(mut self, value: bool) -> Self {
@@ -1001,6 +1214,7 @@ impl ReconnectPolicy {
     pub fn validate(&self) -> Result<()> {
         validate_stream_duration("reconnect.initial_delay", self.initial_delay)?;
         validate_stream_duration("reconnect.max_delay", self.max_delay)?;
+        validate_stream_duration("reconnect.reset_after", self.reset_after)?;
         if self.max_delay < self.initial_delay {
             return Err(Error::invalid_input(
                 "reconnect.max_delay",
@@ -1010,11 +1224,20 @@ impl ReconnectPolicy {
         Ok(())
     }
 
-    /// Returns the reconnect delay for a one-based connection attempt number.
+    fn failures_after_connection(self, previous: u32, connected_for: Duration) -> u32 {
+        if connected_for >= self.reset_after {
+            0
+        } else {
+            previous.saturating_add(1)
+        }
+    }
+
+    /// Returns the delay for consecutive failed attempts or short-lived connections.
+    /// Zero (a stable connection) and one both use the initial delay.
     #[must_use]
-    pub fn delay_for_attempt(self, attempt: u32) -> Duration {
+    pub fn delay_for_failures(self, failures: u32) -> Duration {
         let mut delay = self.initial_delay.min(self.max_delay);
-        for _ in 1..attempt {
+        for _ in 1..failures {
             if delay.is_zero() || delay == self.max_delay {
                 break;
             }
@@ -1133,12 +1356,11 @@ fn normalize_subscriptions(
     Ok(normalized)
 }
 
-fn validate_bot_routes(routes: &[Route], fallback: Option<&Route>) -> Result<()> {
-    for route in routes {
-        route.validate()?;
-    }
-    if let Some(route) = fallback {
-        route.validate()?;
+fn validate_bot_routes(routes: &[Route], fallbacks: &[Route]) -> Result<()> {
+    for (kind, routes) in [("routes", routes), ("fallbacks", fallbacks)] {
+        for (index, route) in routes.iter().enumerate() {
+            route.validate_after(&routes[..index], kind)?;
+        }
     }
     Ok(())
 }
@@ -1280,22 +1502,32 @@ pub enum StreamRunEvent {
         attempt: u32,
         /// Whether the client will retry this error.
         retrying: bool,
-        /// Human-readable error text.
-        error: String,
+        /// Redacted error text and structured SDK metadata.
+        error: StreamError,
     },
     /// A reconnect sleep was scheduled.
     ReconnectScheduled {
         /// One-based number of the next connection attempt.
         next_attempt: u32,
+        /// Consecutive failures or short connections; zero after a stable connection.
+        consecutive_failures: u32,
         /// Delay before reconnecting.
         delay: Duration,
     },
-    /// A frame was acknowledged with an internal error.
+    /// Frame processing failed. A failure ACK is attempted only while connected.
     FrameError {
         /// DingTalk message id, when the frame could be parsed.
         message_id: Option<String>,
-        /// Human-readable error text.
-        error: String,
+        /// Redacted error text and structured SDK metadata.
+        error: StreamError,
+    },
+    /// Accepted frame processing was cancelled, possibly before its handler started.
+    /// External side effects may already have occurred; no successful ACK is implied.
+    FrameCancelled {
+        /// Stream frame message id.
+        message_id: String,
+        /// Why processing was cancelled.
+        reason: StreamCancellationReason,
     },
     /// A standard bot message callback frame was routed by the bot router.
     BotEventHandled {
@@ -2677,7 +2909,7 @@ mod tests {
             let original = builder.build().expect("custom client");
             let stream = StreamBot::from_client(original.clone())
                 .client_id_and_secret("stream-id", "stream-secret")
-                .on_text_command(ConversationScope::Any, "/check", |ctx, _| async move {
+                .on_text_command(ConversationScope::Any, "/check", |ctx| async move {
                     let api = ctx.client().openapi();
                     let credentials = api.credentials().ok_or(Error::MissingCredentials)?;
                     assert_eq!(credentials.app_key(), "stream-id");
@@ -2731,7 +2963,7 @@ mod tests {
         let bot = Bot::new(router_client.clone()).on_text_command(
             ConversationScope::Any,
             "/check",
-            |ctx, _| async move {
+            |ctx| async move {
                 let api = ctx.client().openapi();
                 assert_eq!(
                     api.credentials().map(AppCredentials::app_key),
@@ -2782,47 +3014,47 @@ mod tests {
         let streams = [
             StreamClient::builder(client.clone())
                 .expect("builder")
-                .on_frame(move |_| async move { Err::<(), _>(application_error()) })
+                .on_frame(move |_ctx, _| async move { Err::<(), _>(application_error()) })
                 .build()
                 .expect("stream"),
             StreamClient::builder(client.clone())
                 .expect("builder")
-                .on_frame(
-                    move |_| async move { Err::<StreamFrameResponse, _>(application_error()) },
-                )
+                .on_frame(move |_ctx, _| async move {
+                    Err::<StreamFrameResponse, _>(application_error())
+                })
                 .build()
                 .expect("stream"),
             StreamClient::builder(client.clone())
                 .expect("builder")
-                .on_card_callback(move |_| async move { Err::<(), _>(application_error()) })
+                .on_card_callback(move |_ctx, _| async move { Err::<(), _>(application_error()) })
                 .build()
                 .expect("stream"),
             StreamClient::builder(client.clone())
                 .expect("builder")
-                .on_card_callback(move |_| async move {
+                .on_card_callback(move |_ctx, _| async move {
                     Err::<StreamFrameResponse, _>(application_error())
                 })
                 .build()
                 .expect("stream"),
             StreamBot::from_client(client.clone())
-                .on_frame(move |_| async move { Err::<(), _>(application_error()) })
+                .on_frame(move |_ctx, _| async move { Err::<(), _>(application_error()) })
                 .build()
                 .expect("bot")
                 .client,
             StreamBot::from_client(client.clone())
-                .on_frame(
-                    move |_| async move { Err::<StreamFrameResponse, _>(application_error()) },
-                )
+                .on_frame(move |_ctx, _| async move {
+                    Err::<StreamFrameResponse, _>(application_error())
+                })
                 .build()
                 .expect("bot")
                 .client,
             StreamBot::from_client(client.clone())
-                .on_card_callback(move |_| async move { Err::<(), _>(application_error()) })
+                .on_card_callback(move |_ctx, _| async move { Err::<(), _>(application_error()) })
                 .build()
                 .expect("bot")
                 .client,
             StreamBot::from_client(client)
-                .on_card_callback(move |_| async move {
+                .on_card_callback(move |_ctx, _| async move {
                     Err::<StreamFrameResponse, _>(application_error())
                 })
                 .build()
@@ -2858,7 +3090,7 @@ mod tests {
     async fn stream_response_keeps_payload_and_sdk_error_category() {
         let stream = StreamBot::builder()
             .client_id_and_secret("id", "secret")
-            .on_card_callback(|_| async {
+            .on_card_callback(|_ctx, _| async {
                 Ok::<_, std::io::Error>(StreamFrameResponse::from_value(
                     serde_json::json!({"accepted":true}),
                 ))
@@ -2867,6 +3099,7 @@ mod tests {
             .expect("bot")
             .client;
         let response = stream.card_callback_handler.as_ref().expect("callback")(
+            stream.handler_context(),
             CardCallbackEvent::from_value(serde_json::json!({})),
         )
         .await
@@ -2874,7 +3107,7 @@ mod tests {
         assert_eq!(response.as_value()["accepted"], true);
         let stream = StreamBot::builder()
             .client_id_and_secret("id", "secret")
-            .on_frame(|_| async { Err::<(), _>(Error::MissingCredentials) })
+            .on_frame(|_ctx, _| async { Err::<(), _>(Error::MissingCredentials) })
             .build()
             .expect("bot")
             .client;
@@ -2882,9 +3115,10 @@ mod tests {
             r#"{"type":"EVENT","headers":{"topic":"test","messageId":"id"},"data":{}}"#,
         )
         .expect("frame");
-        let error = stream.frame_handler.as_ref().expect("handler")(frame)
-            .await
-            .expect_err("SDK error");
+        let error =
+            stream.frame_handler.as_ref().expect("handler")(stream.handler_context(), frame)
+                .await
+                .expect_err("SDK error");
         assert_eq!(error.kind(), crate::ErrorKind::MissingCredentials);
     }
 
@@ -2898,43 +3132,34 @@ mod tests {
         let high = || StreamBot::from_client(client.clone());
         let response = || StreamFrameResponse::from_value(serde_json::json!({"accepted":true}));
         let streams = [
-            (low().on_frame(|_| async {}).build().expect("stream"), false),
+            (
+                low().on_frame(|_ctx, _| async {}).build().expect("stream"),
+                false,
+            ),
             (
                 low()
-                    .on_frame(move |_| async move { response() })
+                    .on_frame(move |_ctx, _| async move { response() })
                     .build()
                     .expect("stream"),
                 true,
             ),
             (
                 low()
-                    .on_card_callback(|_| async {})
+                    .on_card_callback(|_ctx, _| async {})
                     .build()
                     .expect("stream"),
                 false,
             ),
             (
                 low()
-                    .on_card_callback(move |_| async move { response() })
+                    .on_card_callback(move |_ctx, _| async move { response() })
                     .build()
                     .expect("stream"),
                 true,
             ),
             (
-                high().on_frame(|_| async {}).build().expect("bot").client,
-                false,
-            ),
-            (
                 high()
-                    .on_frame(move |_| async move { response() })
-                    .build()
-                    .expect("bot")
-                    .client,
-                true,
-            ),
-            (
-                high()
-                    .on_card_callback(|_| async {})
+                    .on_frame(|_ctx, _| async {})
                     .build()
                     .expect("bot")
                     .client,
@@ -2942,7 +3167,23 @@ mod tests {
             ),
             (
                 high()
-                    .on_card_callback(move |_| async move { response() })
+                    .on_frame(move |_ctx, _| async move { response() })
+                    .build()
+                    .expect("bot")
+                    .client,
+                true,
+            ),
+            (
+                high()
+                    .on_card_callback(|_ctx, _| async {})
+                    .build()
+                    .expect("bot")
+                    .client,
+                false,
+            ),
+            (
+                high()
+                    .on_card_callback(move |_ctx, _| async move { response() })
                     .build()
                     .expect("bot")
                     .client,
@@ -2957,13 +3198,18 @@ mod tests {
                         .iter()
                         .any(|subscription| subscription.topic() == CARD_CALLBACK_TOPIC)
                 );
-                handler(CardCallbackEvent::from_value(serde_json::json!({}))).await
+                handler(
+                    stream.handler_context(),
+                    CardCallbackEvent::from_value(serde_json::json!({})),
+                )
+                .await
             } else {
                 let frame = StreamFrame::from_text(
                     r#"{"type":"EVENT","headers":{"topic":"test","messageId":"id"},"data":{}}"#,
                 )
                 .expect("frame");
-                stream.frame_handler.as_ref().expect("handler")(frame).await
+                stream.frame_handler.as_ref().expect("handler")(stream.handler_context(), frame)
+                    .await
             }
             .expect("response");
             assert_eq!(
@@ -2978,7 +3224,7 @@ mod tests {
     }
 
     fn test_bot(client: DingTalk) -> Bot {
-        Bot::new(client).route(Route::new(ConversationScope::Any).handle(|_ctx, _event| async {}))
+        Bot::new(client).route(Route::new(ConversationScope::Any).handle(|_ctx| async {}))
     }
 
     #[test]
@@ -3289,31 +3535,55 @@ mod tests {
     fn reconnect_policy_uses_initial_delay_for_first_retry() {
         let policy = ReconnectPolicy::new(Duration::from_secs(2), Duration::from_secs(30));
 
-        assert_eq!(policy.delay_for_attempt(0), Duration::from_secs(2));
-        assert_eq!(policy.delay_for_attempt(1), Duration::from_secs(2));
-        assert_eq!(policy.delay_for_attempt(2), Duration::from_secs(4));
-        assert_eq!(policy.delay_for_attempt(10), Duration::from_secs(30));
+        assert_eq!(policy.delay_for_failures(0), Duration::from_secs(2));
+        assert_eq!(policy.delay_for_failures(1), Duration::from_secs(2));
+        assert_eq!(policy.delay_for_failures(2), Duration::from_secs(4));
+        assert_eq!(policy.delay_for_failures(10), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn reconnect_streak_counts_failures_and_short_connections_not_lifetime_attempts() {
+        let policy = ReconnectPolicy::default();
+        assert_eq!(policy.failures_after_connection(9, Duration::ZERO), 10);
+        assert_eq!(
+            policy.failures_after_connection(9, Duration::from_secs(59)),
+            10
+        );
+        assert_eq!(
+            policy.failures_after_connection(9, Duration::from_secs(60)),
+            0
+        );
+        assert_eq!(
+            policy.failures_after_connection(0, Duration::from_secs(1)),
+            1
+        );
+        assert_eq!(
+            policy.failures_after_connection(u32::MAX, Duration::ZERO),
+            u32::MAX
+        );
+        assert!(policy.reset_after(Duration::ZERO).validate().is_err());
+        assert!(policy.reset_after(Duration::MAX).validate().is_err());
     }
 
     #[test]
     fn reconnect_backoff_keeps_growing_until_the_configured_maximum() {
         let policy = ReconnectPolicy::new(Duration::from_millis(1), Duration::from_secs(30));
 
-        assert_eq!(policy.delay_for_attempt(11), Duration::from_millis(1024));
-        assert_eq!(policy.delay_for_attempt(12), Duration::from_millis(2048));
-        assert_eq!(policy.delay_for_attempt(16), Duration::from_secs(30));
-        assert_eq!(policy.delay_for_attempt(u32::MAX), Duration::from_secs(30));
+        assert_eq!(policy.delay_for_failures(11), Duration::from_millis(1024));
+        assert_eq!(policy.delay_for_failures(12), Duration::from_millis(2048));
+        assert_eq!(policy.delay_for_failures(16), Duration::from_secs(30));
+        assert_eq!(policy.delay_for_failures(u32::MAX), Duration::from_secs(30));
 
         let policy = ReconnectPolicy::new(Duration::from_nanos(1), Duration::MAX);
         assert_eq!(
-            policy.delay_for_attempt(33),
+            policy.delay_for_failures(33),
             Duration::from_nanos(1_u64 << 32)
         );
-        assert_eq!(policy.delay_for_attempt(u32::MAX), Duration::MAX);
+        assert_eq!(policy.delay_for_failures(u32::MAX), Duration::MAX);
         assert_eq!(
             policy
                 .initial_delay(Duration::ZERO)
-                .delay_for_attempt(u32::MAX),
+                .delay_for_failures(u32::MAX),
             Duration::ZERO
         );
     }
@@ -3342,7 +3612,7 @@ mod tests {
             .max_delay(Duration::from_secs(10));
 
         assert!(!policy.retry_on_error);
-        assert_eq!(policy.delay_for_attempt(2), Duration::from_secs(6));
+        assert_eq!(policy.delay_for_failures(2), Duration::from_secs(6));
         assert!(policy.validate().is_ok());
 
         let invalid = policy.max_delay(Duration::from_secs(1));
@@ -3410,7 +3680,7 @@ mod tests {
 
         let stream = StreamClient::builder(client)
             .expect("builder")
-            .on_card_callback(|_event| async {})
+            .on_card_callback(|_ctx, _event| async {})
             .build()
             .expect("stream");
 
@@ -3428,7 +3698,7 @@ mod tests {
 
         let stream = StreamClient::builder(client)
             .expect("builder")
-            .on_frame(|_frame| async {})
+            .on_frame(|_ctx, _frame| async {})
             .build()
             .expect("stream");
 
@@ -3445,13 +3715,13 @@ mod tests {
         let stream = StreamClient::builder(client.clone())
             .expect("builder")
             .websocket_connect_timeout(Duration::from_secs(9))
-            .on_frame(|_frame| async {})
+            .on_frame(|_ctx, _frame| async {})
             .build()
             .expect("stream");
         let invalid = StreamClient::builder(client)
             .expect("builder")
             .websocket_connect_timeout(Duration::ZERO)
-            .on_frame(|_frame| async {})
+            .on_frame(|_ctx, _frame| async {})
             .build()
             .err()
             .expect("zero websocket timeout should fail");
@@ -3465,7 +3735,7 @@ mod tests {
         let stream = StreamBot::builder()
             .client_id_and_secret("client-id", "client-secret")
             .websocket_connect_timeout(Duration::from_secs(9))
-            .on_frame(|_frame| async {})
+            .on_frame(|_ctx, _frame| async {})
             .build()
             .expect("stream bot");
 
@@ -3495,7 +3765,7 @@ mod tests {
         let result = StreamClient::builder(client)
             .expect("builder")
             .subscriptions(vec![StreamSubscription::callback(" ")])
-            .on_frame(|_frame| async {})
+            .on_frame(|_ctx, _frame| async {})
             .build();
         let Err(error) = result else {
             panic!("empty topic should fail");
@@ -3514,7 +3784,7 @@ mod tests {
         let result = StreamClient::builder(client)
             .expect("builder")
             .subscriptions(vec![StreamSubscription::callback("/v1.0/example events")])
-            .on_frame(|_frame| async {})
+            .on_frame(|_ctx, _frame| async {})
             .build();
         let Err(error) = result else {
             panic!("topic should not contain whitespace");
@@ -3533,7 +3803,7 @@ mod tests {
         let result = StreamClient::builder(client)
             .expect("builder")
             .user_agent(" dingding/0.1 ")
-            .on_frame(|_frame| async {})
+            .on_frame(|_ctx, _frame| async {})
             .build();
         let Err(error) = result else {
             panic!("user agent should not be rewritten");
@@ -3560,7 +3830,7 @@ mod tests {
 
         let result = StreamClient::builder(client)
             .expect("builder")
-            .on_frame(|_frame| async {})
+            .on_frame(|_ctx, _frame| async {})
             .build();
         let Err(error) = result else {
             panic!("credentials should be required");
@@ -3611,7 +3881,7 @@ mod tests {
     fn stream_bot_builder_builds_from_credentials() {
         let result = StreamBot::builder()
             .client_id_and_secret("client-id", "client-secret")
-            .route(Route::new(ConversationScope::Any).handle(|_ctx, _event| async {}))
+            .route(Route::new(ConversationScope::Any).handle(|_ctx| async {}))
             .build();
 
         assert!(result.is_ok());
@@ -3647,9 +3917,9 @@ mod tests {
     fn stream_bot_builder_registers_route_shortcuts() {
         let result = StreamBot::builder()
             .client_id_and_secret("client-id", "client-secret")
-            .on_group_text_command("/ping", |_ctx, _event| async {})
-            .on_private_text_commands(["/help", "help"], |_ctx, _event| async {})
-            .on_private_message(MessageType::Picture, |_ctx, _event| async {})
+            .on_group_text_command("/ping", |_ctx| async {})
+            .on_private_text_commands(["/help", "help"], |_ctx| async {})
+            .on_private_message(MessageType::Picture, |_ctx| async {})
             .build();
 
         assert!(result.is_ok());
@@ -3661,7 +3931,7 @@ mod tests {
         let seen_events = Arc::clone(&seen);
         let stream_bot = StreamBot::builder()
             .client_id_and_secret("client-id", "client-secret")
-            .on_group_text_command("/ping", |_ctx, _event| async {})
+            .on_group_text_command("/ping", |_ctx| async {})
             .on_event(move |event| {
                 seen_events.lock().expect("event lock").push(event);
             })
@@ -3704,7 +3974,7 @@ mod tests {
         let seen_topic = Arc::clone(&seen);
         let stream_bot = StreamBot::builder()
             .client_id_and_secret("client-id", "client-secret")
-            .on_frame(move |frame| {
+            .on_frame(move |_ctx, frame| {
                 let seen_topic = Arc::clone(&seen_topic);
                 async move {
                     *seen_topic.lock().expect("topic lock") = Some(frame.topic().to_string());
@@ -3822,7 +4092,7 @@ mod tests {
         let result = StreamBot::builder()
             .client_id_and_secret("client-id", "client-secret")
             .subscription(StreamSubscription::event("/v1.0/example/events"))
-            .on_frame(|_frame| async {})
+            .on_frame(|_ctx, _frame| async {})
             .build();
 
         assert!(result.is_ok());
@@ -3833,7 +4103,7 @@ mod tests {
         let result = StreamBot::builder()
             .client_id_and_secret("client-id", "client-secret")
             .subscription(StreamSubscription::event("/v1.0/example/events"))
-            .on_frame(|_frame| async {
+            .on_frame(|_ctx, _frame| async {
                 StreamFrameResponse::json(serde_json::json!({ "accepted": true }))
             })
             .build();
@@ -3845,7 +4115,7 @@ mod tests {
     fn stream_bot_builder_registers_card_callback_handler() {
         let stream = StreamBot::builder()
             .client_id_and_secret("client-id", "client-secret")
-            .on_card_callback(|_event| async {})
+            .on_card_callback(|_ctx, _event| async {})
             .build()
             .expect("stream bot");
 
@@ -3877,7 +4147,7 @@ mod tests {
         let seen_events = Arc::clone(&events);
         let stream = StreamClient::builder(client)
             .expect("builder")
-            .on_card_callback(move |event| {
+            .on_card_callback(move |_ctx, event| {
                 let seen_event = Arc::clone(&seen_event);
                 async move {
                     *seen_event.lock().expect("card lock") = Some((
@@ -4159,7 +4429,7 @@ mod tests {
         let stream = StreamClient::builder(client)
             .expect("builder")
             .subscriptions(vec![StreamSubscription::event("/v1.0/example/events")])
-            .on_frame(move |frame| {
+            .on_frame(move |_ctx, frame| {
                 let seen_frame = Arc::clone(&seen_frame);
                 async move {
                     let data = frame.data_json()?;
@@ -4212,7 +4482,7 @@ mod tests {
         let stream = StreamClient::builder(client)
             .expect("builder")
             .subscriptions(vec![StreamSubscription::event("/v1.0/example/events")])
-            .on_frame(|frame| async move {
+            .on_frame(|_ctx, frame| async move {
                 let data = frame.data_json()?;
                 StreamFrameResponse::json(serde_json::json!({
                     "topic": frame.topic(),
@@ -4258,7 +4528,7 @@ mod tests {
         let seen_topic = Arc::clone(&seen);
         let stream = StreamClient::builder(client)
             .expect("builder")
-            .on_frame(move |frame| {
+            .on_frame(move |_ctx, frame| {
                 let seen_topic = Arc::clone(&seen_topic);
                 async move {
                     *seen_topic.lock().expect("topic lock") = Some(frame.topic().to_string());

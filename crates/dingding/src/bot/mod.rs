@@ -1,3 +1,64 @@
+//! Route incoming callbacks and reply using typed conversation contexts.
+//!
+//! [`Bot`] accepts routes directly or via shortcuts. Group-only shortcuts pass a
+//! [`GroupContext`]; private-only shortcuts pass a [`PrivateContext`]. Methods
+//! accepting an explicit [`ConversationScope`] use the general [`BotContext`].
+//! All accept `()`, SDK results, and application results. [`crate::handler_future`]
+//! resolves the error type of inline async blocks using both `?` and `Ok(...)`.
+//!
+//! ```
+//! use dingding::{DingTalk, HandlerResult, bot::*};
+//!
+//! async fn group(ctx: GroupContext) -> HandlerResult {
+//!     let message = String::from_utf8(b"pong".to_vec())?;
+//!     ctx.reply_text(message).await?;
+//!     Ok(())
+//! }
+//!
+//! # fn example() -> dingding::Result<()> {
+//! let bot = Bot::new(DingTalk::new()?).on_group_text_command("/ping", group);
+//! bot.validate()?;
+//! # Ok(()) }
+//! ```
+//!
+//! The optional `#[handler]` macro produces routes with the same return-type
+//! support. It is not required for routing. Store application data with
+//! [`Bot::state`] and access it through [`BotContext::state_required`]. The type
+//! requested must match the stored type, including any `Arc` wrapper.
+//!
+//! # Routing rules
+//!
+//! Normal routes are checked first, in registration order. If none matches,
+//! fallback routes are checked in their own registration order. Fallbacks accumulate:
+//! group and private fallbacks can coexist. Register a catch-all last.
+//!
+//! Validation rejects duplicate command aliases across overlapping scopes (`Any`
+//! overlaps both `Group` and `Private`), and routes fully hidden by an earlier
+//! catch-all. The same command in disjoint group/private scopes is allowed.
+//! [`Bot::validate`] and Stream builder validation apply these rules before dispatch.
+//!
+//! Handlers take a single context; access the event through [`BotContext::event`].
+//! The `#[handler]` macro accepts zero arguments or one context.
+//! Frame/card callbacks use a separate
+//! `(StreamContext, event)` signature.
+//!
+//! # Replies and background jobs
+//!
+//! [`BotContext::reply_text`], [`BotContext::reply_markdown`], and
+//! [`BotContext::reply_message`] use only the event's session webhook. A missing or
+//! known-expired webhook is rejected before sending. Use
+//! [`BotContext::is_session_webhook_expired`] and
+//! [`BotContext::session_webhook_expires_at`] to inspect expiry. Missing expiry
+//! metadata does not guarantee that the URL is still valid.
+//!
+//! With `openapi`, `ctx.reply_via_robot(&robot, message)` explicitly chooses proactive
+//! messaging. For delayed work, persist `ctx.robot_reply_target()?` (also available
+//! on [`BotEvent`]) with the job and the application's identity. The target contains
+//! only a group conversation id or private staff id, not credentials or session URLs.
+//! Protect recipient ids as sensitive data. A worker supplies the matching `RobotApi`.
+//! These APIs require proactive-message permissions, never guess a missing staff id
+//! from `senderId`, and never switch channels after an ambiguous send failure.
+
 use std::{
     any::{Any, type_name},
     convert::Infallible,
@@ -25,7 +86,7 @@ mod reply;
 use dedup::{Deduplication, EventDeduplicator, MemoryEventDeduplicator};
 
 type BoxFuture = Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
-type BoxedHandler = Arc<dyn Fn(BotContext, BotEvent) -> BoxFuture + Send + Sync + 'static>;
+type BoxedHandler = Arc<dyn Fn(BotContext) -> BoxFuture + Send + Sync + 'static>;
 pub(crate) type BotState = Arc<dyn Any + Send + Sync + 'static>;
 
 /// Conversation scope used by bot routing.
@@ -1809,26 +1870,28 @@ impl Route {
         self
     }
 
-    /// Attaches a handler returning `()` or an SDK/application result.
+    /// Attaches a context-only handler returning `()` or an SDK/application result.
     ///
-    /// Use [`crate::HandlerResult`] when combining SDK calls with other fallible work.
+    /// The complete event is available through [`BotContext::event`].
+    /// Use [`crate::HandlerResult`] for named functions combining SDK and application errors,
+    /// or [`crate::handler_future`] inside a closure to infer its result's error type.
     ///
     /// ```
     /// # use dingding::{Result, bot::{Route, ConversationScope}};
     /// # fn main() -> Result<()> {
-    /// let route = Route::new(ConversationScope::Any).handle(|_, _| async {});
+    /// let route = Route::new(ConversationScope::Any).handle(|_| async {});
     /// route.validate()?;
     /// # Ok(()) }
     /// ```
     #[must_use]
     pub fn handle<F, Fut>(mut self, handler: F) -> Self
     where
-        F: Fn(BotContext, BotEvent) -> Fut + Send + Sync + 'static,
+        F: Fn(BotContext) -> Fut + Send + Sync + 'static,
         Fut: Future + Send + 'static,
         Fut::Output: IntoHandlerResult,
     {
-        self.handler = Some(Arc::new(move |ctx, event| {
-            let future = handler(ctx, event);
+        self.handler = Some(Arc::new(move |ctx| {
+            let future = handler(ctx);
             Box::pin(async move { future.await.into_handler_result() })
         }));
         self
@@ -1838,17 +1901,17 @@ impl Route {
     #[must_use]
     pub fn handle_group<F, Fut>(mut self, handler: F) -> Self
     where
-        F: Fn(GroupContext, BotEvent) -> Fut + Send + Sync + 'static,
+        F: Fn(GroupContext) -> Fut + Send + Sync + 'static,
         Fut: Future + Send + 'static,
         Fut::Output: IntoHandlerResult,
     {
         self.scope = ConversationScope::Group;
         let handler = Arc::new(handler);
-        self.handler = Some(Arc::new(move |ctx, event| {
+        self.handler = Some(Arc::new(move |ctx| {
             let handler = Arc::clone(&handler);
             Box::pin(async move {
                 let ctx = ctx.into_group()?;
-                handler(ctx, event).await.into_handler_result()
+                handler(ctx).await.into_handler_result()
             })
         }));
         self
@@ -1858,17 +1921,17 @@ impl Route {
     #[must_use]
     pub fn handle_private<F, Fut>(mut self, handler: F) -> Self
     where
-        F: Fn(PrivateContext, BotEvent) -> Fut + Send + Sync + 'static,
+        F: Fn(PrivateContext) -> Fut + Send + Sync + 'static,
         Fut: Future + Send + 'static,
         Fut::Output: IntoHandlerResult,
     {
         self.scope = ConversationScope::Private;
         let handler = Arc::new(handler);
-        self.handler = Some(Arc::new(move |ctx, event| {
+        self.handler = Some(Arc::new(move |ctx| {
             let handler = Arc::clone(&handler);
             Box::pin(async move {
                 let ctx = ctx.into_private()?;
-                handler(ctx, event).await.into_handler_result()
+                handler(ctx).await.into_handler_result()
             })
         }));
         self
@@ -1896,6 +1959,38 @@ impl Route {
         self.scope.accepts(&event.conversation_scope)
             && self.message_type.accepts(&event.message_type)
             && self.command_matches(event)
+    }
+
+    pub(crate) fn validate_after(&self, previous: &[Self], kind: &str) -> Result<()> {
+        self.validate()?;
+        for (index, route) in previous.iter().enumerate() {
+            let scopes_overlap =
+                self.scope.accepts(&route.scope) || route.scope.accepts(&self.scope);
+            if scopes_overlap
+                && let (Some(commands), Some(existing)) = (&self.commands, &route.commands)
+                && let Some(command) = commands.iter().find(|command| existing.contains(command))
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "{kind}[{}] command `{command}` overlaps {kind}[{index}] in conversation scope; use one handler or disjoint group/private scopes",
+                    previous.len(),
+                )));
+            }
+            let message_type = if self.commands.is_some() {
+                &MessageType::Text
+            } else {
+                &self.message_type
+            };
+            if route.commands.is_none()
+                && route.scope.accepts(&self.scope)
+                && route.message_type.accepts(message_type)
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "{kind}[{}] is unreachable because {kind}[{index}] matches all its messages; register specific handlers first and catch-all handlers last",
+                    previous.len(),
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn command_matches(&self, event: &BotEvent) -> bool {
@@ -1984,13 +2079,9 @@ fn dispatch_route(
     event: BotEvent,
 ) -> Option<BoxFuture> {
     let handler = route.handler.as_ref()?;
-    let ctx = BotContext::new(
-        client.clone(),
-        event.clone(),
-        route.matched_command(&event),
-        state.cloned(),
-    );
-    Some(handler(ctx, event))
+    let command = route.matched_command(&event);
+    let ctx = BotContext::new(client.clone(), event, command, state.cloned());
+    Some(handler(ctx))
 }
 
 #[derive(Clone)]
@@ -2024,10 +2115,9 @@ impl BotValidationError {
 pub struct Bot {
     client: DingTalk,
     routes: Vec<Route>,
-    fallback: Option<Route>,
+    fallbacks: Vec<Route>,
     state: Option<BotState>,
     validation_error: Option<BotValidationError>,
-    fallback_validation_error: Option<BotValidationError>,
     deduplicator: Arc<dyn EventDeduplicator>,
 }
 
@@ -2038,10 +2128,9 @@ impl Bot {
         Self {
             client,
             routes: Vec::new(),
-            fallback: None,
+            fallbacks: Vec::new(),
             state: None,
             validation_error: None,
-            fallback_validation_error: None,
             deduplicator: Arc::new(MemoryEventDeduplicator::default()),
         }
     }
@@ -2070,6 +2159,11 @@ impl Bot {
     }
 
     #[cfg(feature = "stream")]
+    pub(crate) fn shared_state(&self) -> Option<BotState> {
+        self.state.clone()
+    }
+
+    #[cfg(feature = "stream")]
     pub(crate) fn with_app_credentials(
         mut self,
         credentials: crate::auth::AppCredentials,
@@ -2080,22 +2174,29 @@ impl Bot {
 
     #[cfg(feature = "stream")]
     pub(crate) fn has_routes(&self) -> bool {
-        !self.routes.is_empty() || self.fallback.is_some()
+        !self.routes.is_empty() || !self.fallbacks.is_empty()
     }
 
-    /// Registers a route.
+    /// Appends a route. The first matching normal route handles each event.
+    ///
+    /// Duplicate commands in overlapping scopes and routes fully shadowed by an
+    /// earlier catch-all are rejected by [`Self::validate`].
     #[must_use]
     pub fn route(mut self, route: Route) -> Self {
-        self.record_validation(route.validate());
+        self.record_validation(route.validate_after(&self.routes, "routes"));
         self.routes.push(route);
         self
     }
 
-    /// Registers a fallback route that runs when no normal route matches.
+    /// Appends a fallback route, used only when no normal route matches.
+    ///
+    /// Fallbacks accumulate and are matched in registration order. Register
+    /// scope/message-specific fallbacks before a catch-all. Unreachable fallbacks
+    /// are rejected by [`Self::validate`] instead of silently replacing a handler.
     #[must_use]
     pub fn fallback_route(mut self, route: Route) -> Self {
-        self.fallback_validation_error = route.validate().err().map(BotValidationError::from_error);
-        self.fallback = Some(route);
+        self.record_validation(route.validate_after(&self.fallbacks, "fallbacks"));
+        self.fallbacks.push(route);
         self
     }
 
@@ -2148,12 +2249,14 @@ impl Bot {
             }
         }
 
-        if let Some(route) = &self.fallback
-            && route.matches(&event)
-            && let Some(handler) = dispatch_route(&self.client, self.state.as_ref(), route, event)
-        {
-            handler.await?;
-            return Ok(HandleOutcome::Fallback);
+        for route in &self.fallbacks {
+            if route.matches(&event)
+                && let Some(handler) =
+                    dispatch_route(&self.client, self.state.as_ref(), route, event.clone())
+            {
+                handler.await?;
+                return Ok(HandleOutcome::Fallback);
+            }
         }
 
         Ok(HandleOutcome::Ignored)
@@ -2161,11 +2264,7 @@ impl Bot {
 
     /// Validates all configured routes.
     pub fn validate(&self) -> Result<()> {
-        if let Some(error) = self
-            .validation_error
-            .as_ref()
-            .or(self.fallback_validation_error.as_ref())
-        {
+        if let Some(error) = &self.validation_error {
             return Err(error.to_error());
         }
         Ok(())
@@ -2435,16 +2534,13 @@ mod tests {
         let client = DingTalk::builder().build().expect("client");
         let hit = Arc::new(AtomicBool::new(false));
         let seen = Arc::clone(&hit);
-        let bot = Bot::new(client).on_text_command(
-            ConversationScope::Group,
-            "/ping",
-            move |_ctx, _event| {
+        let bot =
+            Bot::new(client).on_text_command(ConversationScope::Group, "/ping", move |_ctx| {
                 let seen = Arc::clone(&seen);
                 async move {
                     seen.store(true, Ordering::SeqCst);
                 }
-            },
-        );
+            });
 
         let outcome = bot
             .handle_event(BotEvent::text(ConversationScope::Group, "/ping"))
@@ -2460,17 +2556,14 @@ mod tests {
         let client = DingTalk::builder().build().expect("client");
         let hit = Arc::new(AtomicBool::new(false));
         let seen = Arc::clone(&hit);
-        let bot = Bot::new(client).on_message(
-            ConversationScope::Any,
-            MessageType::Picture,
-            move |ctx, _event| {
+        let bot =
+            Bot::new(client).on_message(ConversationScope::Any, MessageType::Picture, move |ctx| {
                 let seen = Arc::clone(&seen);
                 async move {
                     assert_eq!(ctx.message_type(), &MessageType::Picture);
                     seen.store(true, Ordering::SeqCst);
                 }
-            },
-        );
+            });
         let event = BotEvent::from_value(serde_json::json!({
             "conversationType": "2",
             "msgtype": "picture",
@@ -2493,14 +2586,14 @@ mod tests {
         let seen_group = Arc::clone(&group_hit);
         let seen_private = Arc::clone(&private_hit);
         let bot = Bot::new(client)
-            .on_group_text_command("/group", move |ctx, _event| {
+            .on_group_text_command("/group", move |ctx| {
                 let seen_group = Arc::clone(&seen_group);
                 async move {
                     assert!(ctx.is_group());
                     seen_group.store(true, Ordering::SeqCst);
                 }
             })
-            .on_private_text_command("/private", move |ctx, _event| {
+            .on_private_text_command("/private", move |ctx| {
                 let seen_private = Arc::clone(&seen_private);
                 async move {
                     assert!(ctx.is_private());
@@ -2535,7 +2628,7 @@ mod tests {
                 Route::new(ConversationScope::Any)
                     .message_type(MessageType::Text)
                     .command("/typed-group")
-                    .handle_group(move |ctx: GroupContext, _event| {
+                    .handle_group(move |ctx: GroupContext| {
                         let seen_group = Arc::clone(&seen_group);
                         async move {
                             assert!(ctx.is_group());
@@ -2547,7 +2640,7 @@ mod tests {
                 Route::new(ConversationScope::Any)
                     .message_type(MessageType::Text)
                     .command("/typed-private")
-                    .handle_private(move |ctx: PrivateContext, _event| {
+                    .handle_private(move |ctx: PrivateContext| {
                         let seen_private = Arc::clone(&seen_private);
                         async move {
                             assert!(ctx.is_private());
@@ -2583,19 +2676,15 @@ mod tests {
         let seen_sender = Arc::new(Mutex::new(None::<String>));
         let args_slot = Arc::clone(&seen_args);
         let sender_slot = Arc::clone(&seen_sender);
-        let bot = Bot::new(client).on_text_command(
-            ConversationScope::Group,
-            "/echo",
-            move |ctx, _event| {
-                let args_slot = Arc::clone(&args_slot);
-                let sender_slot = Arc::clone(&sender_slot);
-                async move {
-                    *args_slot.lock().expect("args lock") = ctx.args().map(ToOwned::to_owned);
-                    *sender_slot.lock().expect("sender lock") =
-                        ctx.sender_name().map(ToOwned::to_owned);
-                }
-            },
-        );
+        let bot = Bot::new(client).on_text_command(ConversationScope::Group, "/echo", move |ctx| {
+            let args_slot = Arc::clone(&args_slot);
+            let sender_slot = Arc::clone(&sender_slot);
+            async move {
+                *args_slot.lock().expect("args lock") = ctx.args().map(ToOwned::to_owned);
+                *sender_slot.lock().expect("sender lock") =
+                    ctx.sender_name().map(ToOwned::to_owned);
+            }
+        });
         let mut event = BotEvent::text(ConversationScope::Group, "  /echo hello world");
         event.sender_nick = Some("Alice".to_string());
 
@@ -2617,10 +2706,8 @@ mod tests {
         let client = DingTalk::builder().build().expect("client");
         let seen = Arc::new(Mutex::new(Vec::<String>::new()));
         let seen_args = Arc::clone(&seen);
-        let bot = Bot::new(client).on_text_command(
-            ConversationScope::Group,
-            "/deploy",
-            move |ctx, _event| {
+        let bot =
+            Bot::new(client).on_text_command(ConversationScope::Group, "/deploy", move |ctx| {
                 let seen_args = Arc::clone(&seen_args);
                 async move {
                     assert!(ctx.has_args());
@@ -2631,8 +2718,7 @@ mod tests {
                     *seen_args.lock().expect("args lock") =
                         ctx.args_vec().into_iter().map(ToOwned::to_owned).collect();
                 }
-            },
-        );
+            });
 
         let outcome = bot
             .handle_event(BotEvent::text(
@@ -2654,16 +2740,12 @@ mod tests {
         let client = DingTalk::builder().build().expect("client");
         let seen_args = Arc::new(Mutex::new(None::<String>));
         let args_slot = Arc::clone(&seen_args);
-        let bot = Bot::new(client).on_text_command(
-            ConversationScope::Group,
-            "/ping",
-            move |ctx, _event| {
-                let args_slot = Arc::clone(&args_slot);
-                async move {
-                    *args_slot.lock().expect("args lock") = ctx.args().map(ToOwned::to_owned);
-                }
-            },
-        );
+        let bot = Bot::new(client).on_text_command(ConversationScope::Group, "/ping", move |ctx| {
+            let args_slot = Arc::clone(&args_slot);
+            async move {
+                *args_slot.lock().expect("args lock") = ctx.args().map(ToOwned::to_owned);
+            }
+        });
 
         let outcome = bot
             .handle_event(BotEvent::text(
@@ -2685,7 +2767,7 @@ mod tests {
         let client = DingTalk::builder().build().expect("client");
         let seen = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
         let seen_aliases = Arc::clone(&seen);
-        let bot = Bot::new(client).on_group_text_commands(["/ping", "ping"], move |ctx, _event| {
+        let bot = Bot::new(client).on_group_text_commands(["/ping", "ping"], move |ctx| {
             let seen_aliases = Arc::clone(&seen_aliases);
             async move {
                 seen_aliases.lock().expect("alias lock").push((
@@ -2720,16 +2802,13 @@ mod tests {
         let client = DingTalk::builder().build().expect("client");
         let hit = Arc::new(AtomicBool::new(false));
         let seen = Arc::clone(&hit);
-        let bot = Bot::new(client).on_text_commands(
-            ConversationScope::Group,
-            [" ", ""],
-            move |_ctx, _event| {
+        let bot =
+            Bot::new(client).on_text_commands(ConversationScope::Group, [" ", ""], move |_ctx| {
                 let seen = Arc::clone(&seen);
                 async move {
                     seen.store(true, Ordering::SeqCst);
                 }
-            },
-        );
+            });
 
         let error = bot
             .handle_event(BotEvent::text(ConversationScope::Group, "/anything"))
@@ -2745,19 +2824,19 @@ mod tests {
         let untrimmed = Route::new(ConversationScope::Any)
             .message_type(MessageType::Text)
             .command(" /ping ")
-            .handle(|_ctx, _event| async {})
+            .handle(|_ctx| async {})
             .validate()
             .expect_err("commands should not be rewritten");
         let duplicate = Route::new(ConversationScope::Any)
             .message_type(MessageType::Text)
             .commands(["/ping", "/ping"])
-            .handle(|_ctx, _event| async {})
+            .handle(|_ctx| async {})
             .validate()
             .expect_err("duplicate aliases should fail");
         let non_text = Route::new(ConversationScope::Any)
             .message_type(MessageType::Picture)
             .command("/ping")
-            .handle(|_ctx, _event| async {})
+            .handle(|_ctx| async {})
             .validate()
             .expect_err("command routes should not be attached to non-text messages");
 
@@ -2784,16 +2863,13 @@ mod tests {
         let client = DingTalk::builder().build().expect("client");
         let hit = Arc::new(AtomicBool::new(false));
         let seen = Arc::clone(&hit);
-        let bot = Bot::new(client).on_text_command(
-            ConversationScope::Group,
-            "/ping",
-            move |_ctx, _event| {
+        let bot =
+            Bot::new(client).on_text_command(ConversationScope::Group, "/ping", move |_ctx| {
                 let seen = Arc::clone(&seen);
                 async move {
                     seen.store(true, Ordering::SeqCst);
                 }
-            },
-        );
+            });
 
         let outcome = bot
             .handle_event(BotEvent::text(ConversationScope::Group, "/pinged"))
@@ -2818,8 +2894,8 @@ mod tests {
         let hit = Arc::new(AtomicBool::new(false));
         let seen = Arc::clone(&hit);
         let bot = Bot::new(client)
-            .on_text_command(ConversationScope::Group, "/ping", |_ctx, _event| async {})
-            .on_unmatched_text(ConversationScope::Any, move |_ctx, _event| {
+            .on_text_command(ConversationScope::Group, "/ping", |_ctx| async {})
+            .on_unmatched_text(ConversationScope::Any, move |_ctx| {
                 let seen = Arc::clone(&seen);
                 async move {
                     seen.store(true, Ordering::SeqCst);
@@ -2836,32 +2912,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacing_invalid_fallback_clears_its_validation_error() {
+    async fn appending_fallback_does_not_hide_an_invalid_registration() {
         let client = DingTalk::builder().build().expect("client");
         let bot = Bot::new(client)
             .fallback_route(Route::new(ConversationScope::Any))
-            .fallback(|_, _| async {});
+            .fallback(|_| async {});
 
-        bot.validate().expect("replacement is valid");
-        let outcome = bot
+        assert!(bot.validate().is_err());
+        let error = bot
             .handle_event(BotEvent::text(ConversationScope::Private, "hello"))
             .await
-            .expect("replacement handles event");
-        assert_eq!(outcome, HandleOutcome::Fallback);
+            .expect_err("invalid fallback prevents dispatch");
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidConfig);
     }
 
     #[test]
-    fn fallback_replacement_preserves_current_route_errors() {
+    fn fallback_registration_preserves_current_route_errors() {
         let client = DingTalk::builder().build().expect("client");
         let bot = Bot::new(client.clone())
-            .fallback(|_, _| async {})
+            .fallback(|_| async {})
             .fallback_route(Route::new(ConversationScope::Any));
         assert!(bot.validate().is_err());
 
         let bot = Bot::new(client)
             .fallback_route(Route::new(ConversationScope::Any))
             .route(Route::new(ConversationScope::Group))
-            .fallback(|_, _| async {});
+            .fallback(|_| async {});
         assert!(bot.validate().is_err());
     }
 
@@ -2877,7 +2953,7 @@ mod tests {
         let seen_state = Arc::clone(&seen);
         let bot = Bot::new(client)
             .state(AppState { name: "ops" })
-            .on_text_command(ConversationScope::Group, "/state", move |ctx, _event| {
+            .on_text_command(ConversationScope::Group, "/state", move |ctx| {
                 let seen_state = Arc::clone(&seen_state);
                 async move {
                     *seen_state.lock().expect("state lock") =
@@ -2900,24 +2976,20 @@ mod tests {
         let client = DingTalk::builder().build().expect("client");
         let seen = Arc::new(Mutex::new(None::<(usize, Option<String>, Option<u64>)>));
         let seen_metadata = Arc::clone(&seen);
-        let bot = Bot::new(client).on_text_command(
-            ConversationScope::Group,
-            "/meta",
-            move |ctx, _event| {
-                let seen_metadata = Arc::clone(&seen_metadata);
-                async move {
-                    *seen_metadata.lock().expect("metadata lock") = Some((
-                        ctx.at_users().len(),
-                        ctx.session_webhook().map(ToOwned::to_owned),
-                        ctx.session_webhook_expires_at_millis(),
-                    ));
-                    assert_eq!(
-                        ctx.raw().get("messageId").and_then(Value::as_str),
-                        Some("m1")
-                    );
-                }
-            },
-        );
+        let bot = Bot::new(client).on_text_command(ConversationScope::Group, "/meta", move |ctx| {
+            let seen_metadata = Arc::clone(&seen_metadata);
+            async move {
+                *seen_metadata.lock().expect("metadata lock") = Some((
+                    ctx.at_users().len(),
+                    ctx.session_webhook().map(ToOwned::to_owned),
+                    ctx.session_webhook_expires_at_millis(),
+                ));
+                assert_eq!(
+                    ctx.raw().get("messageId").and_then(Value::as_str),
+                    Some("m1")
+                );
+            }
+        });
         let event = BotEvent::from_value(serde_json::json!({
             "conversationType": 2,
             "msgType": "text",
@@ -2950,10 +3022,8 @@ mod tests {
         let client = DingTalk::builder().build().expect("client");
         let seen = Arc::new(Mutex::new(None::<(Vec<String>, Vec<String>)>));
         let seen_mentions = Arc::clone(&seen);
-        let bot = Bot::new(client).on_text_command(
-            ConversationScope::Group,
-            "/mention",
-            move |ctx, _event| {
+        let bot =
+            Bot::new(client).on_text_command(ConversationScope::Group, "/mention", move |ctx| {
                 let seen_mentions = Arc::clone(&seen_mentions);
                 async move {
                     *seen_mentions.lock().expect("mention lock") = Some((
@@ -2961,8 +3031,7 @@ mod tests {
                         ctx.mentioned_users_at().user_ids,
                     ));
                 }
-            },
-        );
+            });
         let event = BotEvent::from_value(serde_json::json!({
             "conversationType": 2,
             "msgType": "text",
@@ -3009,7 +3078,7 @@ mod tests {
         let bot = Bot::new(client).on_message(
             ConversationScope::Private,
             MessageType::Picture,
-            move |ctx, _event| {
+            move |ctx| {
                 let seen_picture = Arc::clone(&seen_picture);
                 async move {
                     assert!(ctx.text_message().is_none());
@@ -3042,10 +3111,8 @@ mod tests {
         let client = DingTalk::builder().build().expect("client");
         let seen = Arc::new(Mutex::new(None::<(Option<SystemTime>, bool)>));
         let seen_expiration = Arc::clone(&seen);
-        let bot = Bot::new(client).on_text_command(
-            ConversationScope::Group,
-            "/expiry",
-            move |ctx, _event| {
+        let bot =
+            Bot::new(client).on_text_command(ConversationScope::Group, "/expiry", move |ctx| {
                 let seen_expiration = Arc::clone(&seen_expiration);
                 async move {
                     *seen_expiration.lock().expect("expiration lock") = Some((
@@ -3053,8 +3120,7 @@ mod tests {
                         ctx.is_session_webhook_expired(),
                     ));
                 }
-            },
-        );
+            });
         let event = BotEvent::from_value(serde_json::json!({
             "conversationType": 2,
             "msgType": "text",
@@ -3077,7 +3143,7 @@ mod tests {
         let bot = Bot::new(client).on_text_command(
             ConversationScope::Group,
             "/state",
-            |ctx, _event| async move {
+            |ctx| async move {
                 let _state = ctx.state_required::<AppState>()?;
                 Ok::<_, dingding::Error>(())
             },
@@ -3097,7 +3163,7 @@ mod tests {
         let bot = Bot::new(client).on_text_command(
             ConversationScope::Group,
             "/reply",
-            |ctx, _event| async move { ctx.reply_text("too late").await },
+            |ctx| async move { ctx.reply_text("too late").await },
         );
         let event = BotEvent::from_value(serde_json::json!({
             "conversationType": 2,
@@ -3122,7 +3188,7 @@ mod tests {
         let bot = Bot::new(client).on_text_command(
             ConversationScope::Group,
             "/reply",
-            |ctx, _event| async move {
+            |ctx| async move {
                 ctx.reply_text_response("hello").await?;
                 Ok::<_, dingding::Error>(())
             },
@@ -3142,7 +3208,7 @@ mod tests {
         let bot = Bot::new(client).on_text_command(
             ConversationScope::Group,
             "/reply",
-            |ctx, _event| async move {
+            |ctx| async move {
                 ctx.reply_text_with_at("hello", crate::webhook::At::new().all_users())
                     .await
             },
@@ -3701,16 +3767,13 @@ mod tests {
         let client = DingTalk::builder().build().expect("client");
         let hit = Arc::new(AtomicBool::new(false));
         let seen = Arc::clone(&hit);
-        let bot = Bot::new(client).on_text_command(
-            ConversationScope::Group,
-            "/ping",
-            move |_ctx, _event| {
+        let bot =
+            Bot::new(client).on_text_command(ConversationScope::Group, "/ping", move |_ctx| {
                 let seen = Arc::clone(&seen);
                 async move {
                     seen.store(true, Ordering::SeqCst);
                 }
-            },
-        );
+            });
         let verifier = CallbackVerifier::new(app_secret).expect("verifier");
         let body = serde_json::json!({
             "conversationType": "2",

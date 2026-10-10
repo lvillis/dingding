@@ -9,21 +9,22 @@ pub use crate::bot::{
 
 #[cfg(feature = "openapi")]
 pub use crate::openapi::{
-    DownloadedFile, GroupMessageQuery, GroupMessageReader, GroupMessageStatus, InteractiveCard,
-    InteractiveCardResponse, InteractiveCardSendOptions, InteractiveCardUpdate,
-    InteractiveCardUpdateOptions, MediaType, MediaUpload, MessageFileDownload, MessageReadInfo,
-    MessageRecallResponse, PrivateMessageStatus, RobotActionButton, RobotActionCard,
-    RobotActionCardLayout, RobotMessage, RobotMessageResponse, RobotVideo, UploadedMedia,
+    DownloadedFile, DownloadedFileInfo, GroupMessagePages, GroupMessageQuery, GroupMessageReader,
+    GroupMessageStatus, InteractiveCard, InteractiveCardResponse, InteractiveCardSendOptions,
+    InteractiveCardUpdate, InteractiveCardUpdateOptions, MediaFileUpload, MediaType, MediaUpload,
+    MessageFileDownload, MessageReadInfo, MessageRecallResponse, PrivateMessageStatus,
+    RobotActionButton, RobotActionCard, RobotActionCardLayout, RobotMessage, RobotMessageResponse,
+    RobotReplyTarget, RobotVideo, UploadedMedia,
 };
 
 #[cfg(feature = "stream")]
 pub use crate::stream::{
     BOT_MESSAGE_TOPIC, CARD_CALLBACK_TOPIC, CardCallbackActionValue, CardCallbackContent,
     CardCallbackEvent, CardCallbackOperator, CardCallbackPayload, CardCallbackPrivateData,
-    CardCallbackResponse, ReconnectPolicy, StreamBot, StreamBotBuilder, StreamClient,
-    StreamClientBuilder, StreamExit, StreamFrame, StreamFrameResponse, StreamFrameType,
-    StreamHeaders, StreamProcessingPolicy, StreamRunEvent, StreamSubscription,
-    StreamSubscriptionType,
+    CardCallbackResponse, ReconnectPolicy, StreamBot, StreamBotBuilder, StreamCancellationReason,
+    StreamClient, StreamClientBuilder, StreamContext, StreamError, StreamExit, StreamFrame,
+    StreamFrameResponse, StreamFrameType, StreamHeaders, StreamProcessingPolicy, StreamRunEvent,
+    StreamSubscription, StreamSubscriptionType,
 };
 
 #[cfg(feature = "webhook")]

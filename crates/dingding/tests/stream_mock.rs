@@ -13,8 +13,8 @@ use std::{
 use dingding::{
     DingTalk, Error,
     stream::{
-        CARD_CALLBACK_TOPIC, ReconnectPolicy, StreamClient, StreamFrameResponse,
-        StreamProcessingPolicy,
+        CARD_CALLBACK_TOPIC, ReconnectPolicy, StreamCancellationReason, StreamClient,
+        StreamFrameResponse, StreamProcessingPolicy, StreamRunEvent,
     },
 };
 use futures_util::{SinkExt, StreamExt};
@@ -28,6 +28,84 @@ use tokio::{
 use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
 type Socket = WebSocketStream<TcpStream>;
+
+#[derive(Clone, Default)]
+struct LogOutput(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogOutput {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("logs").extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn text_handler_failure_is_logged_without_an_event_observer() {
+    let (client, listener, http) = gateway(1).await;
+    let output = LogOutput::default();
+    let writer = output.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(move || writer.clone())
+        .finish();
+    // This integration-test process owns logging, just like an application.
+    tracing::subscriber::set_global_default(subscriber).expect("application subscriber");
+    let bot = dingding::stream::StreamBot::from_client(client)
+        .on_group_text_command("/fail", |_| async {
+            Err::<(), _>(std::io::Error::other("access_token=handler-secret"))
+        })
+        .build()
+        .expect("bot");
+    let (stop, shutdown) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        bot.run_until(async {
+            let _ = shutdown.await;
+        })
+        .await
+    });
+    let mut socket = accept(&listener).await;
+    let body = json!({"type":"CALLBACK", "headers":{
+        "topic":dingding::stream::BOT_MESSAGE_TOPIC, "messageId":"text-failure"
+    }, "data":{
+        "conversationType":"2", "msgtype":"text", "text":{"content":"/fail private-text-content"}
+    }});
+    send(&mut socket, Message::Text(body.to_string().into())).await;
+    assert_eq!(ack(&mut socket).await["code"], 500);
+    assert!(
+        !task.is_finished(),
+        "handler failure must not stop the runner"
+    );
+    stop.send(()).expect("shutdown");
+    bounded(task)
+        .await
+        .expect("task")
+        .expect("graceful shutdown");
+    bounded(http).await.expect("gateway task");
+    let logs = String::from_utf8(output.0.lock().expect("logs").clone()).expect("UTF-8");
+    for expected in [
+        "WARN",
+        "dingding::stream",
+        "text-failure",
+        "handler or frame processing failed",
+        "connection opened",
+        "shutdown requested",
+    ] {
+        assert!(logs.contains(expected), "missing {expected}: {logs}");
+    }
+    for secret in [
+        "handler-secret",
+        "private-text-content",
+        "client-secret",
+        "test-ticket",
+    ] {
+        assert!(!logs.contains(secret));
+    }
+}
 
 async fn bounded<T>(future: impl Future<Output = T>) -> T {
     tokio::time::timeout(Duration::from_secs(10), future)
@@ -148,7 +226,7 @@ async fn shutdown_preserves_heartbeats_but_rejects_new_business_frames() {
     let (started, mut starts) = mpsc::unbounded_channel();
     let stream = StreamClient::builder(client)
         .expect("builder")
-        .on_frame(move |frame| {
+        .on_frame(move |_ctx, frame| {
             let gate = Arc::clone(&gate);
             let started = started.clone();
             async move {
@@ -209,7 +287,7 @@ async fn slow_handlers_preserve_heartbeats_order_and_graceful_shutdown() {
     let (started, mut starts) = mpsc::unbounded_channel();
     let stream = StreamClient::builder(client)
         .expect("builder")
-        .on_frame(move |frame| {
+        .on_frame(move |_ctx, frame| {
             let gate = Arc::clone(&gate);
             let started = started.clone();
             async move {
@@ -259,7 +337,7 @@ async fn concurrency_and_queue_are_bounded_without_blocking_control_frames() {
             queue_capacity: 1,
             ..StreamProcessingPolicy::default()
         })
-        .on_frame(move |event| {
+        .on_frame(move |_ctx, event| {
             let gate = Arc::clone(&gate);
             let started = started.clone();
             async move {
@@ -310,16 +388,20 @@ async fn concurrency_and_queue_are_bounded_without_blocking_control_frames() {
 #[tokio::test]
 async fn timeout_failure_and_panic_allow_retry_and_success_is_deduplicated() {
     for failure in ["timeout", "error", "panic"] {
+        let (events, mut received) = mpsc::unbounded_channel();
         let (client, listener, http) = gateway(1).await;
         let calls = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&calls);
         let stream = StreamClient::builder(client)
             .expect("builder")
+            .on_event(move |event| {
+                let _ = events.send(event);
+            })
             .processing_policy(StreamProcessingPolicy {
                 handler_timeout: Duration::from_millis(100),
                 ..StreamProcessingPolicy::default()
             })
-            .on_frame(move |_| {
+            .on_frame(move |_ctx, _| {
                 let first = count.fetch_add(1, Ordering::SeqCst) == 0;
                 async move {
                     if first {
@@ -344,7 +426,323 @@ async fn timeout_failure_and_panic_allow_retry_and_success_is_deduplicated() {
         stop.send(()).expect("shutdown");
         bounded(task).await.expect("task").expect("shutdown");
         bounded(http).await.expect("gateway task");
+        let mut cancellations = Vec::new();
+        while let Ok(event) = received.try_recv() {
+            if let StreamRunEvent::FrameCancelled { message_id, reason } = event {
+                cancellations.push((message_id, reason));
+            }
+        }
+        let expected = if failure == "timeout" {
+            vec![(
+                "same-id".to_owned(),
+                StreamCancellationReason::HandlerTimeout,
+            )]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(cancellations, expected);
     }
+}
+
+#[tokio::test]
+async fn server_disconnect_drains_accepted_work_and_preserves_results_for_redelivery() {
+    for termination in ["disconnect", "close", "transport"] {
+        let (client, listener, http) = gateway(2).await;
+        let gate = Arc::new(Semaphore::new(0));
+        let permits = Arc::clone(&gate);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        let (started, mut starts) = mpsc::unbounded_channel();
+        let (events, mut received) = mpsc::unbounded_channel();
+        let stream = StreamClient::builder(client)
+            .expect("builder")
+            .on_event(move |event| {
+                let _ = events.send(event);
+            })
+            .on_frame(move |_, frame| {
+                let permits = Arc::clone(&permits);
+                let started = started.clone();
+                let count = Arc::clone(&count);
+                async move {
+                    started
+                        .send(frame.message_id().to_owned())
+                        .expect("started");
+                    permits.acquire().await.expect("gate").forget();
+                    count.fetch_add(1, Ordering::SeqCst);
+                    StreamFrameResponse::json(json!({"saved":frame.message_id()}))
+                }
+            })
+            .build()
+            .expect("stream");
+        let first = stream.clone();
+        let task = tokio::spawn(async move { first.run_once().await });
+        let mut socket = accept(&listener).await;
+        send(&mut socket, frame("EVENT", "topic", "running")).await;
+        bounded(starts.recv()).await.expect("started");
+        send(&mut socket, frame("EVENT", "topic", "queued")).await;
+        send(&mut socket, frame("SYSTEM", "ping", "accepted-barrier")).await;
+        assert_eq!(
+            ack(&mut socket).await["headers"]["messageId"],
+            "accepted-barrier"
+        );
+        match termination {
+            "disconnect" => {
+                send(&mut socket, frame("SYSTEM", "disconnect", "disconnect")).await;
+                assert_eq!(ack(&mut socket).await["headers"]["messageId"], "disconnect");
+                send(&mut socket, frame("EVENT", "topic", "rejected")).await;
+                assert_eq!(ack(&mut socket).await["code"], 500);
+            }
+            "close" => send(&mut socket, Message::Close(None)).await,
+            _ => {
+                socket
+                    .get_mut()
+                    .shutdown()
+                    .await
+                    .expect("transport shutdown");
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !task.is_finished(),
+            "{termination} must allow local completion"
+        );
+        gate.add_permits(2);
+        let result = bounded(task).await.expect("task");
+        if termination != "transport" {
+            result.expect("graceful disconnect");
+        } else {
+            result.expect_err("transport failure");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        while let Ok(event) = received.try_recv() {
+            assert!(!matches!(event, StreamRunEvent::FrameCancelled { .. }));
+        }
+        let (stop, task) = launch(stream);
+        let mut socket = accept(&listener).await;
+        for id in ["running", "queued"] {
+            send(&mut socket, frame("EVENT", "topic", id)).await;
+            let response = ack(&mut socket).await;
+            assert_eq!(response["code"], 200);
+            let data: Value =
+                serde_json::from_str(response["data"].as_str().expect("response")).expect("data");
+            assert_eq!(data["response"]["saved"], id);
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "completed work must not run twice"
+        );
+        stop.send(()).expect("shutdown");
+        bounded(task).await.expect("task").expect("shutdown");
+        bounded(http).await.expect("gateway");
+    }
+}
+
+#[tokio::test]
+async fn disconnect_deadline_reports_running_and_queued_cancellations_and_releases_claims() {
+    for termination in ["disconnect", "close", "transport"] {
+        let (client, listener, http) = gateway(2).await;
+        let (events, mut received) = mpsc::unbounded_channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        let (started, mut starts) = mpsc::unbounded_channel();
+        let stream = StreamClient::builder(client)
+            .expect("builder")
+            .processing_policy(StreamProcessingPolicy {
+                disconnect_timeout: Duration::from_millis(60),
+                ..StreamProcessingPolicy::default()
+            })
+            .on_event(move |event| {
+                let _ = events.send(event);
+            })
+            .on_frame(move |_, _| {
+                let first = count.fetch_add(1, Ordering::SeqCst) == 0;
+                let started = started.clone();
+                async move {
+                    started.send(()).expect("started");
+                    if first {
+                        std::future::pending::<()>().await;
+                    }
+                }
+            })
+            .build()
+            .expect("stream");
+        let first = stream.clone();
+        let task = tokio::spawn(async move { first.run_once().await });
+        let mut socket = accept(&listener).await;
+        send(&mut socket, frame("EVENT", "topic", "running")).await;
+        bounded(starts.recv()).await.expect("started");
+        send(&mut socket, frame("EVENT", "topic", "queued")).await;
+        send(&mut socket, frame("SYSTEM", "ping", "barrier")).await;
+        assert_eq!(ack(&mut socket).await["code"], 200);
+        match termination {
+            "disconnect" => {
+                send(&mut socket, frame("SYSTEM", "disconnect", "disconnect")).await;
+                assert_eq!(ack(&mut socket).await["code"], 200);
+            }
+            "close" => send(&mut socket, Message::Close(None)).await,
+            _ => {
+                socket
+                    .get_mut()
+                    .shutdown()
+                    .await
+                    .expect("transport shutdown");
+            }
+        }
+        let error = bounded(task).await.expect("task").expect_err("deadline");
+        assert!(error.to_string().contains("disconnect drain timed out"));
+        let mut cancellations = Vec::new();
+        while let Ok(event) = received.try_recv() {
+            if let StreamRunEvent::FrameCancelled { message_id, reason } = event {
+                assert_eq!(reason, StreamCancellationReason::DisconnectTimeout);
+                cancellations.push(message_id);
+            }
+        }
+        cancellations.sort();
+        assert_eq!(cancellations, ["queued", "running"]);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "queued handler must not start before cancellation"
+        );
+        let (stop, task) = launch(stream);
+        let mut socket = accept(&listener).await;
+        send(&mut socket, frame("EVENT", "topic", "running")).await;
+        assert_eq!(ack(&mut socket).await["code"], 200);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        stop.send(()).expect("shutdown");
+        bounded(task).await.expect("task").expect("shutdown");
+        bounded(http).await.expect("gateway");
+    }
+}
+
+#[tokio::test]
+async fn dropping_runner_reports_cancellation_for_running_and_queued_frames() {
+    let (client, listener, http) = gateway(1).await;
+    let (events, mut received) = mpsc::unbounded_channel();
+    let stream = StreamClient::builder(client)
+        .expect("builder")
+        .on_event(move |event| {
+            let _ = events.send(event);
+        })
+        .on_frame(|_, _| std::future::pending::<()>())
+        .build()
+        .expect("stream");
+    let task = tokio::spawn(async move { stream.run_once().await });
+    let mut socket = accept(&listener).await;
+    for id in ["running", "queued"] {
+        send(&mut socket, frame("EVENT", "topic", id)).await;
+    }
+    send(&mut socket, frame("SYSTEM", "ping", "barrier")).await;
+    assert_eq!(ack(&mut socket).await["code"], 200);
+    task.abort();
+    assert!(bounded(task).await.expect_err("aborted").is_cancelled());
+    let mut ids = Vec::new();
+    while let Ok(event) = received.try_recv() {
+        if let StreamRunEvent::FrameCancelled { message_id, reason } = event {
+            assert_eq!(reason, StreamCancellationReason::RunnerDropped);
+            ids.push(message_id);
+        }
+    }
+    ids.sort();
+    assert_eq!(ids, ["queued", "running"]);
+    bounded(http).await.expect("gateway");
+}
+
+#[tokio::test]
+async fn reconnect_events_separate_attempts_from_failures_and_reset_after_stability() {
+    let (client, listener, http) = gateway(5).await;
+    let (events, mut received) = mpsc::unbounded_channel();
+    let stream = StreamClient::builder(client)
+        .expect("builder")
+        .reconnect_policy(
+            ReconnectPolicy::new(Duration::from_millis(1), Duration::from_millis(8))
+                .reset_after(Duration::from_millis(500)),
+        )
+        .on_event(move |event| {
+            let _ = events.send(event);
+        })
+        .on_frame(|_, _| async {})
+        .build()
+        .expect("stream");
+    let (stop, task) = launch(stream);
+    for (index, failures) in [1, 2, 0, 1].into_iter().enumerate() {
+        let mut socket = accept(&listener).await;
+        if index == 2 {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+        }
+        send(&mut socket, Message::Close(None)).await;
+        loop {
+            if let StreamRunEvent::ReconnectScheduled {
+                next_attempt,
+                consecutive_failures,
+                delay,
+            } = bounded(received.recv()).await.expect("event")
+            {
+                assert_eq!(next_attempt, index as u32 + 2);
+                assert_eq!(consecutive_failures, failures);
+                assert_eq!(
+                    delay,
+                    Duration::from_millis(if failures == 2 { 2 } else { 1 })
+                );
+                break;
+            }
+        }
+    }
+    let _socket = accept(&listener).await;
+    stop.send(()).expect("shutdown");
+    bounded(task).await.expect("task").expect("shutdown");
+    bounded(http).await.expect("gateway");
+}
+
+#[tokio::test]
+async fn frame_error_events_preserve_redacted_structured_metadata() {
+    let (client, listener, http) = gateway(1).await;
+    let (events, mut received) = mpsc::unbounded_channel();
+    let stream = StreamClient::builder(client)
+        .expect("builder")
+        .on_event(move |event| {
+            let _ = events.send(event);
+        })
+        .on_frame(|_, _| async {
+            Err::<(), _>(Error::Api {
+                code: 130101,
+                api_code: Some("TooManyRequests".into()),
+                message: "access_token=application-secret".into(),
+                request_id: Some("request-1".into()),
+                error_body_snippet: Some("private-business-payload".into()),
+                status: Some(429),
+                retry_after: Some(Box::new(Duration::from_secs(7))),
+            })
+        })
+        .build()
+        .expect("stream");
+    let (stop, task) = launch(stream);
+    let mut socket = accept(&listener).await;
+    send(&mut socket, frame("EVENT", "topic", "failure")).await;
+    assert_eq!(ack(&mut socket).await["code"], 500);
+    loop {
+        if let StreamRunEvent::FrameError { message_id, error } =
+            bounded(received.recv()).await.expect("event")
+        {
+            assert_eq!(message_id.as_deref(), Some("failure"));
+            assert_eq!(error.kind(), dingding::ErrorKind::Api);
+            assert_eq!(error.status(), Some(429));
+            assert_eq!(error.errcode(), Some(130101));
+            assert_eq!(error.api_code(), Some("TooManyRequests"));
+            assert_eq!(error.request_id(), Some("request-1"));
+            assert_eq!(error.retry_after(), Some(Duration::from_secs(7)));
+            assert!(error.is_retryable());
+            for text in [error.to_string(), format!("{error:?}")] {
+                assert!(!text.contains("application-secret"));
+                assert!(!text.contains("private-business-payload"));
+            }
+            break;
+        }
+    }
+    stop.send(()).expect("shutdown");
+    bounded(task).await.expect("task").expect("shutdown");
+    bounded(http).await.expect("gateway");
 }
 
 #[tokio::test]
@@ -359,7 +757,7 @@ async fn concurrent_duplicate_is_not_executed_or_acknowledged_as_completed() {
             max_concurrent_handlers: 2,
             ..StreamProcessingPolicy::default()
         })
-        .on_frame(move |_| {
+        .on_frame(move |_ctx, _| {
             let gate = Arc::clone(&gate);
             let started = started.clone();
             async move {
@@ -394,7 +792,7 @@ async fn card_ack_is_replayed_after_duplicate_delivery_and_reconnection() {
             Duration::from_millis(10),
             Duration::from_millis(20),
         ))
-        .on_card_callback(move |_| {
+        .on_card_callback(move |_ctx, _| {
             count.fetch_add(1, Ordering::SeqCst);
             async {
                 StreamFrameResponse::json(json!({"cardData":{"cardParamMap":{"title":"updated"}}}))
@@ -450,7 +848,11 @@ async fn connection_loss_during_shutdown_reports_unfinished_work() {
     let (started, mut starts) = mpsc::unbounded_channel();
     let stream = StreamClient::builder(client)
         .expect("builder")
-        .on_frame(move |_| {
+        .processing_policy(StreamProcessingPolicy {
+            disconnect_timeout: Duration::from_millis(100),
+            ..StreamProcessingPolicy::default()
+        })
+        .on_frame(move |_ctx, _| {
             let guard = Cancelled(Arc::clone(&count));
             let started = started.clone();
             async move {
@@ -472,11 +874,7 @@ async fn connection_loss_during_shutdown_reports_unfinished_work() {
         .await
         .expect("task")
         .expect_err("unfinished drain");
-    assert!(
-        error
-            .to_string()
-            .contains("closed before shutdown drain completed")
-    );
+    assert!(error.to_string().contains("disconnect drain timed out"));
     assert_eq!(cancelled.load(Ordering::SeqCst), 1);
     bounded(http).await.expect("gateway task");
 }
@@ -484,16 +882,20 @@ async fn connection_loss_during_shutdown_reports_unfinished_work() {
 #[tokio::test]
 async fn shutdown_deadline_cancels_unfinished_work_and_reports_failure() {
     let (client, listener, http) = gateway(1).await;
+    let (events, mut received) = mpsc::unbounded_channel();
     let cancelled = Arc::new(AtomicUsize::new(0));
     let count = Arc::clone(&cancelled);
     let (started, mut starts) = mpsc::unbounded_channel();
     let stream = StreamClient::builder(client)
         .expect("builder")
+        .on_event(move |event| {
+            let _ = events.send(event);
+        })
         .processing_policy(StreamProcessingPolicy {
             shutdown_timeout: Duration::from_millis(100),
             ..StreamProcessingPolicy::default()
         })
-        .on_frame(move |_| {
+        .on_frame(move |_ctx, _| {
             let guard = Cancelled(Arc::clone(&count));
             let started = started.clone();
             async move {
@@ -515,6 +917,19 @@ async fn shutdown_deadline_cancels_unfinished_work_and_reports_failure() {
         .expect_err("drain timed out");
     assert!(error.to_string().contains("shutdown drain timed out"));
     assert_eq!(cancelled.load(Ordering::SeqCst), 1);
+    let mut cancellations = Vec::new();
+    while let Ok(event) = received.try_recv() {
+        if let StreamRunEvent::FrameCancelled { message_id, reason } = event {
+            cancellations.push((message_id, reason));
+        }
+    }
+    assert_eq!(
+        cancellations,
+        [(
+            "unfinished".into(),
+            StreamCancellationReason::ShutdownTimeout
+        )]
+    );
     bounded(http).await.expect("gateway task");
 }
 
@@ -528,7 +943,7 @@ async fn buffered_control_bursts_do_not_starve_the_ack_writer() {
             ..StreamProcessingPolicy::default()
         })
         .reconnect_policy(ReconnectPolicy::no_retry())
-        .on_frame(|_| async {})
+        .on_frame(|_ctx, _| async {})
         .build()
         .expect("stream");
     let (stop, task) = launch(stream);
@@ -559,7 +974,7 @@ async fn already_signalled_shutdown_does_not_open_a_connection() {
             .expect("client"),
     )
     .expect("builder")
-    .on_frame(|_| async {})
+    .on_frame(|_ctx, _| async {})
     .build()
     .expect("stream");
     bounded(stream.run_until(async {}))

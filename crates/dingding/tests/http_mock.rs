@@ -159,7 +159,7 @@ async fn stream_open_errors_preserve_http_metadata() -> TestResult<()> {
                 .header("x-request-id", "stream-id"),
         ])?;
     let stream = dingding::stream::StreamClient::builder(dingtalk_for_mock(&server)?)?
-        .on_frame(|_| async {})
+        .on_frame(|_ctx, _| async {})
         .build()?;
     let error = stream
         .run_once()
@@ -169,6 +169,51 @@ async fn stream_open_errors_preserve_http_metadata() -> TestResult<()> {
     assert_eq!(error.status(), Some(200));
     assert_eq!(error.retry_after(), Some(Duration::from_secs(7)));
     assert_eq!(error.request_id(), Some("stream-id"));
+    server.finish()
+}
+
+#[cfg(feature = "stream")]
+#[tokio::test]
+async fn stream_connection_error_events_preserve_metadata_without_secrets() -> TestResult<()> {
+    use dingding::stream::{ReconnectPolicy, StreamClient, StreamRunEvent};
+    let server = MockServer::spawn([MockResponse::json_status(
+        429,
+        "Too Many Requests",
+        r#"{"code":"TooManyRequests","message":"access_token=connection-secret"}"#,
+    )
+    .header("retry-after", "7")
+    .header("x-request-id", "stream-id")])?;
+    let (sender, events) = mpsc::channel();
+    let stream = StreamClient::builder(dingtalk_for_mock(&server)?)?
+        .reconnect_policy(ReconnectPolicy::no_retry())
+        .on_event(move |event| {
+            let _ = sender.send(event);
+        })
+        .on_frame(|_, _| async {})
+        .build()?;
+    assert!(stream.run().await.is_err());
+    let error = events
+        .try_iter()
+        .find_map(|event| match event {
+            StreamRunEvent::ConnectionError {
+                error,
+                attempt,
+                retrying,
+            } => {
+                assert_eq!(attempt, 1);
+                assert!(!retrying);
+                Some(error)
+            }
+            _ => None,
+        })
+        .ok_or("missing connection error")?;
+    assert_eq!(error.kind(), ErrorKind::Api);
+    assert_eq!(error.status(), Some(429));
+    assert_eq!(error.api_code(), Some("TooManyRequests"));
+    assert_eq!(error.request_id(), Some("stream-id"));
+    assert_eq!(error.retry_after(), Some(Duration::from_secs(7)));
+    assert!(error.is_retryable());
+    assert!(!format!("{error:?} {error}").contains("connection-secret"));
     server.finish()
 }
 
@@ -1486,7 +1531,7 @@ async fn proactive_context_replies_ignore_expired_session_and_choose_correct_rec
         let bot = Bot::new(client).on_message(
             ConversationScope::Any,
             dingding::bot::MessageType::Text,
-            move |ctx, _| {
+            move |ctx| {
                 let robot = robot.clone();
                 async move {
                     assert!(ctx.is_session_webhook_expired());
@@ -1770,7 +1815,169 @@ async fn streamed_download_times_out_a_blocked_writer() -> TestResult<()> {
     .await?
     .err()
     .ok_or("blocked writer")?;
-    assert_eq!(error.kind(), ErrorKind::Io);
+    assert_eq!(error.kind(), ErrorKind::Transport);
+    assert!(error.is_retryable());
+    api.finish()?;
+    download.finish()
+}
+
+struct DownloadTestWriter {
+    written: usize,
+    write_limit: usize,
+    error: Option<io::ErrorKind>,
+}
+
+impl tokio::io::AsyncWrite for DownloadTestWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        if self.written == self.write_limit {
+            return match self.error {
+                Some(kind) => std::task::Poll::Ready(Err(io::Error::from(kind))),
+                None => std::task::Poll::Pending,
+            };
+        }
+        let count = data.len().min(self.write_limit - self.written);
+        self.written += count;
+        std::task::Poll::Ready(Ok(count))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.error {
+            Some(kind) => std::task::Poll::Ready(Err(io::Error::from(kind))),
+            None => std::task::Poll::Pending,
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn streamed_download_bounds_all_write_stages_and_preserves_io_sources() -> TestResult<()> {
+    for write_limit in [0, 64 * 1024 + 1, usize::MAX] {
+        for failure in [None, Some(io::ErrorKind::PermissionDenied)] {
+            let download = MockServer::spawn([MockResponse::bytes(
+                "application/octet-stream",
+                &vec![1; 96 * 1024],
+            )])?;
+            let api = download_api_server(&download)?;
+            let client = DingTalk::builder()
+                .webhook_base_url(api.base_url())
+                .openapi_base_url(api.base_url())
+                .app_key_and_secret("key", "secret")
+                .system_proxy(false)
+                .total_timeout(Duration::from_millis(200))
+                .build()?;
+            let mut writer = DownloadTestWriter {
+                written: 0,
+                write_limit,
+                error: failure,
+            };
+            let error = tokio::time::timeout(
+                Duration::from_secs(3),
+                client.openapi().robot("robot")?.download_message_file_to(
+                    "code",
+                    &mut writer,
+                    128 * 1024,
+                ),
+            )
+            .await?
+            .err()
+            .ok_or("writer must fail or time out")?;
+            assert_eq!(writer.written, write_limit.min(96 * 1024));
+            if let Some(kind) = failure {
+                assert_eq!(error.kind(), ErrorKind::Io);
+                assert_eq!(
+                    error
+                        .source()
+                        .and_then(|e| e.downcast_ref::<io::Error>())
+                        .ok_or("original I/O error")?
+                        .kind(),
+                    kind
+                );
+            } else {
+                assert_eq!(error.kind(), ErrorKind::Transport);
+                assert!(error.is_retryable());
+            }
+            api.finish()?;
+            download.finish()?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn streamed_download_profile_deadline_covers_the_prefix_write() -> TestResult<()> {
+    let download = MockServer::spawn([MockResponse::bytes("application/octet-stream", b"file")])?;
+    let api = download_api_server(&download)?;
+    let client = DingTalk::builder()
+        .webhook_base_url(api.base_url())
+        .openapi_base_url(api.base_url())
+        .app_key_and_secret("key", "secret")
+        .system_proxy(false)
+        .profile(dingding::ClientProfile::LowLatency)
+        .build()?;
+    let (mut writer, _unread) = tokio::io::duplex(1);
+    let error = tokio::time::timeout(
+        Duration::from_secs(8),
+        client
+            .openapi()
+            .robot("robot")?
+            .download_message_file_to("code", &mut writer, 1024),
+    )
+    .await?
+    .err()
+    .ok_or("profile deadline must cover the prefix")?;
+    assert_eq!(error.kind(), ErrorKind::Transport);
+    assert!(error.is_retryable());
+    api.finish()?;
+    download.finish()
+}
+
+#[tokio::test]
+async fn streamed_download_can_disable_the_profile_deadline() -> TestResult<()> {
+    use tokio::io::AsyncReadExt;
+    let download = MockServer::spawn([MockResponse::bytes("application/octet-stream", b"file")])?;
+    let api = download_api_server(&download)?;
+    let client = DingTalk::builder()
+        .webhook_base_url(api.base_url())
+        .openapi_base_url(api.base_url())
+        .app_key_and_secret("key", "secret")
+        .system_proxy(false)
+        .total_timeout(None)
+        .profile(dingding::ClientProfile::LowLatency)
+        .build()?;
+    let (mut writer, mut reader) = tokio::io::duplex(1);
+    let robot = client.openapi().robot("robot")?;
+    let transfer = async {
+        let info = robot
+            .download_message_file_to("code", &mut writer, 1024)
+            .await?;
+        drop(writer);
+        Ok::<_, dingding::Error>(info)
+    };
+    let consume = async {
+        tokio::time::sleep(Duration::from_millis(5500)).await;
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await?;
+        Ok::<_, dingding::Error>(bytes)
+    };
+    let (info, bytes) = tokio::time::timeout(Duration::from_secs(9), async {
+        tokio::try_join!(transfer, consume)
+    })
+    .await??;
+    assert_eq!(info.bytes_written(), 4);
+    assert_eq!(bytes, b"file");
     api.finish()?;
     download.finish()
 }

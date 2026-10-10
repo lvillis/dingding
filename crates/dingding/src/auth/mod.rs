@@ -42,6 +42,8 @@ impl AppCredentials {
     ///
     /// Reads `DINGTALK_CLIENT_ID` / `DINGTALK_CLIENT_SECRET`, falling back to
     /// `DINGTALK_APP_KEY` / `DINGTALK_APP_SECRET`.
+    /// An incomplete primary pair is an error; the two pairs are never mixed.
+    /// Fallback variables are read only when both primary variables are absent.
     pub fn from_env() -> crate::Result<Self> {
         Self::from_env_vars(
             "DINGTALK_CLIENT_ID",
@@ -52,11 +54,15 @@ impl AppCredentials {
     }
 
     /// Creates credentials from explicit primary and fallback environment variable names.
+    ///
+    /// Names may be constructed at runtime. Fallback variables are read only when
+    /// both primary variables are absent. Empty, malformed, or incomplete primary
+    /// credentials fail validation instead of silently selecting another application.
     pub fn from_env_vars(
-        app_key_var: &'static str,
-        app_secret_var: &'static str,
-        fallback_app_key_var: &'static str,
-        fallback_app_secret_var: &'static str,
+        app_key_var: &str,
+        app_secret_var: &str,
+        fallback_app_key_var: &str,
+        fallback_app_secret_var: &str,
     ) -> crate::Result<Self> {
         let primary = EnvCredentialNames {
             app_key: app_key_var,
@@ -66,13 +72,10 @@ impl AppCredentials {
             app_key: fallback_app_key_var,
             app_secret: fallback_app_secret_var,
         };
-        let credentials = select_env_credentials(
-            primary,
-            fallback,
-            read_env_credentials(primary)?,
-            read_env_credentials(fallback)?,
-        );
-        let credentials = credentials?;
+        let credentials =
+            select_env_credentials(primary, fallback, read_env_credentials(primary)?, || {
+                read_env_credentials(fallback)
+            })?;
         credentials.validate()?;
         Ok(credentials)
     }
@@ -114,7 +117,7 @@ fn validate_credential_token(value: &str, field: &'static str) -> crate::Result<
     Ok(())
 }
 
-fn env_value(name: &'static str) -> crate::Result<Option<String>> {
+fn env_value(name: &str) -> crate::Result<Option<String>> {
     match env::var(name) {
         Ok(value) => Ok(Some(value)),
         Err(env::VarError::NotPresent) => Ok(None),
@@ -125,9 +128,9 @@ fn env_value(name: &'static str) -> crate::Result<Option<String>> {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct EnvCredentialNames {
-    app_key: &'static str,
-    app_secret: &'static str,
+struct EnvCredentialNames<'a> {
+    app_key: &'a str,
+    app_secret: &'a str,
 }
 
 struct EnvCredentialValues {
@@ -135,7 +138,7 @@ struct EnvCredentialValues {
     app_secret: Option<String>,
 }
 
-fn read_env_credentials(names: EnvCredentialNames) -> crate::Result<EnvCredentialValues> {
+fn read_env_credentials(names: EnvCredentialNames<'_>) -> crate::Result<EnvCredentialValues> {
     Ok(EnvCredentialValues {
         app_key: env_value(names.app_key)?,
         app_secret: env_value(names.app_secret)?,
@@ -143,14 +146,15 @@ fn read_env_credentials(names: EnvCredentialNames) -> crate::Result<EnvCredentia
 }
 
 fn select_env_credentials(
-    primary_names: EnvCredentialNames,
-    fallback_names: EnvCredentialNames,
+    primary_names: EnvCredentialNames<'_>,
+    fallback_names: EnvCredentialNames<'_>,
     primary_values: EnvCredentialValues,
-    fallback_values: EnvCredentialValues,
+    read_fallback: impl FnOnce() -> crate::Result<EnvCredentialValues>,
 ) -> crate::Result<AppCredentials> {
     if primary_values.app_key.is_some() || primary_values.app_secret.is_some() {
         return complete_env_credentials(primary_names, primary_values);
     }
+    let fallback_values = read_fallback()?;
     if fallback_values.app_key.is_some() || fallback_values.app_secret.is_some() {
         return complete_env_credentials(fallback_names, fallback_values);
     }
@@ -165,7 +169,7 @@ fn select_env_credentials(
 }
 
 fn complete_env_credentials(
-    names: EnvCredentialNames,
+    names: EnvCredentialNames<'_>,
     values: EnvCredentialValues,
 ) -> crate::Result<AppCredentials> {
     match (values.app_key, values.app_secret) {
@@ -478,9 +482,11 @@ mod tests {
                 app_key: Some("client-id".to_string()),
                 app_secret: Some("client-secret".to_string()),
             },
-            EnvCredentialValues {
-                app_key: Some("app-key".to_string()),
-                app_secret: Some("app-secret".to_string()),
+            || {
+                Ok(EnvCredentialValues {
+                    app_key: Some("app-key".to_string()),
+                    app_secret: Some("app-secret".to_string()),
+                })
             },
         )
         .expect("primary pair should win");
@@ -491,9 +497,11 @@ mod tests {
                 app_key: None,
                 app_secret: None,
             },
-            EnvCredentialValues {
-                app_key: Some("app-key".to_string()),
-                app_secret: Some("app-secret".to_string()),
+            || {
+                Ok(EnvCredentialValues {
+                    app_key: Some("app-key".to_string()),
+                    app_secret: Some("app-secret".to_string()),
+                })
             },
         )
         .expect("fallback pair should be used");
@@ -504,9 +512,11 @@ mod tests {
                 app_key: Some("client-id".to_string()),
                 app_secret: None,
             },
-            EnvCredentialValues {
-                app_key: Some("app-key".to_string()),
-                app_secret: Some("app-secret".to_string()),
+            || {
+                Ok(EnvCredentialValues {
+                    app_key: Some("app-key".to_string()),
+                    app_secret: Some("app-secret".to_string()),
+                })
             },
         )
         .expect_err("primary credentials must not be mixed with fallback credentials");
@@ -517,5 +527,46 @@ mod tests {
         assert_eq!(fallback.app_secret(), "app-secret");
         assert_eq!(partial.kind(), crate::ErrorKind::InvalidConfig);
         assert!(partial.to_string().contains("CLIENT_SECRET"));
+    }
+
+    #[test]
+    fn primary_credentials_do_not_read_fallback_even_when_incomplete() {
+        let key_name = String::from("CLIENT_ID");
+        let primary = EnvCredentialNames {
+            app_key: &key_name,
+            app_secret: "CLIENT_SECRET",
+        };
+        let fallback = EnvCredentialNames {
+            app_key: "APP_KEY",
+            app_secret: "APP_SECRET",
+        };
+        for secret in [Some("secret".to_owned()), None] {
+            let complete = secret.is_some();
+            let result = select_env_credentials(
+                primary,
+                fallback,
+                EnvCredentialValues {
+                    app_key: Some("key".to_owned()),
+                    app_secret: secret,
+                },
+                || panic!("fallback must not be read when a primary variable is present"),
+            );
+            assert_eq!(result.is_ok(), complete);
+        }
+        let error = select_env_credentials(
+            primary,
+            fallback,
+            EnvCredentialValues {
+                app_key: None,
+                app_secret: None,
+            },
+            || {
+                Err(crate::Error::InvalidConfig(
+                    "fallback is not Unicode".into(),
+                ))
+            },
+        )
+        .expect_err("needed fallback errors must propagate");
+        assert!(error.to_string().contains("fallback is not Unicode"));
     }
 }

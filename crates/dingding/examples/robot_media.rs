@@ -1,14 +1,22 @@
-use std::{env, fs, path::Path};
+//! Streams a local file to DingTalk, then sends it to a group or private recipient.
+//!
+//! Set app credentials, `DINGTALK_ROBOT_CODE`, `DINGTALK_MEDIA_PATH`, and
+//! `DINGTALK_MEDIA_KIND=image|voice|video|file`. Choose exactly one of
+//! `DINGTALK_OPEN_CONVERSATION_ID` or `DINGTALK_PRIVATE_USER_ID`.
+//! `DINGTALK_MEDIA_MAX_BYTES` optionally limits the uploaded file size.
+
+use std::{env, path::Path};
 
 use dingding::{
     DingTalk, Error, Result,
-    openapi::{MediaType, MediaUpload, RobotVideo},
+    openapi::{MediaFileUpload, MediaType, RobotMessage, RobotReplyTarget, RobotVideo},
 };
 
 const ROBOT_CODE_ENV: &str = "DINGTALK_ROBOT_CODE";
 const MEDIA_PATH_ENV: &str = "DINGTALK_MEDIA_PATH";
 const MEDIA_KIND_ENV: &str = "DINGTALK_MEDIA_KIND";
 const MEDIA_CONTENT_TYPE_ENV: &str = "DINGTALK_MEDIA_CONTENT_TYPE";
+const MEDIA_MAX_BYTES_ENV: &str = "DINGTALK_MEDIA_MAX_BYTES";
 const OPEN_CONVERSATION_ID_ENV: &str = "DINGTALK_OPEN_CONVERSATION_ID";
 const PRIVATE_USER_ID_ENV: &str = "DINGTALK_PRIVATE_USER_ID";
 const AUDIO_DURATION_MS_ENV: &str = "DINGTALK_AUDIO_DURATION_MS";
@@ -19,83 +27,6 @@ async fn main() -> Result<()> {
     let ding = DingTalk::builder().app_credentials_from_env()?.build()?;
     let robot = ding.openapi().robot(required_env(ROBOT_CODE_ENV)?)?;
     let target = target()?;
-    let upload = media_upload()?;
-
-    let media_type = upload.media_type().clone();
-    let file_name = upload.file_name().to_string();
-    let media = robot.upload_media(upload).await?;
-
-    let response = match (target, media_type) {
-        (Target::Group(open_conversation_id), MediaType::Image) => {
-            robot
-                .send_group_image(open_conversation_id, media.media_id())
-                .await?
-        }
-        (Target::Private(user_id), MediaType::Image) => {
-            robot.send_private_image(user_id, media.media_id()).await?
-        }
-        (Target::Group(open_conversation_id), MediaType::Voice) => {
-            robot
-                .send_group_audio(open_conversation_id, media.media_id(), audio_duration_ms()?)
-                .await?
-        }
-        (Target::Private(user_id), MediaType::Voice) => {
-            robot
-                .send_private_audio(user_id, media.media_id(), audio_duration_ms()?)
-                .await?
-        }
-        (Target::Group(open_conversation_id), MediaType::Video) => {
-            robot
-                .send_group_video(
-                    open_conversation_id,
-                    RobotVideo::new(media.media_id(), video_duration_seconds()?),
-                )
-                .await?
-        }
-        (Target::Private(user_id), MediaType::Video) => {
-            robot
-                .send_private_video(
-                    user_id,
-                    RobotVideo::new(media.media_id(), video_duration_seconds()?),
-                )
-                .await?
-        }
-        (Target::Group(open_conversation_id), MediaType::File) => {
-            robot
-                .send_group_file(
-                    open_conversation_id,
-                    media.media_id(),
-                    &file_name,
-                    file_type(&file_name)?,
-                )
-                .await?
-        }
-        (Target::Private(user_id), MediaType::File) => {
-            robot
-                .send_private_file(
-                    user_id,
-                    media.media_id(),
-                    &file_name,
-                    file_type(&file_name)?,
-                )
-                .await?
-        }
-        (_target, MediaType::Other(value)) => {
-            return Err(Error::InvalidConfig(format!(
-                "`{MEDIA_KIND_ENV}={value}` cannot be sent by this example"
-            )));
-        }
-    };
-
-    println!(
-        "media sent: media_id={} process_query_key={}",
-        media.media_id(),
-        response.process_query_key()
-    );
-    Ok(())
-}
-
-fn media_upload() -> Result<MediaUpload> {
     let path = required_env(MEDIA_PATH_ENV)?;
     let media_type = media_type()?;
     let file_name = Path::new(&path)
@@ -105,17 +36,34 @@ fn media_upload() -> Result<MediaUpload> {
         .ok_or_else(|| {
             Error::InvalidConfig(format!("`{MEDIA_PATH_ENV}` must include a file name"))
         })?;
-    let bytes = fs::read(&path).map_err(|source| {
-        Error::InvalidConfig(format!(
-            "failed to read `{MEDIA_PATH_ENV}` at `{path}`: {source}"
-        ))
-    })?;
-
-    let upload = MediaUpload::new(media_type, file_name, bytes);
-    Ok(match optional_env(MEDIA_CONTENT_TYPE_ENV) {
-        Some(content_type) => upload.content_type(content_type),
-        None => upload,
-    })
+    let mut upload = MediaFileUpload::new(media_type.clone(), path);
+    if let Some(content_type) = optional_env(MEDIA_CONTENT_TYPE_ENV) {
+        upload = upload.content_type(content_type);
+    }
+    if let Some(max_bytes) = optional_u64_env(MEDIA_MAX_BYTES_ENV)? {
+        upload = upload.max_bytes(max_bytes);
+    }
+    let media = robot.upload_media_file(upload).await?;
+    let message = match media_type {
+        MediaType::Image => RobotMessage::image(media.media_id()),
+        MediaType::Voice => RobotMessage::audio(media.media_id(), audio_duration_ms()?),
+        MediaType::Video => {
+            RobotMessage::video(RobotVideo::new(media.media_id(), video_duration_seconds()?))
+        }
+        MediaType::File => RobotMessage::file_with_inferred_type(media.media_id(), file_name)?,
+        MediaType::Other(value) => {
+            return Err(Error::InvalidConfig(format!(
+                "`{MEDIA_KIND_ENV}={value}` cannot be sent by this example"
+            )));
+        }
+    };
+    let response = target.send_message(&robot, message).await?;
+    println!(
+        "media sent: media_id={} process_query_key={}",
+        media.media_id(),
+        response.process_query_key()
+    );
+    Ok(())
 }
 
 fn media_type() -> Result<MediaType> {
@@ -130,13 +78,13 @@ fn media_type() -> Result<MediaType> {
     }
 }
 
-fn target() -> Result<Target> {
+fn target() -> Result<RobotReplyTarget> {
     match (
         optional_env(OPEN_CONVERSATION_ID_ENV),
         optional_env(PRIVATE_USER_ID_ENV),
     ) {
-        (Some(open_conversation_id), None) => Ok(Target::Group(open_conversation_id)),
-        (None, Some(user_id)) => Ok(Target::Private(user_id)),
+        (Some(open_conversation_id), None) => RobotReplyTarget::group(open_conversation_id),
+        (None, Some(user_id)) => RobotReplyTarget::private(user_id),
         (None, None) => Err(Error::InvalidConfig(format!(
             "set `{OPEN_CONVERSATION_ID_ENV}` or `{PRIVATE_USER_ID_ENV}` before running"
         ))),
@@ -152,14 +100,6 @@ fn audio_duration_ms() -> Result<u64> {
 
 fn video_duration_seconds() -> Result<u64> {
     optional_u64_env(VIDEO_DURATION_SECONDS_ENV).map(|value| value.unwrap_or(1))
-}
-
-fn file_type(file_name: &str) -> Result<String> {
-    file_name
-        .rsplit_once('.')
-        .map(|(_stem, extension)| extension.trim().to_ascii_lowercase())
-        .filter(|extension| !extension.is_empty())
-        .ok_or_else(|| Error::InvalidConfig("file messages require a file extension".to_string()))
 }
 
 fn required_env(name: &'static str) -> Result<String> {
@@ -181,9 +121,4 @@ fn optional_u64_env(name: &'static str) -> Result<Option<u64>> {
             })
         })
         .transpose()
-}
-
-enum Target {
-    Group(String),
-    Private(String),
 }

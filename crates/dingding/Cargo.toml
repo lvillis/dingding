@@ -19,7 +19,7 @@ async-tls-native = ["reqx/async-tls-native"]
 webhook = []
 openapi = ["dep:tokio", "tokio/fs", "tokio/io-util", "tokio/time", "dep:getrandom"]
 bot = ["webhook"]
-stream = ["openapi", "bot", "dep:futures-util", "dep:tokio", "tokio/macros", "tokio/rt", "tokio/time", "dep:tokio-tungstenite"]
+stream = ["openapi", "bot", "dep:futures-util", "dep:tokio", "tokio/macros", "tokio/rt", "tokio/time", "dep:tokio-tungstenite", "dep:tracing"]
 macros = ["bot", "dep:dingding-macros"]
 
 [dependencies]
@@ -35,12 +35,13 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, optional = true, features = ["sync"] }
 tokio-tungstenite = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 url = { workspace = true }
 urlencoding = { workspace = true }
 dingding-macros = { version = "0.1.7", path = "../dingding-macros", optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "net", "io-util", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "net", "io-util", "time", "test-util"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 trybuild = { workspace = true }
