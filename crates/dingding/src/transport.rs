@@ -427,6 +427,7 @@ fn stream_read_error(error: std::io::Error) -> Error {
 fn build_http_client(base_url: &Url, config: &TransportConfig) -> Result<HttpClient> {
     let mut builder = HttpClient::builder(base_url.as_str())
         .profile(config.profile)
+        .tls_backend(crate::tls::HTTP_BACKEND)
         // DingTalk error parsing needs the body and headers of non-success responses.
         .default_status_policy(StatusPolicy::Response)
         .client_name(config.client_name.clone())
@@ -1119,6 +1120,16 @@ fn body_snippet_for_error(body: &str, config: BodySnippetConfig) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_clients_use_the_selected_tls_backend() {
+        let client = build_http_client(
+            &Url::parse("https://example.test").expect("URL"),
+            &TransportConfig::default(),
+        )
+        .expect("client");
+        assert_eq!(client.tls_backend(), crate::tls::HTTP_BACKEND);
+    }
 
     #[cfg(feature = "openapi")]
     #[test]

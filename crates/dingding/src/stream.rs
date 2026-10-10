@@ -147,7 +147,7 @@ use futures_util::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::connect_async_tls_with_config;
 use url::Url;
 
 use crate::{
@@ -569,10 +569,14 @@ impl StreamClient {
         let connect = async {
             let ticket = self.open_connection().await?;
             let url = websocket_url(&ticket)?;
-            tokio::time::timeout(self.websocket_connect_timeout, connect_async(url.as_str()))
-                .await
-                .map_err(|_| Error::stream("websocket connect timed out"))?
-                .map_err(Error::websocket_connect)
+            let connector = crate::tls::websocket_connector()?;
+            tokio::time::timeout(
+                self.websocket_connect_timeout,
+                connect_async_tls_with_config(url.as_str(), None, false, Some(connector)),
+            )
+            .await
+            .map_err(|_| Error::stream("websocket connect timed out"))?
+            .map_err(Error::websocket_connect)
         };
         let (socket, _response) = tokio::select! {
             biased;

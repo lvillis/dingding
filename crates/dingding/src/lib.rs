@@ -39,10 +39,26 @@
 //! ```
 //!
 //! Select exactly one TLS feature: `async-tls-rustls-ring`,
-//! `async-tls-rustls-aws-lc-rs`, or `async-tls-native`. Disable default features
+//! `async-tls-rustls-aws-lc-rs`, `async-tls-rustls-graviola`, or `async-tls-native`.
+//! Disable default features
 //! when changing the backend. `--all-features` is not supported because these
 //! backends are mutually exclusive. Enable at least one capability from the table.
 //! The minimum Rust version is declared in the package's `rust-version` field.
+//!
+//! The selected backend is used for both HTTP and Stream WebSocket connections.
+//! Rustls providers are configured per client, without installing or relying on a
+//! process-wide default provider. For a Stream bot using Graviola:
+//!
+//! ```toml
+//! dingding = { version = "0.1", default-features = false, features = [
+//!     "async-tls-rustls-graviola", "stream", "macros",
+//! ] }
+//! ```
+//!
+//! Graviola supports `x86_64` and `aarch64` with specific CPU instruction requirements;
+//! check [its platform requirements](https://github.com/ctz/graviola#limitations)
+//! against the deployment hardware. Enabling it does not enable ring or AWS-LC
+//! through this library; other application dependencies can still enable them.
 //!
 //! # Receive and reply over Stream
 //!
@@ -136,24 +152,33 @@ extern crate self as dingding;
 #[cfg(not(any(
     feature = "async-tls-rustls-ring",
     feature = "async-tls-rustls-aws-lc-rs",
+    feature = "async-tls-rustls-graviola",
     feature = "async-tls-native"
 )))]
 compile_error!(
     "Enable exactly one async TLS feature: \
-     `async-tls-rustls-ring`, `async-tls-rustls-aws-lc-rs`, or `async-tls-native`."
+     `async-tls-rustls-ring`, `async-tls-rustls-aws-lc-rs`, \
+     `async-tls-rustls-graviola`, or `async-tls-native`."
 );
 
-#[cfg(all(
-    feature = "async-tls-rustls-ring",
-    feature = "async-tls-rustls-aws-lc-rs"
+#[cfg(any(
+    all(
+        feature = "async-tls-rustls-ring",
+        any(
+            feature = "async-tls-rustls-aws-lc-rs",
+            feature = "async-tls-rustls-graviola",
+            feature = "async-tls-native"
+        )
+    ),
+    all(
+        feature = "async-tls-rustls-aws-lc-rs",
+        any(feature = "async-tls-rustls-graviola", feature = "async-tls-native")
+    ),
+    all(feature = "async-tls-rustls-graviola", feature = "async-tls-native"),
 ))]
-compile_error!("`async-tls-rustls-ring` and `async-tls-rustls-aws-lc-rs` are mutually exclusive.");
-
-#[cfg(all(feature = "async-tls-rustls-ring", feature = "async-tls-native"))]
-compile_error!("`async-tls-rustls-ring` and `async-tls-native` are mutually exclusive.");
-
-#[cfg(all(feature = "async-tls-rustls-aws-lc-rs", feature = "async-tls-native"))]
-compile_error!("`async-tls-rustls-aws-lc-rs` and `async-tls-native` are mutually exclusive.");
+compile_error!(
+    "Async TLS features are mutually exclusive; enable exactly one and disable default features when changing backends."
+);
 
 #[cfg(not(any(feature = "webhook", feature = "openapi", feature = "bot")))]
 compile_error!("Enable at least one capability feature: `webhook`, `openapi`, or `bot`.");
@@ -163,6 +188,7 @@ mod error;
 mod handler_result;
 #[cfg(feature = "webhook")]
 mod signature;
+mod tls;
 mod transport;
 mod util;
 

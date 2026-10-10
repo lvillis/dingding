@@ -9,13 +9,15 @@ repository.workspace = true
 include = [
     "Cargo.toml",
     "src/**",
+    "tests/fixtures/tls/**",
 ]
 
 [features]
 default = ["async-tls-rustls-ring", "webhook", "openapi", "bot", "stream", "macros"]
-async-tls-rustls-ring = ["reqx/async-tls-rustls-ring"]
-async-tls-rustls-aws-lc-rs = ["reqx/async-tls-rustls-aws-lc-rs"]
-async-tls-native = ["reqx/async-tls-native"]
+async-tls-rustls-ring = ["reqx/async-tls-rustls-ring", "dep:rustls", "rustls/ring", "dep:webpki-roots", "tokio-tungstenite?/rustls-tls-webpki-roots"]
+async-tls-rustls-aws-lc-rs = ["reqx/async-tls-rustls-aws-lc-rs", "dep:rustls", "rustls/aws_lc_rs", "dep:webpki-roots", "tokio-tungstenite?/rustls-tls-webpki-roots"]
+async-tls-rustls-graviola = ["reqx/async-tls-rustls-graviola", "dep:rustls", "dep:rustls-graviola", "dep:webpki-roots", "tokio-tungstenite?/rustls-tls-webpki-roots"]
+async-tls-native = ["reqx/async-tls-native", "dep:native-tls", "tokio-tungstenite?/native-tls"]
 webhook = []
 openapi = ["dep:tokio", "tokio/fs", "tokio/io-util", "tokio/time", "dep:getrandom"]
 bot = ["webhook"]
@@ -29,6 +31,10 @@ getrandom = { workspace = true, optional = true }
 hmac = { workspace = true }
 httpdate = { workspace = true }
 reqx = { workspace = true }
+rustls = { workspace = true, optional = true }
+rustls-graviola = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
+native-tls = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -42,6 +48,7 @@ dingding-macros = { version = "0.1.8", path = "../dingding-macros", optional = t
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "net", "io-util", "time", "test-util"] }
+tokio-rustls = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 trybuild = { workspace = true }

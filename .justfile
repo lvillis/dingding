@@ -12,7 +12,10 @@ ci:
     cargo check -p dingding --no-default-features --features async-tls-rustls-ring,webhook
     cargo check -p dingding --no-default-features --features async-tls-rustls-ring,openapi
     cargo check -p dingding --no-default-features --features async-tls-rustls-ring,stream,macros
+    cargo check -p dingding --no-default-features --features async-tls-rustls-graviola,webhook
+    cargo check -p dingding --no-default-features --features async-tls-rustls-graviola,stream,macros
     RUSTDOCFLAGS='-D warnings' cargo doc -p dingding --no-deps
     RUSTDOCFLAGS='-D warnings' cargo doc -p dingding-macros --no-deps
     cargo test --doc --workspace
     cargo nextest run --workspace
+    cargo nextest run -p dingding --no-default-features --features async-tls-rustls-graviola,stream,macros
