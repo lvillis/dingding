@@ -1,3 +1,13 @@
+## [0.1.8] - 2026-10-10
+
+### 🐛 Bug Fixes
+
+- Drain Stream tasks, reset backoff, and expose structured errors
+## [0.1.7] - 2026-10-09
+
+### ⚙️ Miscellaneous Tasks
+
+- Release version 0.1.7
 ## [0.1.6] - 2026-10-09
 
 ### ⚙️ Miscellaneous Tasks
