@@ -22,9 +22,44 @@
 //! ```
 //!
 //! The optional `#[handler]` macro produces routes with the same return-type
-//! support. It is not required for routing. Store application data with
-//! [`Bot::state`] and access it through [`BotContext::state_required`]. The type
-//! requested must match the stored type, including any `Arc` wrapper.
+//! support. It is not required for routing. Construct a stateful router with
+//! [`Bot::with_state`]. Handlers receive `Context<AppState>` (or its scoped variant)
+//! and borrow their state with [`BotContext::state`], without casts or runtime errors.
+//! State is shared behind an `Arc` and does not need to implement `Clone`.
+//! Stateless handlers use `Context` and unit state. Use
+//! [`BotContext::shared_state`] when an owned state handle is needed.
+//!
+//! # Business error handling
+//!
+//! [`Bot::on_error`] registers one asynchronous handler for errors returned by normal
+//! routes and fallbacks. It receives the original context and error, including SDK
+//! metadata or application sources. Choose an explicit user-facing response:
+//!
+//! ```no_run
+//! use dingding::prelude::*;
+//! # fn example() -> Result<()> {
+//! let bot = Bot::new(DingTalk::new()?)
+//!     .on_group_text_command("/run", |ctx| async move {
+//!         ctx.reply_text("done").await
+//!     })
+//!     .on_error(|ctx, error| async move {
+//!         if error.is_retryable() {
+//!             ctx.reply_text("Service temporarily unavailable.").await
+//!         } else {
+//!             Err(error)
+//!         }
+//!     });
+//! # Ok(()) }
+//! ```
+//!
+//! Successful error handling marks the event as handled and permits a success ACK;
+//! normal message-id deduplication applies. Return `Err(error)` to preserve failure.
+//! This acknowledges the application's decision, not success of the external operation.
+//! Hook failures propagate without recursively invoking the hook. No automatic reply
+//! or business retry is performed. The Stream handler deadline includes the hook;
+//! timeouts, panics, cancellation, and deduplication errors bypass it and are reported
+//! by Stream diagnostics. Do not recover ambiguous external side effects without a
+//! durable business record. Raw application error sources may contain secrets.
 //!
 //! # Routing rules
 //!
@@ -60,7 +95,6 @@
 //! from `senderId`, and never switch channels after an ambiguous send failure.
 
 use std::{
-    any::{Any, type_name},
     convert::Infallible,
     fmt,
     future::Future,
@@ -86,8 +120,9 @@ mod reply;
 use dedup::{Deduplication, EventDeduplicator, MemoryEventDeduplicator};
 
 type BoxFuture = Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
-type BoxedHandler = Arc<dyn Fn(BotContext) -> BoxFuture + Send + Sync + 'static>;
-pub(crate) type BotState = Arc<dyn Any + Send + Sync + 'static>;
+type BoxedHandler<T> = Arc<dyn Fn(BotContext<T>) -> BoxFuture + Send + Sync + 'static>;
+pub(crate) type ErrorHandler<T> =
+    Arc<dyn Fn(BotContext<T>, Error) -> BoxFuture + Send + Sync + 'static>;
 
 /// Conversation scope used by bot routing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1356,37 +1391,54 @@ pub struct GroupScope;
 pub struct PrivateScope;
 
 /// Bot handler context.
-#[derive(Clone)]
-pub struct BotContext<S = AnyScope> {
+pub struct BotContext<T = (), S = AnyScope> {
     client: DingTalk,
-    event: BotEvent,
+    event: Arc<BotEvent>,
     command: Option<Arc<str>>,
-    state: Option<BotState>,
+    state: Arc<T>,
     _scope: PhantomData<S>,
 }
 
 /// Context accepted by routes for any conversation.
-pub type AnyContext = BotContext<AnyScope>;
+pub type AnyContext<T = ()> = BotContext<T, AnyScope>;
 
 /// Short alias for [`AnyContext`], intended for general-purpose bot handlers.
-pub type Context = AnyContext;
+pub type Context<T = ()> = AnyContext<T>;
 
 /// Context accepted by group-only routes.
-pub type GroupContext = BotContext<GroupScope>;
+pub type GroupContext<T = ()> = BotContext<T, GroupScope>;
 
 /// Context accepted by private-only routes.
-pub type PrivateContext = BotContext<PrivateScope>;
+pub type PrivateContext<T = ()> = BotContext<T, PrivateScope>;
 
-impl<S> BotContext<S> {
-    fn new(
-        client: DingTalk,
-        event: BotEvent,
-        command: Option<Arc<str>>,
-        state: Option<BotState>,
-    ) -> Self {
+impl<T, S> Clone for BotContext<T, S> {
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            event: Arc::clone(&self.event),
+            command: self.command.clone(),
+            state: Arc::clone(&self.state),
+            _scope: PhantomData,
+        }
+    }
+}
+
+/// Context state projection used by the handler attribute macro.
+#[doc(hidden)]
+pub trait ContextState {
+    /// Application state carried by this context.
+    type State: Send + Sync + 'static;
+}
+
+impl<T: Send + Sync + 'static, S> ContextState for BotContext<T, S> {
+    type State = T;
+}
+
+impl<T, S> BotContext<T, S> {
+    fn new(client: DingTalk, event: BotEvent, command: Option<Arc<str>>, state: Arc<T>) -> Self {
         Self {
             client,
-            event,
+            event: Arc::new(event),
             command,
             state,
             _scope: PhantomData,
@@ -1465,26 +1517,16 @@ impl<S> BotContext<S> {
         self.event.content.as_ref()
     }
 
-    /// Returns shared application state when it was configured with this type.
+    /// Borrows the application state. Its type is checked when registering the handler.
     #[must_use]
-    pub fn state<T>(&self) -> Option<&T>
-    where
-        T: Send + Sync + 'static,
-    {
-        self.state.as_deref()?.downcast_ref::<T>()
+    pub fn state(&self) -> &T {
+        &self.state
     }
 
-    /// Returns shared application state or an invalid-configuration error.
-    pub fn state_required<T>(&self) -> Result<&T>
-    where
-        T: Send + Sync + 'static,
-    {
-        self.state::<T>().ok_or_else(|| {
-            Error::InvalidConfig(format!(
-                "bot state `{}` is not configured",
-                type_name::<T>()
-            ))
-        })
+    /// Clones the shared state handle without requiring the state itself to implement `Clone`.
+    #[must_use]
+    pub fn shared_state(&self) -> Arc<T> {
+        Arc::clone(&self.state)
     }
 
     /// Returns the matched command prefix when this route was command-filtered.
@@ -1795,18 +1837,18 @@ impl<S> BotContext<S> {
     }
 }
 
-impl BotContext<AnyScope> {
+impl<T> BotContext<T, AnyScope> {
     /// Converts this context into a group-only context.
-    pub fn into_group(self) -> Result<GroupContext> {
+    pub fn into_group(self) -> Result<GroupContext<T>> {
         self.into_scope(ConversationScope::Group)
     }
 
     /// Converts this context into a private-only context.
-    pub fn into_private(self) -> Result<PrivateContext> {
+    pub fn into_private(self) -> Result<PrivateContext<T>> {
         self.into_scope(ConversationScope::Private)
     }
 
-    fn into_scope<T>(self, expected: ConversationScope) -> Result<BotContext<T>> {
+    fn into_scope<S>(self, expected: ConversationScope) -> Result<BotContext<T, S>> {
         if expected.accepts(&self.event.conversation_scope) {
             Ok(BotContext {
                 client: self.client,
@@ -1825,15 +1867,25 @@ impl BotContext<AnyScope> {
 }
 
 /// Bot route.
-#[derive(Clone)]
-pub struct Route {
+pub struct Route<T = ()> {
     scope: ConversationScope,
     message_type: MessageType,
     commands: Option<Vec<Arc<str>>>,
-    handler: Option<BoxedHandler>,
+    handler: Option<BoxedHandler<T>>,
 }
 
-impl Route {
+impl<T> Clone for Route<T> {
+    fn clone(&self) -> Self {
+        Self {
+            scope: self.scope.clone(),
+            message_type: self.message_type.clone(),
+            commands: self.commands.clone(),
+            handler: self.handler.clone(),
+        }
+    }
+}
+
+impl<T: Send + Sync + 'static> Route<T> {
     /// Creates a route for a conversation scope.
     #[must_use]
     pub fn new(scope: ConversationScope) -> Self {
@@ -1879,14 +1931,14 @@ impl Route {
     /// ```
     /// # use dingding::{Result, bot::{Route, ConversationScope}};
     /// # fn main() -> Result<()> {
-    /// let route = Route::new(ConversationScope::Any).handle(|_| async {});
+    /// let route: Route = Route::new(ConversationScope::Any).handle(|_| async {});
     /// route.validate()?;
     /// # Ok(()) }
     /// ```
     #[must_use]
     pub fn handle<F, Fut>(mut self, handler: F) -> Self
     where
-        F: Fn(BotContext) -> Fut + Send + Sync + 'static,
+        F: Fn(BotContext<T>) -> Fut + Send + Sync + 'static,
         Fut: Future + Send + 'static,
         Fut::Output: IntoHandlerResult,
     {
@@ -1901,7 +1953,7 @@ impl Route {
     #[must_use]
     pub fn handle_group<F, Fut>(mut self, handler: F) -> Self
     where
-        F: Fn(GroupContext) -> Fut + Send + Sync + 'static,
+        F: Fn(GroupContext<T>) -> Fut + Send + Sync + 'static,
         Fut: Future + Send + 'static,
         Fut::Output: IntoHandlerResult,
     {
@@ -1921,7 +1973,7 @@ impl Route {
     #[must_use]
     pub fn handle_private<F, Fut>(mut self, handler: F) -> Self
     where
-        F: Fn(PrivateContext) -> Fut + Send + Sync + 'static,
+        F: Fn(PrivateContext<T>) -> Fut + Send + Sync + 'static,
         Fut: Future + Send + 'static,
         Fut::Output: IntoHandlerResult,
     {
@@ -2072,18 +2124,6 @@ fn validate_command(command: &str) -> Result<()> {
     Ok(())
 }
 
-fn dispatch_route(
-    client: &DingTalk,
-    state: Option<&BotState>,
-    route: &Route,
-    event: BotEvent,
-) -> Option<BoxFuture> {
-    let handler = route.handler.as_ref()?;
-    let command = route.matched_command(&event);
-    let ctx = BotContext::new(client.clone(), event, command, state.cloned());
-    Some(handler(ctx))
-}
-
 #[derive(Clone)]
 enum BotValidationError {
     InvalidConfig(String),
@@ -2111,25 +2151,84 @@ impl BotValidationError {
 }
 
 /// Bot router and dispatcher.
-#[derive(Clone)]
-pub struct Bot {
+pub struct Bot<T = ()> {
     client: DingTalk,
-    routes: Vec<Route>,
-    fallbacks: Vec<Route>,
-    state: Option<BotState>,
+    routes: Vec<Route<T>>,
+    fallbacks: Vec<Route<T>>,
+    state: Arc<T>,
+    error_handler: Option<ErrorHandler<T>>,
     validation_error: Option<BotValidationError>,
     deduplicator: Arc<dyn EventDeduplicator>,
+}
+
+impl<T> Clone for Bot<T> {
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            routes: self.routes.clone(),
+            fallbacks: self.fallbacks.clone(),
+            state: Arc::clone(&self.state),
+            error_handler: self.error_handler.clone(),
+            validation_error: self.validation_error.clone(),
+            deduplicator: Arc::clone(&self.deduplicator),
+        }
+    }
 }
 
 impl Bot {
     /// Creates a bot router.
     #[must_use]
     pub fn new(client: DingTalk) -> Self {
+        Self::with_state(client, ())
+    }
+
+    /// Creates a router with one shared, compile-time-checked application state.
+    ///
+    /// Handlers receive `Context<T>`, `GroupContext<T>`, or `PrivateContext<T>`.
+    /// State is allocated once behind an `Arc`; `T` does not need to implement `Clone`.
+    ///
+    /// ```
+    /// use dingding::prelude::*;
+    /// use std::sync::atomic::{AtomicUsize, Ordering};
+    /// # fn example() -> Result<()> {
+    /// let bot = Bot::with_state(DingTalk::new()?, AtomicUsize::new(0))
+    ///     .on_group_text_command("/count", |ctx| async move {
+    ///         let count = ctx.state().fetch_add(1, Ordering::Relaxed) + 1;
+    ///         ctx.reply_text(count.to_string()).await
+    ///     });
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// A mismatched handler state cannot be registered:
+    ///
+    /// ```compile_fail
+    /// use dingding::prelude::*;
+    /// async fn handler(_: Context<String>) {}
+    /// # fn example() -> Result<()> {
+    /// let _ = Bot::with_state(DingTalk::new()?, 42_u32)
+    ///     .on_text_command(Scope::Any, "/run", handler);
+    /// # Ok(()) }
+    /// ```
+    #[must_use]
+    pub fn with_state<T: Send + Sync + 'static>(client: DingTalk, state: T) -> Bot<T> {
+        Bot::from_shared_state(client, Arc::new(state))
+    }
+}
+
+impl<T: Send + Sync + 'static> Bot<T> {
+    /// Returns the SDK client used by this router and its handlers.
+    #[must_use]
+    pub fn client(&self) -> &DingTalk {
+        &self.client
+    }
+
+    pub(crate) fn from_shared_state(client: DingTalk, state: Arc<T>) -> Self {
         Self {
             client,
             routes: Vec::new(),
             fallbacks: Vec::new(),
-            state: None,
+            state,
+            error_handler: None,
             validation_error: None,
             deduplicator: Arc::new(MemoryEventDeduplicator::default()),
         }
@@ -2142,25 +2241,13 @@ impl Bot {
         self
     }
 
-    /// Configures shared application state available from [`BotContext::state`].
-    #[must_use]
-    pub fn state<T>(mut self, state: T) -> Self
-    where
-        T: Send + Sync + 'static,
-    {
-        self.state = Some(Arc::new(state));
-        self
+    #[cfg(feature = "stream")]
+    pub(crate) fn shared_state(&self) -> Arc<T> {
+        Arc::clone(&self.state)
     }
 
-    #[cfg(feature = "stream")]
-    pub(crate) fn state_arc(mut self, state: BotState) -> Self {
-        self.state = Some(state);
-        self
-    }
-
-    #[cfg(feature = "stream")]
-    pub(crate) fn shared_state(&self) -> Option<BotState> {
-        self.state.clone()
+    pub(crate) fn set_error_handler(&mut self, handler: ErrorHandler<T>) {
+        self.error_handler = Some(handler);
     }
 
     #[cfg(feature = "stream")]
@@ -2182,7 +2269,7 @@ impl Bot {
     /// Duplicate commands in overlapping scopes and routes fully shadowed by an
     /// earlier catch-all are rejected by [`Self::validate`].
     #[must_use]
-    pub fn route(mut self, route: Route) -> Self {
+    pub fn route(mut self, route: Route<T>) -> Self {
         self.record_validation(route.validate_after(&self.routes, "routes"));
         self.routes.push(route);
         self
@@ -2194,7 +2281,7 @@ impl Bot {
     /// scope/message-specific fallbacks before a catch-all. Unreachable fallbacks
     /// are rejected by [`Self::validate`] instead of silently replacing a handler.
     #[must_use]
-    pub fn fallback_route(mut self, route: Route) -> Self {
+    pub fn fallback_route(mut self, route: Route<T>) -> Self {
         self.record_validation(route.validate_after(&self.fallbacks, "fallbacks"));
         self.fallbacks.push(route);
         self
@@ -2236,27 +2323,29 @@ impl Bot {
     }
 
     async fn dispatch_event(&self, event: BotEvent) -> Result<HandleOutcome> {
-        for route in &self.routes {
-            if !route.matches(&event) {
-                continue;
+        let matched = self
+            .routes
+            .iter()
+            .map(|route| (route, HandleOutcome::Matched))
+            .chain(
+                self.fallbacks
+                    .iter()
+                    .map(|route| (route, HandleOutcome::Fallback)),
+            )
+            .find(|(route, _)| route.matches(&event));
+        if let Some((route, outcome)) = matched
+            && let Some(handler) = &route.handler
+        {
+            let command = route.matched_command(&event);
+            let ctx = BotContext::new(self.client.clone(), event, command, Arc::clone(&self.state));
+            if let Some(on_error) = &self.error_handler {
+                if let Err(error) = handler(ctx.clone()).await {
+                    on_error(ctx, error).await?;
+                }
+            } else {
+                handler(ctx).await?;
             }
-
-            if let Some(handler) =
-                dispatch_route(&self.client, self.state.as_ref(), route, event.clone())
-            {
-                handler.await?;
-                return Ok(HandleOutcome::Matched);
-            }
-        }
-
-        for route in &self.fallbacks {
-            if route.matches(&event)
-                && let Some(handler) =
-                    dispatch_route(&self.client, self.state.as_ref(), route, event.clone())
-            {
-                handler.await?;
-                return Ok(HandleOutcome::Fallback);
-            }
+            return Ok(outcome);
         }
 
         Ok(HandleOutcome::Ignored)
@@ -2821,19 +2910,19 @@ mod tests {
 
     #[test]
     fn command_routes_reject_ambiguous_configuration() {
-        let untrimmed = Route::new(ConversationScope::Any)
+        let untrimmed = Route::<()>::new(ConversationScope::Any)
             .message_type(MessageType::Text)
             .command(" /ping ")
             .handle(|_ctx| async {})
             .validate()
             .expect_err("commands should not be rewritten");
-        let duplicate = Route::new(ConversationScope::Any)
+        let duplicate = Route::<()>::new(ConversationScope::Any)
             .message_type(MessageType::Text)
             .commands(["/ping", "/ping"])
             .handle(|_ctx| async {})
             .validate()
             .expect_err("duplicate aliases should fail");
-        let non_text = Route::new(ConversationScope::Any)
+        let non_text = Route::<()>::new(ConversationScope::Any)
             .message_type(MessageType::Picture)
             .command("/ping")
             .handle(|_ctx| async {})
@@ -2951,16 +3040,17 @@ mod tests {
         let client = DingTalk::builder().build().expect("client");
         let seen = Arc::new(Mutex::new(None::<String>));
         let seen_state = Arc::clone(&seen);
-        let bot = Bot::new(client)
-            .state(AppState { name: "ops" })
-            .on_text_command(ConversationScope::Group, "/state", move |ctx| {
+        let bot = Bot::with_state(client, AppState { name: "ops" }).on_text_command(
+            ConversationScope::Group,
+            "/state",
+            move |ctx| {
                 let seen_state = Arc::clone(&seen_state);
                 async move {
-                    *seen_state.lock().expect("state lock") =
-                        Some(ctx.state_required::<AppState>()?.name.to_string());
+                    *seen_state.lock().expect("state lock") = Some(ctx.state().name.to_string());
                     Ok::<_, dingding::Error>(())
                 }
-            });
+            },
+        );
 
         let outcome = bot
             .handle_event(BotEvent::text(ConversationScope::Group, "/state"))
@@ -3065,7 +3155,7 @@ mod tests {
         let event = BotEvent::from_value(serde_json::json!({
             "senderStaffId": "sender 1"
         }));
-        let ctx: BotContext = BotContext::new(client, event, None, None);
+        let ctx: BotContext = BotContext::new(client, event, None, Arc::new(()));
 
         assert!(ctx.sender_mention().is_empty());
     }
@@ -3138,23 +3228,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn context_reports_missing_required_state() {
+    async fn stateless_context_has_unit_state() {
         let client = DingTalk::builder().build().expect("client");
         let bot = Bot::new(client).on_text_command(
             ConversationScope::Group,
             "/state",
             |ctx| async move {
-                let _state = ctx.state_required::<AppState>()?;
+                assert_eq!(ctx.state(), &());
                 Ok::<_, dingding::Error>(())
             },
         );
 
-        let error = bot
+        let outcome = bot
             .handle_event(BotEvent::text(ConversationScope::Group, "/state"))
             .await
-            .expect_err("missing state should fail");
+            .expect("stateless handler");
 
-        assert_eq!(error.kind(), crate::ErrorKind::InvalidConfig);
+        assert_eq!(outcome, HandleOutcome::Matched);
     }
 
     #[tokio::test]

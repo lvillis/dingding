@@ -37,8 +37,8 @@ pub use crate::stream::{
     CardCallbackEvent, CardCallbackOperator, CardCallbackPayload, CardCallbackPrivateData,
     CardCallbackResponse, ReconnectPolicy, StreamBot, StreamBotBuilder, StreamCancellationReason,
     StreamClient, StreamClientBuilder, StreamContext, StreamError, StreamExit, StreamFrame,
-    StreamFrameResponse, StreamFrameType, StreamHeaders, StreamProcessingPolicy, StreamRunEvent,
-    StreamSubscription, StreamSubscriptionType,
+    StreamFrameResponse, StreamFrameType, StreamHeaders, StreamOrdering, StreamProcessingPolicy,
+    StreamRunEvent, StreamSubscription, StreamSubscriptionType,
 };
 
 #[cfg(feature = "webhook")]

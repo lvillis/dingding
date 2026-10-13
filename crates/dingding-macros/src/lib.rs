@@ -16,6 +16,8 @@ use syn::{Expr, ExprLit, ItemFn, Lit, Meta, Token, parse_macro_input, punctuated
 /// Handlers may return `()`, `dingding::Result<()>`, `dingding::HandlerResult`, or another result
 /// whose error converts into a boxed `Send + Sync` application error.
 /// Accepts zero arguments or one context argument. Access the event with `ctx.event()`.
+/// A stateful `Context<AppState>` (including type aliases and scoped contexts)
+/// generates `Route<AppState>`. Zero-argument handlers work with any state type.
 ///
 /// Example:
 ///
@@ -123,6 +125,18 @@ fn expand_handler(
     let fn_ident = &input.sig.ident;
     let vis = &input.vis;
     let arg_count = input.sig.inputs.len();
+    let state_type = match input.sig.inputs.first() {
+        Some(syn::FnArg::Typed(argument)) => {
+            let ty = &argument.ty;
+            quote! { <#ty as #crate_path::bot::ContextState>::State }
+        }
+        _ => quote! { __DingdingState },
+    };
+    let route_generics = if arg_count == 0 {
+        quote! { <__DingdingState: ::core::marker::Send + ::core::marker::Sync + 'static> }
+    } else {
+        quote! {}
+    };
     let handler_tokens = match arg_count {
         0 => quote! {
             .#handler_method(|_ctx| async move {
@@ -159,7 +173,7 @@ fn expand_handler(
         #input
         #filter_marker_tokens
 
-        #vis fn #route_ident() -> #crate_path::bot::Route {
+        #vis fn #route_ident #route_generics () -> #crate_path::bot::Route<#state_type> {
             #crate_path::bot::Route::new(#scope_tokens)
                 .message_type(#message_tokens)
                 #command_tokens

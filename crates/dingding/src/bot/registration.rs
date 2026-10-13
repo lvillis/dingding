@@ -1,4 +1,4 @@
-use std::future::Future;
+use std::{future::Future, sync::Arc};
 
 use super::{Bot, BotContext, ConversationScope, GroupContext, MessageType, PrivateContext, Route};
 use crate::IntoHandlerResult;
@@ -6,7 +6,31 @@ use crate::IntoHandlerResult;
 // Keep the Bot and StreamBotBuilder registration surfaces identical.
 macro_rules! impl_registration {
     ($target:ty) => {
-        impl $target {
+        impl<T: Send + Sync + 'static> $target {
+            /// Handles errors returned by bot routes and fallbacks using the original context.
+            ///
+            /// Returning `()` or `Ok(())` deliberately marks the event as handled. Normal
+            /// deduplication applies and Stream attempts a success ACK. Return
+            /// the original error to preserve failure semantics. A failed error handler
+            /// propagates its error and is never called recursively.
+            ///
+            /// No message is sent automatically. Choose a safe user-facing message instead
+            /// of exposing internal errors. The hook runs within the original Stream deadline;
+            /// panics, cancellation, timeouts, and deduplication failures do not invoke it.
+            #[must_use]
+            pub fn on_error<F, Fut>(mut self, handler: F) -> Self
+            where
+                F: Fn(BotContext<T>, crate::Error) -> Fut + Send + Sync + 'static,
+                Fut: Future + Send + 'static,
+                Fut::Output: IntoHandlerResult,
+            {
+                self.set_error_handler(Arc::new(move |ctx, error| {
+                    let future = handler(ctx, error);
+                    Box::pin(async move { future.await.into_handler_result() })
+                }));
+                self
+            }
+
             /// Registers a text command handler returning `()` or an SDK/application result.
             #[must_use]
             pub fn on_text_command<F, Fut>(
@@ -16,7 +40,7 @@ macro_rules! impl_registration {
                 handler: F,
             ) -> Self
             where
-                F: Fn(BotContext) -> Fut + Send + Sync + 'static,
+                F: Fn(BotContext<T>) -> Fut + Send + Sync + 'static,
                 Fut: Future + Send + 'static,
                 Fut::Output: IntoHandlerResult,
             {
@@ -39,7 +63,7 @@ macro_rules! impl_registration {
             where
                 I: IntoIterator<Item = S>,
                 S: Into<String>,
-                F: Fn(BotContext) -> Fut + Send + Sync + 'static,
+                F: Fn(BotContext<T>) -> Fut + Send + Sync + 'static,
                 Fut: Future + Send + 'static,
                 Fut::Output: IntoHandlerResult,
             {
@@ -60,7 +84,7 @@ macro_rules! impl_registration {
                 handler: F,
             ) -> Self
             where
-                F: Fn(BotContext) -> Fut + Send + Sync + 'static,
+                F: Fn(BotContext<T>) -> Fut + Send + Sync + 'static,
                 Fut: Future + Send + 'static,
                 Fut::Output: IntoHandlerResult,
             {
@@ -76,7 +100,7 @@ macro_rules! impl_registration {
                 handler: F,
             ) -> Self
             where
-                F: Fn(GroupContext) -> Fut + Send + Sync + 'static,
+                F: Fn(GroupContext<T>) -> Fut + Send + Sync + 'static,
                 Fut: Future + Send + 'static,
                 Fut::Output: IntoHandlerResult,
             {
@@ -95,7 +119,7 @@ macro_rules! impl_registration {
             where
                 I: IntoIterator<Item = S>,
                 S: Into<String>,
-                F: Fn(GroupContext) -> Fut + Send + Sync + 'static,
+                F: Fn(GroupContext<T>) -> Fut + Send + Sync + 'static,
                 Fut: Future + Send + 'static,
                 Fut::Output: IntoHandlerResult,
             {
@@ -116,7 +140,7 @@ macro_rules! impl_registration {
                 handler: F,
             ) -> Self
             where
-                F: Fn(PrivateContext) -> Fut + Send + Sync + 'static,
+                F: Fn(PrivateContext<T>) -> Fut + Send + Sync + 'static,
                 Fut: Future + Send + 'static,
                 Fut::Output: IntoHandlerResult,
             {
@@ -135,7 +159,7 @@ macro_rules! impl_registration {
             where
                 I: IntoIterator<Item = S>,
                 S: Into<String>,
-                F: Fn(PrivateContext) -> Fut + Send + Sync + 'static,
+                F: Fn(PrivateContext<T>) -> Fut + Send + Sync + 'static,
                 Fut: Future + Send + 'static,
                 Fut::Output: IntoHandlerResult,
             {
@@ -152,7 +176,7 @@ macro_rules! impl_registration {
             #[must_use]
             pub fn on_group_message<F, Fut>(self, message_type: MessageType, handler: F) -> Self
             where
-                F: Fn(GroupContext) -> Fut + Send + Sync + 'static,
+                F: Fn(GroupContext<T>) -> Fut + Send + Sync + 'static,
                 Fut: Future + Send + 'static,
                 Fut::Output: IntoHandlerResult,
             {
@@ -168,7 +192,7 @@ macro_rules! impl_registration {
             #[must_use]
             pub fn on_private_message<F, Fut>(self, message_type: MessageType, handler: F) -> Self
             where
-                F: Fn(PrivateContext) -> Fut + Send + Sync + 'static,
+                F: Fn(PrivateContext<T>) -> Fut + Send + Sync + 'static,
                 Fut: Future + Send + 'static,
                 Fut::Output: IntoHandlerResult,
             {
@@ -185,7 +209,7 @@ macro_rules! impl_registration {
             #[must_use]
             pub fn fallback<F, Fut>(self, handler: F) -> Self
             where
-                F: Fn(BotContext) -> Fut + Send + Sync + 'static,
+                F: Fn(BotContext<T>) -> Fut + Send + Sync + 'static,
                 Fut: Future + Send + 'static,
                 Fut::Output: IntoHandlerResult,
             {
@@ -198,7 +222,7 @@ macro_rules! impl_registration {
             #[must_use]
             pub fn on_unmatched_text<F, Fut>(self, scope: ConversationScope, handler: F) -> Self
             where
-                F: Fn(BotContext) -> Fut + Send + Sync + 'static,
+                F: Fn(BotContext<T>) -> Fut + Send + Sync + 'static,
                 Fut: Future + Send + 'static,
                 Fut::Output: IntoHandlerResult,
             {
@@ -212,6 +236,6 @@ macro_rules! impl_registration {
     };
 }
 
-impl_registration!(Bot);
+impl_registration!(Bot<T>);
 #[cfg(feature = "stream")]
-impl_registration!(crate::stream::StreamBotBuilder);
+impl_registration!(crate::stream::StreamBotBuilder<T>);

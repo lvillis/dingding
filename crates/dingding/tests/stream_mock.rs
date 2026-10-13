@@ -14,7 +14,7 @@ use dingding::{
     DingTalk, Error,
     stream::{
         CARD_CALLBACK_TOPIC, ReconnectPolicy, StreamCancellationReason, StreamClient,
-        StreamFrameResponse, StreamProcessingPolicy, StreamRunEvent,
+        StreamFrameResponse, StreamOrdering, StreamProcessingPolicy, StreamRunEvent,
     },
 };
 use futures_util::{SinkExt, StreamExt};
@@ -177,6 +177,14 @@ fn frame(kind: &str, topic: &str, id: &str) -> Message {
     Message::Text(json!({"specVersion":"1.0","type":kind,"headers":{"topic":topic,"messageId":id,"contentType":"application/json"},"data":"{}"}).to_string().into())
 }
 
+fn bot_frame(id: &str, conversation: &str, text: &str) -> Message {
+    Message::Text(json!({
+        "type":"CALLBACK", "headers":{"topic":dingding::stream::BOT_MESSAGE_TOPIC,"messageId":id},
+        "data":{"conversationType":"2","conversationId":conversation,"msgId":id,
+            "msgtype":"text","text":{"content":text}}
+    }).to_string().into())
+}
+
 async fn send(socket: &mut Socket, message: Message) {
     bounded(socket.send(message)).await.expect("send frame");
 }
@@ -193,13 +201,15 @@ async fn ack(socket: &mut Socket) -> Value {
     }
 }
 
-fn launch(stream: StreamClient) -> (oneshot::Sender<()>, JoinHandle<dingding::Result<()>>) {
+fn launch<T: Send + Sync + 'static>(
+    stream: StreamClient<T>,
+) -> (oneshot::Sender<()>, JoinHandle<dingding::Result<()>>) {
     let (stop, _observed, task) = launch_with_observed_shutdown(stream);
     (stop, task)
 }
 
-fn launch_with_observed_shutdown(
-    stream: StreamClient,
+fn launch_with_observed_shutdown<T: Send + Sync + 'static>(
+    stream: StreamClient<T>,
 ) -> (
     oneshot::Sender<()>,
     oneshot::Receiver<()>,
@@ -334,6 +344,7 @@ async fn concurrency_and_queue_are_bounded_without_blocking_control_frames() {
         .expect("builder")
         .processing_policy(StreamProcessingPolicy {
             max_concurrent_handlers: 2,
+            ordering: StreamOrdering::Concurrent,
             queue_capacity: 1,
             ..StreamProcessingPolicy::default()
         })
@@ -755,6 +766,7 @@ async fn concurrent_duplicate_is_not_executed_or_acknowledged_as_completed() {
         .expect("builder")
         .processing_policy(StreamProcessingPolicy {
             max_concurrent_handlers: 2,
+            ordering: StreamOrdering::Concurrent,
             ..StreamProcessingPolicy::default()
         })
         .on_frame(move |_ctx, _| {
@@ -980,4 +992,181 @@ async fn already_signalled_shutdown_does_not_open_a_connection() {
     bounded(stream.run_until(async {}))
         .await
         .expect("shutdown before connect");
+}
+
+#[tokio::test]
+async fn per_conversation_ordering_is_bounded_without_blocking_other_conversations() {
+    for capacity in [0, 1] {
+        let (client, listener, http) = gateway(1).await;
+        let gate = Arc::new(Semaphore::new(0));
+        let permits = Arc::clone(&gate);
+        let (started, mut starts) = mpsc::unbounded_channel();
+        let bot = dingding::bot::Bot::new(client).on_group_text_command("/run", move |ctx| {
+            let gate = Arc::clone(&gate);
+            let started = started.clone();
+            async move {
+                started
+                    .send(ctx.message_id().expect("id").to_owned())
+                    .expect("started");
+                if ctx.conversation_id() == Some("slow") {
+                    gate.acquire().await.expect("gate").forget();
+                }
+            }
+        });
+        let stream = StreamClient::from_bot(bot)
+            .expect("builder")
+            .processing_policy(StreamProcessingPolicy {
+                max_concurrent_handlers: 2,
+                queue_capacity: capacity,
+                ..StreamProcessingPolicy::default()
+            })
+            .build()
+            .expect("stream");
+        let (stop, task) = launch(stream);
+        let mut socket = accept(&listener).await;
+        send(&mut socket, bot_frame("slow-1", "slow", "/run")).await;
+        assert_eq!(bounded(starts.recv()).await.as_deref(), Some("slow-1"));
+        if capacity == 1 {
+            send(&mut socket, bot_frame("slow-2", "slow", "/run")).await;
+        }
+        send(&mut socket, bot_frame("overflow", "slow", "/run")).await;
+        let rejected = ack(&mut socket).await;
+        assert_eq!(rejected["headers"]["messageId"], "overflow");
+        assert_eq!(rejected["code"], 500);
+        send(&mut socket, bot_frame("fast", "fast", "/run")).await;
+        assert_eq!(bounded(starts.recv()).await.as_deref(), Some("fast"));
+        assert_eq!(ack(&mut socket).await["headers"]["messageId"], "fast");
+        assert!(starts.try_recv().is_err(), "same conversation stays queued");
+        stop.send(()).expect("shutdown");
+        permits.add_permits(1 + capacity);
+        assert_eq!(ack(&mut socket).await["headers"]["messageId"], "slow-1");
+        if capacity == 1 {
+            assert_eq!(bounded(starts.recv()).await.as_deref(), Some("slow-2"));
+            assert_eq!(ack(&mut socket).await["headers"]["messageId"], "slow-2");
+        }
+        bounded(task).await.expect("task").expect("drained");
+        bounded(http).await.expect("gateway task");
+    }
+}
+
+#[tokio::test]
+async fn error_hooks_control_ack_and_dedup_and_share_the_handler_deadline() {
+    for mode in 0..5 {
+        let (client, listener, http) = gateway(1).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recoveries = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&recoveries);
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let cancellations = Arc::clone(&cancelled);
+        let bot = dingding::bot::Bot::with_state(client, Arc::clone(&calls))
+            .on_group_text_command("/fail", |ctx| async move {
+                ctx.state().fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(Error::MissingCredentials)
+            })
+            .on_error(move |ctx, error| {
+                let counter = Arc::clone(&counter);
+                async move {
+                    assert_eq!(ctx.command(), Some("/fail"));
+                    assert_eq!(error.kind(), dingding::ErrorKind::MissingCredentials);
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    match mode {
+                        0 => {
+                            tokio::task::yield_now().await;
+                            Ok(())
+                        }
+                        1 => Err(error),
+                        2 => ctx.reply_text("Temporarily unavailable.").await,
+                        3 => std::future::pending().await,
+                        _ => panic!("error hook panicked"),
+                    }
+                }
+            });
+        let stream = StreamClient::from_bot(bot)
+            .expect("builder")
+            .processing_policy(StreamProcessingPolicy {
+                handler_timeout: Duration::from_millis(100),
+                ..StreamProcessingPolicy::default()
+            })
+            .on_event(move |event| {
+                if matches!(
+                    event,
+                    StreamRunEvent::FrameCancelled {
+                        reason: StreamCancellationReason::HandlerTimeout,
+                        ..
+                    }
+                ) {
+                    cancellations.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .build()
+            .expect("stream");
+        let (stop, task) = launch(stream);
+        let mut socket = accept(&listener).await;
+        for _ in 0..2 {
+            send(&mut socket, bot_frame("same", "group", "/fail")).await;
+            assert_eq!(
+                ack(&mut socket).await["code"],
+                if mode == 0 { 200 } else { 500 }
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), if mode == 0 { 1 } else { 2 });
+        assert_eq!(
+            recoveries.load(Ordering::SeqCst),
+            if mode == 0 { 1 } else { 2 }
+        );
+        assert_eq!(
+            cancelled.load(Ordering::SeqCst),
+            if mode == 3 { 2 } else { 0 }
+        );
+        stop.send(()).expect("shutdown");
+        bounded(task).await.expect("task").expect("drained");
+        bounded(http).await.expect("gateway task");
+    }
+}
+
+#[tokio::test]
+async fn failures_and_timeouts_release_the_conversation_lane() {
+    for mode in ["error", "timeout", "panic"] {
+        let (client, listener, http) = gateway(1).await;
+        let (started, mut starts) = mpsc::unbounded_channel();
+        let bot = dingding::bot::Bot::new(client).on_group_text_command("/run", move |ctx| {
+            let started = started.clone();
+            async move {
+                started
+                    .send(ctx.message_id().expect("id").to_owned())
+                    .expect("started");
+                if ctx.message_id() == Some("first") {
+                    match mode {
+                        "error" => return Err(Error::MissingCredentials),
+                        "timeout" => std::future::pending::<()>().await,
+                        _ => panic!("business handler panic"),
+                    }
+                }
+                Ok(())
+            }
+        });
+        let stream = StreamClient::from_bot(bot)
+            .expect("builder")
+            .processing_policy(StreamProcessingPolicy {
+                handler_timeout: Duration::from_millis(100),
+                ..StreamProcessingPolicy::default()
+            })
+            .build()
+            .expect("stream");
+        let (stop, task) = launch(stream);
+        let mut socket = accept(&listener).await;
+        send(&mut socket, bot_frame("first", "same", "/run")).await;
+        send(&mut socket, bot_frame("second", "same", "/run")).await;
+        assert_eq!(bounded(starts.recv()).await.as_deref(), Some("first"));
+        let failed = ack(&mut socket).await;
+        assert_eq!(failed["headers"]["messageId"], "first");
+        assert_eq!(failed["code"], 500);
+        assert_eq!(bounded(starts.recv()).await.as_deref(), Some("second"));
+        let success = ack(&mut socket).await;
+        assert_eq!(success["headers"]["messageId"], "second");
+        assert_eq!(success["code"], 200);
+        stop.send(()).expect("shutdown");
+        bounded(task).await.expect("task").expect("drained");
+        bounded(http).await.expect("gateway task");
+    }
 }

@@ -31,6 +31,15 @@ async fn main() -> Result<()> {
         .on_unmatched_text(Scope::Any, |ctx| async move {
             ctx.reply_text("Try /ping or /echo <text>.").await
         })
+        .on_error(|ctx, error| async move {
+            tracing::warn!(kind = %error.kind(), %error, "command failed");
+            if error.is_retryable() {
+                ctx.reply_text("Service temporarily unavailable. Please try again later.")
+                    .await
+            } else {
+                Err(error)
+            }
+        })
         .run_until(async {
             if let Err(error) = tokio::signal::ctrl_c().await {
                 tracing::error!(%error, "failed to listen for Ctrl-C");

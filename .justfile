@@ -11,6 +11,7 @@ ci:
     cargo clippy --workspace --all-targets -- -D warnings
     cargo check -p dingding --no-default-features --features async-tls-rustls-ring,webhook
     cargo check -p dingding --no-default-features --features async-tls-rustls-ring,openapi
+    cargo check -p dingding --no-default-features --features async-tls-rustls-ring,bot
     cargo check -p dingding --no-default-features --features async-tls-rustls-ring,stream,macros
     cargo check -p dingding --no-default-features --features async-tls-rustls-graviola,webhook
     cargo check -p dingding --no-default-features --features async-tls-rustls-graviola,stream,macros

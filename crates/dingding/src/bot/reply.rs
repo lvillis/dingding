@@ -32,7 +32,7 @@ impl BotEvent {
     }
 }
 
-impl<S> BotContext<S> {
+impl<T, S> BotContext<T, S> {
     /// Captures the reply destination without retaining this context or its credentials.
     pub fn robot_reply_target(&self) -> Result<RobotReplyTarget> {
         self.event.robot_reply_target()

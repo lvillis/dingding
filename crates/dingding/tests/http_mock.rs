@@ -18,6 +18,37 @@ use serde_json::{Value, json};
 
 type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
+#[cfg(feature = "bot")]
+#[tokio::test]
+async fn error_hook_sends_a_safe_session_reply_once() -> TestResult<()> {
+    use dingding::bot::{Bot, BotEvent, ConversationScope, HandleOutcome};
+    let server = MockServer::spawn([MockResponse::json(r#"{"errcode":0,"errmsg":"ok"}"#)])?;
+    let bot = Bot::new(dingtalk_for_mock(&server)?)
+        .on_group_text_command("/run", |_| async {
+            Err::<(), _>(io::Error::other("access_token=private-error"))
+        })
+        .on_error(|ctx, error| async move {
+            assert_eq!(error.kind(), ErrorKind::Handler);
+            ctx.reply_text("Service temporarily unavailable.").await
+        });
+    let mut event = BotEvent::text(ConversationScope::Group, "/run");
+    event.message_id = Some("recoverable".into());
+    event.session_webhook = Some(format!("{}/session", server.base_url()));
+    for _ in 0..2 {
+        assert_eq!(
+            bot.handle_event(event.clone()).await?,
+            HandleOutcome::Matched
+        );
+    }
+    let request = server.next_request()?;
+    assert_eq!(request.path(), "/session");
+    assert_eq!(
+        request.json_body()?,
+        json!({"msgtype":"text","text":{"content":"Service temporarily unavailable."}})
+    );
+    server.finish()
+}
+
 #[tokio::test]
 async fn webhook_errors_preserve_status_retry_after_and_header_request_id() -> TestResult<()> {
     for (status, reason) in [(429, "Too Many Requests"), (200, "OK")] {

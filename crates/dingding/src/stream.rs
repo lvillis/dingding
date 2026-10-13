@@ -15,9 +15,9 @@
 //! ```
 //! use dingding::prelude::*;
 //!
-//! fn configure(client: DingTalk) -> StreamBotBuilder {
-//!     StreamBot::from_client(client)
-//!         .state(String::from("done"))
+//! fn configure(client: DingTalk) -> StreamBotBuilder<String> {
+//!     StreamBot::with_state(String::from("done"))
+//!         .client(client)
 //!         .on_group_text_command("/ping", |ctx| handler_future(async move {
 //!             let text = String::from_utf8(b"pong".to_vec())?;
 //!             ctx.reply_text(text).await?;
@@ -25,16 +25,18 @@
 //!         }))
 //!         .on_card_callback(|ctx, _| async move {
 //!             CardCallbackResponse::new().card_data([
-//!                 ("status", ctx.state_required::<String>()?),
+//!                 ("status", ctx.state()),
 //!             ])
 //!         })
 //! }
 //! ```
 //!
 //! All business handlers share the same state allocation, even in card-only or
-//! frame-only applications. [`StreamClientBuilder`] inherits a supplied Bot's
-//! state; an explicit [`StreamClientBuilder::state`] overrides it for all handlers
-//! regardless of setter order. Other clones of the supplied Bot keep their state.
+//! frame-only applications. State is configured at construction and its type must
+//! agree with every route and callback. [`StreamBot::from_env_with_state`] is the
+//! shortest stateful entry point. [`StreamClient::from_bot`] shares the supplied
+//! router's state with Stream callbacks; [`StreamClientBuilder::bot`] also adopts
+//! the supplied router's state. No runtime casts or state replacement setter is used.
 //!
 //! Explicit builder credentials override client defaults for the connection and
 //! every handler's SDK client, including a separately supplied Bot. Transports,
@@ -60,7 +62,9 @@
 //! optional observers and do not disable diagnostics. Avoid logging the same
 //! events twice. Handler errors produce failure ACKs without stopping the runner;
 //! connection errors retry by default. Neither automatically sends an error message
-//! to the conversation.
+//! to the conversation. Use [`StreamBotBuilder::on_error`] for an asynchronous
+//! business error handler with the original typed context. Successful recovery
+//! marks the callback as handled; returning an error preserves a failure ACK.
 //!
 //! Observers can request shutdown through an application-owned signal, for example
 //! to stop reconnecting on an authentication error:
@@ -87,13 +91,20 @@
 //!
 //! # Processing and shutdown
 //!
-//! Defaults: one concurrent handler, 64 waiting business frames, a 30-second
+//! Defaults: up to four concurrent handlers, 64 waiting business frames, a 30-second
 //! handler timeout, 5-second write timeout, and separate 30-second shutdown and
 //! disconnect drain deadlines.
-//! Concurrency greater than one allows out-of-order completion. Heartbeats and
+//! [`StreamOrdering::PerConversation`] preserves bot-message order within a
+//! conversation and allows concurrency across conversations. Missing/unknown
+//! conversation identities and non-bot frames share a conservative serial lane.
+//! Queued frames do not occupy execution slots. Choose [`StreamOrdering::Serial`]
+//! for global ordering or [`StreamOrdering::Concurrent`] for unrestricted ordering
+//! within the configured concurrency limit. Ordering is local to one runner;
+//! multiple replicas still need business-level coordination. Heartbeats and
 //! ACK writes continue while asynchronous handlers run. Overload, handler errors,
 //! panics, and timeouts produce failure ACKs. Handler deadlines also cover
-//! deduplication storage operations.
+//! deduplication storage operations and asynchronous business error handling, but
+//! not time spent waiting in the queue.
 //!
 //! [`StreamBot::run_until`] and [`StreamClient::run_until`] stop accepting business
 //! work when the shutdown future resolves, then drain accepted handlers and ACKs.
@@ -137,9 +148,7 @@
 //! Persist jobs and external operation identifiers durably before acknowledging them,
 //! and record/reconcile results outside the handler deadline when necessary.
 
-use std::{
-    any::Any, collections::BTreeMap, fmt, future::Future, pin::Pin, sync::Arc, time::Duration,
-};
+use std::{collections::BTreeMap, fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use futures_util::{
     future::{Either, FutureExt, pending, select},
@@ -153,7 +162,7 @@ use url::Url;
 use crate::{
     DingTalk, Error, Result,
     auth::AppCredentials,
-    bot::{Bot, BotEvent, BotState, ConversationScope, HandleOutcome, MessageType, Route},
+    bot::{Bot, BotEvent, ConversationScope, ErrorHandler, HandleOutcome, MessageType, Route},
     transport::{
         BodySnippetConfig, api_error_from_body, decode_json_response, response_envelope_error,
         with_response_metadata,
@@ -168,10 +177,12 @@ mod error;
 mod handler_tests;
 mod handlers;
 mod runtime;
+mod scheduling;
 use crate::bot::dedup::{EventDeduplicator, MemoryEventDeduplicator};
 pub use context::StreamContext;
 pub use error::StreamError;
 pub use runtime::{StreamCancellationReason, StreamProcessingPolicy};
+pub use scheduling::StreamOrdering;
 
 /// Stream topic for robot message callbacks.
 pub const BOT_MESSAGE_TOPIC: &str = "/v1.0/im/bot/messages/get";
@@ -181,24 +192,31 @@ pub const CARD_CALLBACK_TOPIC: &str = "/v1.0/card/instances/callback";
 type StreamEventHandler = Arc<dyn Fn(StreamRunEvent) + Send + Sync + 'static>;
 type BoxStreamFrameFuture =
     Pin<Box<dyn Future<Output = Result<StreamFrameResponse>> + Send + 'static>>;
-type StreamFrameHandler =
-    Arc<dyn Fn(StreamContext, StreamFrame) -> BoxStreamFrameFuture + Send + Sync + 'static>;
+type StreamFrameHandler<T> =
+    Arc<dyn Fn(StreamContext<T>, StreamFrame) -> BoxStreamFrameFuture + Send + Sync + 'static>;
 type CardCallbackFuture =
     Pin<Box<dyn Future<Output = Result<StreamFrameResponse>> + Send + 'static>>;
-type CardCallbackHandler =
-    Arc<dyn Fn(StreamContext, CardCallbackEvent) -> CardCallbackFuture + Send + Sync + 'static>;
+type CardCallbackHandler<T> =
+    Arc<dyn Fn(StreamContext<T>, CardCallbackEvent) -> CardCallbackFuture + Send + Sync + 'static>;
 
 /// High-level Stream robot application.
-#[derive(Clone)]
-pub struct StreamBot {
-    client: StreamClient,
+pub struct StreamBot<T = ()> {
+    client: StreamClient<T>,
+}
+
+impl<T> Clone for StreamBot<T> {
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+        }
+    }
 }
 
 impl StreamBot {
     /// Creates a high-level Stream bot builder.
     #[must_use]
     pub fn builder() -> StreamBotBuilder {
-        StreamBotBuilder::new()
+        Self::with_state(())
     }
 
     /// Creates a Stream bot builder using app credentials from environment variables.
@@ -206,15 +224,43 @@ impl StreamBot {
     /// Reads `DINGTALK_CLIENT_ID` / `DINGTALK_CLIENT_SECRET`, falling back to
     /// `DINGTALK_APP_KEY` / `DINGTALK_APP_SECRET`.
     pub fn from_env() -> Result<StreamBotBuilder> {
-        StreamBotBuilder::from_env()
+        Self::from_env_with_state(())
     }
 
     /// Creates a Stream bot builder from an existing SDK client.
     #[must_use]
     pub fn from_client(client: DingTalk) -> StreamBotBuilder {
-        StreamBotBuilder::from_client(client)
+        Self::builder().client(client)
     }
 
+    /// Creates a builder with one shared, compile-time-checked application state.
+    /// Configure credentials with `credentials`, `client_id_and_secret`, or `client`.
+    #[must_use]
+    pub fn with_state<T: Send + Sync + 'static>(state: T) -> StreamBotBuilder<T> {
+        StreamBotBuilder::new(Arc::new(state))
+    }
+
+    /// Loads credentials from the environment and configures typed application state.
+    ///
+    /// ```no_run
+    /// use dingding::prelude::*;
+    /// struct AppState { greeting: String }
+    /// async fn hello(ctx: Context<AppState>) -> Result<()> {
+    ///     ctx.reply_text(&ctx.state().greeting).await
+    /// }
+    /// # async fn run() -> Result<()> {
+    /// StreamBot::from_env_with_state(AppState { greeting: "Hello".into() })?
+    ///     .on_text_command(Scope::Any, "/hello", hello)
+    ///     .run_until(async { let _ = tokio::signal::ctrl_c().await; })
+    ///     .await
+    /// # }
+    /// ```
+    pub fn from_env_with_state<T: Send + Sync + 'static>(state: T) -> Result<StreamBotBuilder<T>> {
+        Ok(Self::with_state(state).credentials(AppCredentials::from_env()?))
+    }
+}
+
+impl<T: Send + Sync + 'static> StreamBot<T> {
     /// Runs the Stream bot forever with reconnect backoff.
     pub async fn run(&self) -> Result<()> {
         self.client.run().await
@@ -230,12 +276,13 @@ impl StreamBot {
 }
 
 /// Builder for [`StreamBot`].
-pub struct StreamBotBuilder {
+pub struct StreamBotBuilder<T = ()> {
     client: Option<DingTalk>,
     credentials: Option<AppCredentials>,
-    routes: Vec<Route>,
-    fallbacks: Vec<Route>,
-    state: Option<BotState>,
+    routes: Vec<Route<T>>,
+    fallbacks: Vec<Route<T>>,
+    state: Arc<T>,
+    error_handler: Option<ErrorHandler<T>>,
     subscriptions: Vec<StreamSubscription>,
     subscriptions_replaced: bool,
     local_ip: Option<String>,
@@ -245,18 +292,19 @@ pub struct StreamBotBuilder {
     processing: StreamProcessingPolicy,
     deduplicator: Arc<dyn EventDeduplicator>,
     event_handler: Option<StreamEventHandler>,
-    frame_handler: Option<StreamFrameHandler>,
-    card_callback_handler: Option<CardCallbackHandler>,
+    frame_handler: Option<StreamFrameHandler<T>>,
+    card_callback_handler: Option<CardCallbackHandler<T>>,
 }
 
-impl StreamBotBuilder {
-    fn new() -> Self {
+impl<T: Send + Sync + 'static> StreamBotBuilder<T> {
+    fn new(state: Arc<T>) -> Self {
         Self {
             client: None,
             credentials: None,
             routes: Vec::new(),
             fallbacks: Vec::new(),
-            state: None,
+            state,
+            error_handler: None,
             subscriptions: Vec::new(),
             subscriptions_replaced: false,
             local_ip: None,
@@ -268,17 +316,6 @@ impl StreamBotBuilder {
             event_handler: None,
             frame_handler: None,
             card_callback_handler: None,
-        }
-    }
-
-    fn from_env() -> Result<Self> {
-        Ok(Self::new().credentials(AppCredentials::from_env()?))
-    }
-
-    fn from_client(client: DingTalk) -> Self {
-        Self {
-            client: Some(client),
-            ..Self::new()
         }
     }
 
@@ -309,7 +346,7 @@ impl StreamBotBuilder {
 
     /// Appends a route. Conflicts and unreachable routes are rejected by [`Self::build`].
     #[must_use]
-    pub fn route(mut self, route: Route) -> Self {
+    pub fn route(mut self, route: Route<T>) -> Self {
         self.routes.push(route);
         self
     }
@@ -319,21 +356,13 @@ impl StreamBotBuilder {
     /// Fallbacks accumulate in registration order. Put specific fallbacks first
     /// and catch-all handlers last. See [`Bot::fallback_route`].
     #[must_use]
-    pub fn fallback_route(mut self, route: Route) -> Self {
+    pub fn fallback_route(mut self, route: Route<T>) -> Self {
         self.fallbacks.push(route);
         self
     }
 
-    /// Configures shared state for bot, frame, and card handlers.
-    ///
-    /// Available through [`crate::bot::BotContext::state`] and [`StreamContext::state`].
-    #[must_use]
-    pub fn state<T>(mut self, state: T) -> Self
-    where
-        T: Send + Sync + 'static,
-    {
-        self.state = Some(Arc::new(state) as Arc<dyn Any + Send + Sync>);
-        self
+    pub(crate) fn set_error_handler(&mut self, handler: ErrorHandler<T>) {
+        self.error_handler = Some(handler);
     }
 
     /// Replaces inferred Stream subscriptions.
@@ -410,13 +439,14 @@ impl StreamBotBuilder {
     }
 
     /// Builds the Stream bot.
-    pub fn build(self) -> Result<StreamBot> {
+    pub fn build(self) -> Result<StreamBot<T>> {
         let Self {
             client,
             credentials,
             routes,
             fallbacks,
             state,
+            error_handler,
             subscriptions,
             subscriptions_replaced,
             local_ip,
@@ -432,6 +462,11 @@ impl StreamBotBuilder {
 
         let has_bot_route = !routes.is_empty() || !fallbacks.is_empty();
         let has_frame_handler = frame_handler.is_some() || card_callback_handler.is_some();
+        if error_handler.is_some() && !has_bot_route {
+            return Err(Error::InvalidConfig(
+                "on_error requires a bot route or fallback".into(),
+            ));
+        }
         if !has_bot_route && !has_frame_handler {
             return Err(Error::InvalidConfig(
                 "stream bot route, frame handler, or card callback handler is required".to_string(),
@@ -447,7 +482,7 @@ impl StreamBotBuilder {
             }
         };
 
-        let mut stream = StreamClient::builder(client.clone())?
+        let mut stream = StreamClientBuilder::new(client.clone(), Arc::clone(&state))?
             .subscriptions(resolve_implicit_subscriptions(
                 subscriptions,
                 subscriptions_replaced,
@@ -458,13 +493,15 @@ impl StreamBotBuilder {
             .reconnect_policy(reconnect)
             .processing_policy(processing)
             .deduplicator(Arc::clone(&deduplicator));
-        stream.state = state;
         if let Some(websocket_connect_timeout) = websocket_connect_timeout {
             stream = stream.websocket_connect_timeout(websocket_connect_timeout);
         }
 
         if has_bot_route {
-            let mut bot = Bot::new(client.clone()).deduplicator(deduplicator);
+            let mut bot = Bot::from_shared_state(client.clone(), state).deduplicator(deduplicator);
+            if let Some(handler) = error_handler {
+                bot.set_error_handler(handler);
+            }
             for route in routes {
                 bot = bot.route(route);
             }
@@ -513,10 +550,9 @@ impl StreamBotBuilder {
 }
 
 /// DingTalk Stream client.
-#[derive(Clone)]
-pub struct StreamClient {
+pub struct StreamClient<T = ()> {
     client: DingTalk,
-    state: Option<BotState>,
+    state: Arc<T>,
     credentials: AppCredentials,
     subscriptions: Vec<StreamSubscription>,
     local_ip: Option<String>,
@@ -525,23 +561,70 @@ pub struct StreamClient {
     websocket_connect_timeout: Duration,
     processing: StreamProcessingPolicy,
     deduplicator: Arc<dyn EventDeduplicator>,
-    bot: Option<Bot>,
+    bot: Option<Bot<T>>,
     event_handler: Option<StreamEventHandler>,
-    frame_handler: Option<StreamFrameHandler>,
-    card_callback_handler: Option<CardCallbackHandler>,
+    frame_handler: Option<StreamFrameHandler<T>>,
+    card_callback_handler: Option<CardCallbackHandler<T>>,
+}
+
+impl<T> Clone for StreamClient<T> {
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            state: Arc::clone(&self.state),
+            credentials: self.credentials.clone(),
+            subscriptions: self.subscriptions.clone(),
+            local_ip: self.local_ip.clone(),
+            user_agent: self.user_agent.clone(),
+            reconnect: self.reconnect,
+            websocket_connect_timeout: self.websocket_connect_timeout,
+            processing: self.processing,
+            deduplicator: Arc::clone(&self.deduplicator),
+            bot: self.bot.clone(),
+            event_handler: self.event_handler.clone(),
+            frame_handler: self.frame_handler.clone(),
+            card_callback_handler: self.card_callback_handler.clone(),
+        }
+    }
 }
 
 impl StreamClient {
-    fn handler_context(&self) -> StreamContext {
-        StreamContext {
-            client: self.client.clone(),
-            state: self.state.clone(),
-        }
-    }
-
     /// Creates a Stream client builder.
     pub fn builder(client: DingTalk) -> Result<StreamClientBuilder> {
-        StreamClientBuilder::new(client)
+        Self::builder_with_state(client, ())
+    }
+
+    /// Creates a builder with typed state for frame and card callbacks.
+    ///
+    /// State mismatches in Stream callbacks are rejected at compile time:
+    ///
+    /// ```compile_fail
+    /// use dingding::prelude::*;
+    /// async fn callback(_: StreamContext<String>, _: StreamFrame) {}
+    /// # fn example() -> Result<()> {
+    /// let _ = StreamClient::builder_with_state(DingTalk::new()?, 42_u32)?
+    ///     .on_frame(callback);
+    /// # Ok(()) }
+    /// ```
+    pub fn builder_with_state<T: Send + Sync + 'static>(
+        client: DingTalk,
+        state: T,
+    ) -> Result<StreamClientBuilder<T>> {
+        StreamClientBuilder::new(client, Arc::new(state))
+    }
+
+    /// Creates a builder sharing the router's client and state with all callbacks.
+    pub fn from_bot<T: Send + Sync + 'static>(bot: Bot<T>) -> Result<StreamClientBuilder<T>> {
+        Ok(StreamClientBuilder::new(bot.client().clone(), bot.shared_state())?.bot(bot))
+    }
+}
+
+impl<T: Send + Sync + 'static> StreamClient<T> {
+    fn handler_context(&self) -> StreamContext<T> {
+        StreamContext {
+            client: self.client.clone(),
+            state: Arc::clone(&self.state),
+        }
     }
 
     /// Opens one Stream WebSocket connection and drains accepted work when it closes.
@@ -723,7 +806,11 @@ impl StreamClient {
         }
     }
 
-    async fn handle_bot_frame(&self, bot: &Bot, frame: StreamFrame) -> Result<StreamHandleResult> {
+    async fn handle_bot_frame(
+        &self,
+        bot: &Bot<T>,
+        frame: StreamFrame,
+    ) -> Result<StreamHandleResult> {
         let message_id = frame.headers.message_id.clone();
         let event = match frame.bot_event() {
             Ok(Some(event)) => event,
@@ -764,7 +851,7 @@ impl StreamClient {
 
     async fn handle_card_callback_frame(
         &self,
-        handler: &CardCallbackHandler,
+        handler: &CardCallbackHandler<T>,
         frame: StreamFrame,
     ) -> Result<StreamHandleResult> {
         let message_id = frame.headers.message_id.clone();
@@ -898,9 +985,9 @@ impl StreamHandleResult {
 }
 
 /// Builder for [`StreamClient`].
-pub struct StreamClientBuilder {
+pub struct StreamClientBuilder<T = ()> {
     client: DingTalk,
-    state: Option<BotState>,
+    state: Arc<T>,
     credentials: Option<AppCredentials>,
     subscriptions: Vec<StreamSubscription>,
     subscriptions_replaced: bool,
@@ -910,19 +997,19 @@ pub struct StreamClientBuilder {
     websocket_connect_timeout: Duration,
     processing: StreamProcessingPolicy,
     deduplicator: Arc<dyn EventDeduplicator>,
-    bot: Option<Bot>,
+    bot: Option<Bot<T>>,
     event_handler: Option<StreamEventHandler>,
-    frame_handler: Option<StreamFrameHandler>,
-    card_callback_handler: Option<CardCallbackHandler>,
+    frame_handler: Option<StreamFrameHandler<T>>,
+    card_callback_handler: Option<CardCallbackHandler<T>>,
 }
 
-impl StreamClientBuilder {
-    fn new(client: DingTalk) -> Result<Self> {
+impl<T: Send + Sync + 'static> StreamClientBuilder<T> {
+    fn new(client: DingTalk, state: Arc<T>) -> Result<Self> {
         let credentials = client.app_credentials();
         let websocket_connect_timeout = client.stream_connect_timeout();
         Ok(Self {
             client,
-            state: None,
+            state,
             credentials,
             subscriptions: Vec::new(),
             subscriptions_replaced: false,
@@ -957,23 +1044,12 @@ impl StreamClientBuilder {
         self
     }
 
-    /// Sets the bot router that handles robot message callbacks.
+    /// Sets the bot router and shares its state with all Stream callbacks.
+    /// The supplied router must have the same application state type as this builder.
     #[must_use]
-    pub fn bot(mut self, bot: Bot) -> Self {
+    pub fn bot(mut self, bot: Bot<T>) -> Self {
+        self.state = bot.shared_state();
         self.bot = Some(bot);
-        self
-    }
-
-    /// Configures shared state for the bot router, frame handlers, and card callbacks.
-    ///
-    /// Overrides state on a supplied bot regardless of builder call order. When omitted,
-    /// the supplied bot's state is shared with Stream callbacks.
-    #[must_use]
-    pub fn state<T>(mut self, state: T) -> Self
-    where
-        T: Send + Sync + 'static,
-    {
-        self.state = Some(Arc::new(state));
         self
     }
 
@@ -1055,18 +1131,18 @@ impl StreamClientBuilder {
         self
     }
 
-    fn on_frame_handler(mut self, handler: StreamFrameHandler) -> Self {
+    fn on_frame_handler(mut self, handler: StreamFrameHandler<T>) -> Self {
         self.frame_handler = Some(handler);
         self
     }
 
-    fn on_card_callback_handler(mut self, handler: CardCallbackHandler) -> Self {
+    fn on_card_callback_handler(mut self, handler: CardCallbackHandler<T>) -> Self {
         self.card_callback_handler = Some(handler);
         self
     }
 
     /// Builds a Stream client.
-    pub fn build(self) -> Result<StreamClient> {
+    pub fn build(self) -> Result<StreamClient<T>> {
         if self.bot.is_none()
             && self.frame_handler.is_none()
             && self.card_callback_handler.is_none()
@@ -1087,18 +1163,10 @@ impl StreamClientBuilder {
         let credentials = self.credentials.ok_or(Error::MissingCredentials)?;
         credentials.validate()?;
         let client = self.client.with_app_credentials(credentials.clone())?;
-        let state = self
-            .state
-            .or_else(|| self.bot.as_ref().and_then(Bot::shared_state));
+        let state = self.state;
         let bot = self
             .bot
-            .map(|bot| {
-                let bot = match &state {
-                    Some(state) => bot.state_arc(Arc::clone(state)),
-                    None => bot,
-                };
-                bot.with_app_credentials(credentials.clone())
-            })
+            .map(|bot| bot.with_app_credentials(credentials.clone()))
             .transpose()?;
 
         let subscriptions = resolve_implicit_subscriptions(
@@ -1360,7 +1428,10 @@ fn normalize_subscriptions(
     Ok(normalized)
 }
 
-fn validate_bot_routes(routes: &[Route], fallbacks: &[Route]) -> Result<()> {
+fn validate_bot_routes<T: Send + Sync + 'static>(
+    routes: &[Route<T>],
+    fallbacks: &[Route<T>],
+) -> Result<()> {
     for (kind, routes) in [("routes", routes), ("fallbacks", fallbacks)] {
         for (index, route) in routes.iter().enumerate() {
             route.validate_after(&routes[..index], kind)?;

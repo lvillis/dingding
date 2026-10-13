@@ -12,7 +12,7 @@ use crate::{BoxError, Error, HandlerResult, Result};
 /// # #[cfg(feature = "bot")]
 /// # fn example() {
 /// use dingding::prelude::*;
-/// let _ = Route::new(Scope::Any).handle(|ctx| handler_future(async move {
+/// let _: Route = Route::new(Scope::Any).handle(|ctx| handler_future(async move {
 ///     let content = String::from_utf8(vec![104, 105])?;
 ///     ctx.reply_text(content).await?;
 ///     Ok(())

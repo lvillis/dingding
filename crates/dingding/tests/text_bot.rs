@@ -2,6 +2,10 @@
 #![allow(clippy::expect_used)]
 
 use std::sync::{Arc, Mutex};
+use std::{
+    error::Error as _,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use dingding::{ErrorKind, prelude::*};
 
@@ -77,27 +81,23 @@ async fn a_conflict_prevents_any_handler_from_running() -> Result<()> {
 #[tokio::test]
 async fn commands_in_disjoint_scopes_and_prefixes_remain_distinct() -> Result<()> {
     let seen = Arc::new(Mutex::new(Vec::<String>::new()));
-    async fn group(ctx: GroupContext) -> Result<()> {
+    async fn group(ctx: GroupContext<Arc<Mutex<Vec<String>>>>) -> Result<()> {
         assert_eq!(ctx.event().conversation_scope, Scope::Group);
-        ctx.state_required::<Arc<Mutex<Vec<String>>>>()?
-            .lock()
-            .expect("state")
-            .push(format!(
-                "group:{}:{}",
-                ctx.command().expect("command"),
-                ctx.args_or_empty()
-            ));
+        ctx.state().lock().expect("state").push(format!(
+            "group:{}:{}",
+            ctx.command().expect("command"),
+            ctx.args_or_empty()
+        ));
         Ok(())
     }
-    async fn private(ctx: PrivateContext) -> Result<()> {
-        ctx.state_required::<Arc<Mutex<Vec<String>>>>()?
+    async fn private(ctx: PrivateContext<Arc<Mutex<Vec<String>>>>) -> Result<()> {
+        ctx.state()
             .lock()
             .expect("state")
             .push(format!("private:{}", ctx.args_or_empty()));
         Ok(())
     }
-    let bot = Bot::new(DingTalk::new()?)
-        .state(Arc::clone(&seen))
+    let bot = Bot::with_state(DingTalk::new()?, Arc::clone(&seen))
         .on_group_text_commands(["/ping", "ping"], group)
         .on_private_text_command("/ping", private)
         .on_group_text_command("/pinged", group);
@@ -123,16 +123,12 @@ async fn commands_in_disjoint_scopes_and_prefixes_remain_distinct() -> Result<()
 async fn scoped_fallbacks_accumulate_and_normal_routes_win() -> Result<()> {
     let seen = Arc::new(Mutex::new(Vec::<&'static str>::new()));
     let record = |name| {
-        move |ctx: Context| async move {
-            ctx.state_required::<Arc<Mutex<Vec<&'static str>>>>()?
-                .lock()
-                .expect("state")
-                .push(name);
+        move |ctx: Context<Arc<Mutex<Vec<&'static str>>>>| async move {
+            ctx.state().lock().expect("state").push(name);
             Ok::<_, Error>(())
         }
     };
-    let bot = Bot::new(DingTalk::new()?)
-        .state(Arc::clone(&seen))
+    let bot = Bot::with_state(DingTalk::new()?, Arc::clone(&seen))
         .on_unmatched_text(Scope::Group, record("group"))
         .on_unmatched_text(Scope::Private, record("private"))
         .fallback(record("other"))
@@ -217,5 +213,146 @@ fn macro_routes_use_the_same_conflict_validation() -> Result<()> {
         .route(ping_route())
         .on_group_text_command("ping", |_| async {});
     assert!(bot.validate().is_err());
+    Ok(())
+}
+
+#[derive(Default)]
+struct AppState {
+    calls: AtomicUsize,
+    recoveries: AtomicUsize,
+}
+
+#[tokio::test]
+async fn error_hook_keeps_context_and_state_and_deduplicates_recovered_outcomes() -> Result<()> {
+    let state = Arc::new(AppState::default());
+    let bot = Bot::with_state(DingTalk::new()?, Arc::clone(&state))
+        .on_group_text_command("/run", |ctx| async move {
+            ctx.state().calls.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(std::io::Error::other("external service unavailable"))
+        })
+        .on_error(|ctx, error| async move {
+            assert_eq!(error.kind(), ErrorKind::Handler);
+            assert!(
+                error
+                    .source()
+                    .and_then(|e| e.downcast_ref::<std::io::Error>())
+                    .is_some()
+            );
+            assert_eq!(ctx.command(), Some("/run"));
+            assert_eq!(ctx.args(), Some("job"));
+            assert_eq!(ctx.message_id(), Some("recoverable"));
+            assert_eq!(ctx.scope(), &Scope::Group);
+            tokio::task::yield_now().await;
+            ctx.state().recoveries.fetch_add(1, Ordering::SeqCst);
+        });
+    let event = BotEvent::from_value(serde_json::json!({
+        "conversationType": "2", "conversationId": "group", "msgId": "recoverable",
+        "msgtype": "text", "text": {"content": "/run job"}
+    }));
+    for _ in 0..2 {
+        assert_eq!(
+            bot.handle_event(event.clone()).await?,
+            HandleOutcome::Matched
+        );
+    }
+    assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(state.recoveries.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn error_hook_failure_is_not_recursive_or_cached_as_success() -> Result<()> {
+    for propagate_original in [false, true] {
+        let state = Arc::new(AppState::default());
+        let bot = Bot::with_state(DingTalk::new()?, Arc::clone(&state))
+            .on_group_text_command("/run", |ctx| async move {
+                ctx.state().calls.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(dingding::Error::InvalidConfig("original failure".into()))
+            })
+            .on_error(move |ctx, error| async move {
+                ctx.state().recoveries.fetch_add(1, Ordering::SeqCst);
+                if propagate_original {
+                    Err(error)
+                } else {
+                    ctx.reply_text("Please try again later.").await
+                }
+            });
+        let event = BotEvent::from_value(serde_json::json!({
+            "conversationType": "2", "msgId": "failed", "msgtype": "text",
+            "text": {"content": "/run"}
+        }));
+        for _ in 0..2 {
+            let error = bot
+                .handle_event(event.clone())
+                .await
+                .expect_err("failed recovery");
+            assert_eq!(error.kind(), ErrorKind::InvalidConfig);
+            assert!(error.to_string().contains(if propagate_original {
+                "original failure"
+            } else {
+                "sessionWebhook"
+            }));
+        }
+        assert_eq!(state.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(state.recoveries.load(Ordering::SeqCst), 2);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn error_hook_handles_fallbacks_but_not_successful_or_ignored_events() -> Result<()> {
+    let state = Arc::new(AppState::default());
+    let bot = Bot::with_state(DingTalk::new()?, Arc::clone(&state))
+        .on_group_text_command("/ok", |_| async {})
+        .on_unmatched_text(Scope::Group, |_| async {
+            Err::<(), _>(std::io::Error::other("fallback"))
+        })
+        .on_error(|ctx, _| async move {
+            assert_eq!(ctx.command(), None);
+            ctx.state().recoveries.fetch_add(1, Ordering::SeqCst);
+        });
+    assert_eq!(
+        bot.handle_event(BotEvent::text(Scope::Group, "hello"))
+            .await?,
+        HandleOutcome::Fallback
+    );
+    assert_eq!(
+        bot.handle_event(BotEvent::text(Scope::Group, "/ok"))
+            .await?,
+        HandleOutcome::Matched
+    );
+    assert_eq!(
+        bot.handle_event(BotEvent::text(Scope::Private, "hello"))
+            .await?,
+        HandleOutcome::Ignored
+    );
+    assert_eq!(state.recoveries.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[cfg(feature = "macros")]
+#[tokio::test]
+async fn macro_routes_accept_stateful_context_aliases_without_clone_bounds() -> Result<()> {
+    type Send = ();
+    type Sync = ();
+    let _: (Send, Sync) = ((), ());
+    type AppContext = GroupContext<AppState>;
+    #[dingding::handler(scope = Scope::Group, command = "/count")]
+    async fn count(ctx: AppContext) {
+        let clone = ctx.clone();
+        assert!(Arc::ptr_eq(&ctx.shared_state(), &clone.shared_state()));
+        ctx.state().calls.fetch_add(1, Ordering::SeqCst);
+    }
+    #[dingding::handler(command = "/noop")]
+    async fn noop() {}
+    let route = count_route();
+    let bot = Bot::with_state(DingTalk::new()?, AppState::default())
+        .route(route.clone())
+        .route(noop_route());
+    bot.clone()
+        .handle_event(BotEvent::text(Scope::Group, "/count"))
+        .await?;
+    bot.handle_event(BotEvent::text(Scope::Private, "/noop"))
+        .await?;
     Ok(())
 }

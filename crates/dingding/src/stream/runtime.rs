@@ -1,10 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
-    fmt,
-    future::Future,
-    panic::AssertUnwindSafe,
-    pin::Pin,
-    time::Duration,
+    collections::BTreeMap, fmt, future::Future, panic::AssertUnwindSafe, pin::Pin, time::Duration,
 };
 
 use futures_util::{FutureExt, Sink, SinkExt, StreamExt, stream::FuturesUnordered};
@@ -14,7 +9,9 @@ use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 
 use super::{
     StreamAck, StreamAckData, StreamClient, StreamExit, StreamFrame, StreamHandleResult,
-    StreamRunEvent, validate_stream_duration,
+    StreamOrdering, StreamRunEvent,
+    scheduling::{FrameQueue, FrameSlot, QueuedFrame},
+    validate_stream_duration,
 };
 use crate::{Error, Result, bot::dedup::Deduplication};
 
@@ -39,11 +36,15 @@ use crate::{Error, Result, bot::dedup::Deduplication};
 /// ```
 #[derive(Debug, Clone, Copy)]
 pub struct StreamProcessingPolicy {
-    /// Concurrent handlers. The default of one preserves arrival order.
+    /// Maximum concurrent handlers across all lanes. Defaults to four.
     pub max_concurrent_handlers: usize,
-    /// Waiting business frames. Zero rejects work whenever all handlers are occupied.
+    /// Ordering within and across conversations. Defaults to per-conversation ordering.
+    pub ordering: StreamOrdering,
+    /// Waiting business frames, including frames blocked by a busy conversation.
+    /// Zero rejects work that cannot start immediately.
     pub queue_capacity: usize,
-    /// Maximum time for one handler, including deduplication storage operations.
+    /// Maximum execution time, including deduplication and the bot error hook.
+    /// Time spent waiting in the business queue is excluded.
     pub handler_timeout: Duration,
     /// Maximum time for a WebSocket write or close.
     pub write_timeout: Duration,
@@ -57,7 +58,8 @@ pub struct StreamProcessingPolicy {
 impl Default for StreamProcessingPolicy {
     fn default() -> Self {
         Self {
-            max_concurrent_handlers: 1,
+            max_concurrent_handlers: 4,
+            ordering: StreamOrdering::PerConversation,
             queue_capacity: 64,
             handler_timeout: Duration::from_secs(30),
             write_timeout: Duration::from_secs(5),
@@ -122,13 +124,13 @@ impl fmt::Display for StreamCancellationReason {
 }
 
 // Kept outside the job futures so cancellation also reports work not yet polled.
-struct PendingFrames<'a> {
-    client: &'a StreamClient,
+struct PendingFrames<'a, T: Send + Sync + 'static> {
+    client: &'a StreamClient<T>,
     ids: BTreeMap<u64, String>,
     reason: StreamCancellationReason,
 }
 
-impl Drop for PendingFrames<'_> {
+impl<T: Send + Sync + 'static> Drop for PendingFrames<'_, T> {
     fn drop(&mut self) {
         for message_id in self.ids.values() {
             self.client.emit_event(StreamRunEvent::FrameCancelled {
@@ -186,7 +188,7 @@ impl SocketState {
     }
 }
 
-impl StreamClient {
+impl<T: Send + Sync + 'static> StreamClient<T> {
     pub(super) async fn run_socket<S, F>(
         &self,
         socket: WebSocketStream<S>,
@@ -209,7 +211,7 @@ impl StreamClient {
             reason: StreamCancellationReason::RunnerDropped,
         };
         let mut jobs = FuturesUnordered::new();
-        let mut queue = VecDeque::new();
+        let mut queue = FrameQueue::default();
         let mut next_id = 0_u64;
         let mut state = SocketState {
             sender: Some(sender),
@@ -226,10 +228,10 @@ impl StreamClient {
             // A buffered input burst must also give the sibling ACK writer time to run.
             tokio::task::yield_now().await;
             while jobs.len() < self.processing.max_concurrent_handlers {
-                let Some((id, frame)) = queue.pop_front() else {
+                let Some(frame) = queue.pop_ready() else {
                     break;
                 };
-                jobs.push(async move { (id, self.process_business_frame(frame).await) });
+                jobs.push(self.process_queued_frame(queue.start(frame)));
             }
             if state.drain.is_some() && jobs.is_empty() && queue.is_empty() {
                 state.sender = None;
@@ -268,8 +270,9 @@ impl StreamClient {
                         state.disconnect(Some(error));
                     }
                 }
-                Some((id, handled)) = jobs.next(), if !jobs.is_empty() => {
-                    pending.ids.remove(&id);
+                Some((frame, handled)) = jobs.next(), if !jobs.is_empty() => {
+                    pending.ids.remove(&frame.id);
+                    queue.finish(&frame);
                     self.emit_frame_error(&handled);
                     state.ack(&handled.ack);
                 }
@@ -314,18 +317,22 @@ impl StreamClient {
                                 Err(error) => state.disconnect(Some(error)),
                             },
                             Ok(frame) => {
-                                if state.drain.is_some() || (jobs.len() >= self.processing.max_concurrent_handlers
-                                    && queue.len() >= self.processing.queue_capacity)
+                                let frame = QueuedFrame::new(next_id, frame, self.processing.ordering);
+                                let ready = jobs.len() < self.processing.max_concurrent_handlers && queue.ready(&frame);
+                                if state.drain.is_some() || (!ready && queue.len() >= self.processing.queue_capacity)
                                 {
                                     let message = if state.drain.is_some() { "stream is draining" } else { "business frame queue is full" };
-                                    let handled = frame_failure(frame.message_id().to_owned(), Error::stream(message));
+                                    let handled = frame_failure(frame.frame.message_id().to_owned(), Error::stream(message));
                                     self.emit_frame_error(&handled);
                                     state.ack(&handled.ack);
                                 } else {
-                                    let id = next_id;
                                     next_id = next_id.wrapping_add(1);
-                                    pending.ids.insert(id, frame.message_id().to_owned());
-                                    queue.push_back((id, frame));
+                                    pending.ids.insert(frame.id, frame.frame.message_id().to_owned());
+                                    if ready {
+                                        jobs.push(self.process_queued_frame(queue.start(frame)));
+                                    } else {
+                                        queue.push(frame);
+                                    }
                                 }
                             }
                         },
@@ -338,6 +345,14 @@ impl StreamClient {
                 lifetime_recorded = true;
             }
         }
+    }
+
+    async fn process_queued_frame(
+        &self,
+        (slot, frame): (FrameSlot, StreamFrame),
+    ) -> (FrameSlot, StreamHandleResult) {
+        let handled = self.process_business_frame(frame).await;
+        (slot, handled)
     }
 
     async fn process_business_frame(&self, frame: StreamFrame) -> StreamHandleResult {

@@ -11,11 +11,10 @@ use dingding::{
 
 #[tokio::test]
 async fn handler_future_infers_mixed_errors_and_typed_contexts() -> HandlerResult {
-    let bot = Bot::new(DingTalk::new()?)
-        .state(42_u32)
+    let bot = Bot::with_state(DingTalk::new()?, 42_u32)
         .on_group_text_command("/shortcut", |ctx| {
             handler_future(async move {
-                assert_eq!(*ctx.state_required::<u32>()?, 42);
+                assert_eq!(*ctx.state(), 42);
                 let _ = String::from_utf8(b"hello".to_vec())?;
                 Ok(())
             })
@@ -26,7 +25,7 @@ async fn handler_future_infers_mixed_errors_and_typed_contexts() -> HandlerResul
                 .handle_group(|ctx| {
                     handler_future(async move {
                         assert!(ctx.is_group());
-                        assert_eq!(*ctx.state_required::<u32>()?, 42);
+                        assert_eq!(*ctx.state(), 42);
                         Ok(())
                     })
                 }),
@@ -66,7 +65,7 @@ async fn handler_future_preserves_sdk_and_application_error_sources() -> Handler
     let bot = Bot::new(DingTalk::new()?)
         .on_group_text_command("/sdk", |ctx| {
             handler_future(async move {
-                ctx.state_required::<u32>()?;
+                ctx.reply_text("missing session webhook").await?;
                 Ok(())
             })
         })
@@ -79,7 +78,7 @@ async fn handler_future_preserves_sdk_and_application_error_sources() -> Handler
     let sdk = bot
         .handle_event(BotEvent::text(ConversationScope::Group, "/sdk"))
         .await
-        .expect_err("missing state");
+        .expect_err("missing session webhook");
     assert_eq!(sdk.kind(), ErrorKind::InvalidConfig);
     let app = bot
         .handle_event(BotEvent::text(ConversationScope::Group, "/app"))
@@ -98,18 +97,18 @@ async fn handler_future_preserves_sdk_and_application_error_sources() -> Handler
 #[tokio::test]
 async fn scoped_shortcuts_accept_named_typed_handlers() -> HandlerResult {
     use dingding::bot::{GroupContext, PrivateContext};
-    async fn group(ctx: GroupContext) -> HandlerResult {
+    async fn group(ctx: GroupContext<u32>) -> HandlerResult {
         assert!(ctx.is_group());
-        assert_eq!(*ctx.state_required::<u32>()?, 42);
+        assert_eq!(*ctx.state(), 42);
         Ok(())
     }
-    async fn private(ctx: PrivateContext) -> HandlerResult {
+    async fn private(ctx: PrivateContext<u32>) -> HandlerResult {
         assert!(ctx.is_private());
-        assert_eq!(*ctx.state_required::<u32>()?, 42);
+        assert_eq!(*ctx.state(), 42);
         Ok(())
     }
     let client = DingTalk::new()?;
-    let bot = || Bot::new(client.clone()).state(42_u32);
+    let bot = || Bot::with_state(client.clone(), 42_u32);
     let cases = [
         (
             bot().on_group_text_command("/run", group),
@@ -152,7 +151,7 @@ async fn scoped_shortcuts_accept_named_typed_handlers() -> HandlerResult {
         );
     }
     #[cfg(feature = "stream")]
-    dingding::stream::StreamBot::builder()
+    dingding::stream::StreamBot::with_state(42_u32)
         .client_id_and_secret("key", "secret")
         .on_group_text_command("/run", group)
         .on_group_text_commands(["/alias"], group)
@@ -266,7 +265,7 @@ async fn routes_preserve_sdk_error_categories() -> HandlerResult {
 
 #[tokio::test]
 async fn all_shortcuts_dispatch_application_errors() -> HandlerResult {
-    async fn fail<S>(_: dingding::bot::BotContext<S>) -> io::Result<()> {
+    async fn fail<S>(_: dingding::bot::BotContext<(), S>) -> io::Result<()> {
         Err(io::Error::other("shortcut failed"))
     }
     let client = DingTalk::new()?;
@@ -361,7 +360,7 @@ async fn shortcuts_keep_scope_validation_priority_and_sdk_errors() -> HandlerRes
 #[test]
 fn stream_bot_exposes_all_matching_shortcuts() -> HandlerResult {
     use dingding::stream::StreamBot;
-    async fn handler<S>(_: dingding::bot::BotContext<S>) -> HandlerResult {
+    async fn handler<S>(_: dingding::bot::BotContext<(), S>) -> HandlerResult {
         Ok(())
     }
     StreamBot::builder()

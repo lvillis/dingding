@@ -1,43 +1,41 @@
-use std::any::type_name;
+use std::sync::Arc;
 
-use crate::{DingTalk, Error, Result, bot::BotState};
+use crate::DingTalk;
 
 /// Shared SDK client and application state for Stream frame and card callbacks.
 ///
 /// The client uses the effective Stream credentials. State is shared with the bot
 /// router, including when only frame or card callbacks are registered.
-#[derive(Clone)]
-pub struct StreamContext {
+pub struct StreamContext<T = ()> {
     pub(super) client: DingTalk,
-    pub(super) state: Option<BotState>,
+    pub(super) state: Arc<T>,
 }
 
-impl StreamContext {
+impl<T> Clone for StreamContext<T> {
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+impl<T> StreamContext<T> {
     /// Returns the SDK client with the effective Stream credentials.
     #[must_use]
     pub fn client(&self) -> &DingTalk {
         &self.client
     }
 
-    /// Returns shared state when it was configured with this type.
+    /// Borrows the application state, checked at compile time when registering the handler.
     #[must_use]
-    pub fn state<T>(&self) -> Option<&T>
-    where
-        T: Send + Sync + 'static,
-    {
-        self.state.as_deref()?.downcast_ref::<T>()
+    pub fn state(&self) -> &T {
+        &self.state
     }
 
-    /// Returns shared state or an invalid-configuration error.
-    pub fn state_required<T>(&self) -> Result<&T>
-    where
-        T: Send + Sync + 'static,
-    {
-        self.state::<T>().ok_or_else(|| {
-            Error::InvalidConfig(format!(
-                "stream state `{}` is not configured",
-                type_name::<T>()
-            ))
-        })
+    /// Clones the state handle without requiring `T: Clone`.
+    #[must_use]
+    pub fn shared_state(&self) -> Arc<T> {
+        Arc::clone(&self.state)
     }
 }

@@ -90,6 +90,13 @@
 //! All bot handlers take only the context; use `ctx.event()` for the full event.
 //! Stream emits `tracing` diagnostics without requiring an `on_event` callback.
 //! The application owns subscriber setup; the library never installs one globally.
+//! For shared application data, use `StreamBot::from_env_with_state(app_state)?`
+//! and handlers accepting `Context<AppState>`. Read state with `ctx.state()`;
+//! mismatched types are rejected at compile time, and state need not implement `Clone`.
+//! Use `.on_error(|ctx, error| async move { ... })` for explicit business recovery:
+//! a successful return permits a success ACK, while an error preserves failure.
+//! By default, Stream preserves order within each bot conversation while allowing
+//! up to four handlers across different conversations.
 //! See the `stream` module for callback state, concurrency, deduplication, and shutdown.
 //!
 //! # Send a webhook message

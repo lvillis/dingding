@@ -8,7 +8,7 @@ use crate::IntoHandlerResult;
 
 macro_rules! impl_stream_handlers {
     ($target:ty) => {
-        impl $target {
+        impl<T: Send + Sync + 'static> $target {
             /// Registers a callback/event handler for frames not handled by the bot router.
             ///
             /// Receives the shared context followed by the frame. Return `()` for an empty
@@ -18,7 +18,7 @@ macro_rules! impl_stream_handlers {
             #[must_use]
             pub fn on_frame<F, Fut>(mut self, handler: F) -> Self
             where
-                F: Fn(StreamContext, StreamFrame) -> Fut + Send + Sync + 'static,
+                F: Fn(StreamContext<T>, StreamFrame) -> Fut + Send + Sync + 'static,
                 Fut: Future + Send + 'static,
                 Fut::Output: IntoHandlerResult<StreamFrameResponse>,
             {
@@ -39,7 +39,7 @@ macro_rules! impl_stream_handlers {
             #[must_use]
             pub fn on_card_callback<F, Fut>(mut self, handler: F) -> Self
             where
-                F: Fn(StreamContext, CardCallbackEvent) -> Fut + Send + Sync + 'static,
+                F: Fn(StreamContext<T>, CardCallbackEvent) -> Fut + Send + Sync + 'static,
                 Fut: Future + Send + 'static,
                 Fut::Output: IntoHandlerResult<StreamFrameResponse>,
             {
@@ -54,5 +54,5 @@ macro_rules! impl_stream_handlers {
     };
 }
 
-impl_stream_handlers!(StreamBotBuilder);
-impl_stream_handlers!(StreamClientBuilder);
+impl_stream_handlers!(StreamBotBuilder<T>);
+impl_stream_handlers!(StreamClientBuilder<T>);
