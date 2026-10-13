@@ -1,8 +1,17 @@
+## [0.1.10] - 2026-10-13
+
+### 🚀 Features
+
+- Add typed bot state, error hooks, and per-conversation scheduling
 ## [0.1.9] - 2026-10-10
 
 ### 🚀 Features
 
 - Add Graviola TLS support for HTTP and Stream WebSockets
+
+### ⚙️ Miscellaneous Tasks
+
+- Release version 0.1.9
 ## [0.1.8] - 2026-10-10
 
 ### 🐛 Bug Fixes
