@@ -1,25 +1,15 @@
 # dingding
 
-Rust SDK and bot framework for DingTalk, powered by `reqx`.
+[![Crates.io version](https://img.shields.io/crates/v/dingding)](https://crates.io/crates/dingding)
+[![API documentation](https://docs.rs/dingding/badge.svg)](https://docs.rs/dingding)
+[![Minimum supported Rust version](https://img.shields.io/crates/msrv/dingding)](Cargo.toml)
+[![Apache-2.0 license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-- Webhook and enterprise robot messages, interactive cards, and media.
-- Typed bot routing, Stream callbacks, shared state, and graceful shutdown.
-- Message status, pagination, recall, and persistent destinations for background jobs.
-- Bounded processing, deduplication, and structured errors.
-
-## Documentation
-
-Integration examples, feature selection, runtime contracts, and API documentation live in
-[rustdoc](https://docs.rs/dingding). Build documentation for the working tree with:
+Rust SDK for DingTalk bots. Handle chat commands over Stream, send webhook
+notifications, and manage robot messages and interactive cards through the DingTalk OpenAPI.
 
 ```sh
-cargo doc -p dingding --no-deps --open
+cargo add dingding
 ```
 
-Runnable applications are in [`crates/dingding/examples`](crates/dingding/examples).
-
-## Development
-
-```sh
-just ci
-```
+[Text bot example](crates/dingding/examples/stream_ping.rs)
