@@ -3,6 +3,10 @@
 ### 🚀 Features
 
 - Add typed bot state, error hooks, and per-conversation scheduling
+
+### ⚙️ Miscellaneous Tasks
+
+- Release version 0.1.10
 ## [0.1.9] - 2026-10-10
 
 ### 🚀 Features
