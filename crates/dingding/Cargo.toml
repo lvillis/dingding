@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 include = [
     "Cargo.toml",
+    "LICENSE",
     "src/**",
     "tests/fixtures/tls/**",
 ]
@@ -18,9 +19,9 @@ async-tls-rustls-ring = ["reqx/async-tls-rustls-ring", "dep:rustls", "rustls/rin
 async-tls-rustls-aws-lc-rs = ["reqx/async-tls-rustls-aws-lc-rs", "dep:rustls", "rustls/aws_lc_rs", "dep:webpki-roots", "tokio-tungstenite?/rustls-tls-webpki-roots"]
 async-tls-rustls-graviola = ["reqx/async-tls-rustls-graviola", "dep:rustls", "dep:rustls-graviola", "dep:webpki-roots", "tokio-tungstenite?/rustls-tls-webpki-roots"]
 async-tls-native = ["reqx/async-tls-native", "dep:native-tls", "tokio-tungstenite?/native-tls"]
-webhook = []
+webhook = ["dep:hmac", "dep:sha2"]
 openapi = ["dep:tokio", "tokio/fs", "tokio/io-util", "tokio/time", "dep:getrandom"]
-bot = ["webhook"]
+bot = ["webhook", "dep:urlencoding"]
 stream = ["openapi", "bot", "dep:futures-util", "dep:tokio", "tokio/macros", "tokio/rt", "tokio/time", "dep:tokio-tungstenite", "dep:tracing"]
 macros = ["bot", "dep:dingding-macros"]
 
@@ -28,7 +29,7 @@ macros = ["bot", "dep:dingding-macros"]
 base64 = { workspace = true }
 futures-util = { workspace = true, optional = true }
 getrandom = { workspace = true, optional = true }
-hmac = { workspace = true }
+hmac = { workspace = true, optional = true }
 httpdate = { workspace = true }
 reqx = { workspace = true }
 rustls = { workspace = true, optional = true }
@@ -37,13 +38,13 @@ webpki-roots = { workspace = true, optional = true }
 native-tls = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
+sha2 = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, optional = true, features = ["sync"] }
 tokio-tungstenite = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 url = { workspace = true }
-urlencoding = { workspace = true }
+urlencoding = { workspace = true, optional = true }
 dingding-macros = { version = "0.1.10", path = "../dingding-macros", optional = true }
 
 [dev-dependencies]

@@ -3,6 +3,7 @@
 
 use std::{
     future::Future,
+    mem::DropGuard,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -845,11 +846,12 @@ async fn card_ack_is_replayed_after_duplicate_delivery_and_reconnection() {
     bounded(http).await.expect("gateway task");
 }
 
-struct Cancelled(Arc<AtomicUsize>);
-impl Drop for Cancelled {
-    fn drop(&mut self) {
-        self.0.fetch_add(1, Ordering::SeqCst);
-    }
+async fn wait_for_cancellation(started: mpsc::UnboundedSender<()>, cancelled: Arc<AtomicUsize>) {
+    let _guard = DropGuard::new(cancelled, |count| {
+        count.fetch_add(1, Ordering::SeqCst);
+    });
+    started.send(()).expect("started");
+    std::future::pending().await
 }
 
 #[tokio::test]
@@ -864,15 +866,7 @@ async fn connection_loss_during_shutdown_reports_unfinished_work() {
             disconnect_timeout: Duration::from_millis(100),
             ..StreamProcessingPolicy::default()
         })
-        .on_frame(move |_ctx, _| {
-            let guard = Cancelled(Arc::clone(&count));
-            let started = started.clone();
-            async move {
-                let _guard = guard;
-                started.send(()).expect("started");
-                std::future::pending::<()>().await;
-            }
-        })
+        .on_frame(move |_ctx, _| wait_for_cancellation(started.clone(), Arc::clone(&count)))
         .build()
         .expect("stream");
     let (stop, observed, task) = launch_with_observed_shutdown(stream);
@@ -907,15 +901,7 @@ async fn shutdown_deadline_cancels_unfinished_work_and_reports_failure() {
             shutdown_timeout: Duration::from_millis(100),
             ..StreamProcessingPolicy::default()
         })
-        .on_frame(move |_ctx, _| {
-            let guard = Cancelled(Arc::clone(&count));
-            let started = started.clone();
-            async move {
-                let _guard = guard;
-                started.send(()).expect("started");
-                std::future::pending::<()>().await;
-            }
-        })
+        .on_frame(move |_ctx, _| wait_for_cancellation(started.clone(), Arc::clone(&count)))
         .build()
         .expect("stream");
     let (stop, task) = launch(stream);

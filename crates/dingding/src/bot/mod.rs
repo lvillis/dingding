@@ -95,7 +95,6 @@
 //! from `senderId`, and never switch channels after an ambiguous send failure.
 
 use std::{
-    convert::Infallible,
     fmt,
     future::Future,
     marker::PhantomData,
@@ -201,7 +200,7 @@ impl ConversationScope {
 }
 
 impl std::str::FromStr for ConversationScope {
-    type Err = Infallible;
+    type Err = !;
 
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
         Ok(Self::from_dingtalk_value(value))
@@ -311,7 +310,7 @@ impl MessageType {
 }
 
 impl std::str::FromStr for MessageType {
-    type Err = Infallible;
+    type Err = !;
 
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
         Ok(Self::from_dingtalk_value(value))

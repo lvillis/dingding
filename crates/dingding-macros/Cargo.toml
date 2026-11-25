@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 include = [
     "Cargo.toml",
+    "LICENSE",
     "src/**",
 ]
 
